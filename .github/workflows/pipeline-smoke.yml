@@ -55,7 +55,7 @@ jobs:
 
       - name: Fetch prices (yfinance)
         run: |
-          python scripts/fetch_prices.py --include-extra
+          python scripts/fetch_prices.py --include-extra --reset --force-full
           ls -la data/raw | sed -n '1,200p'
           python - << 'PY'
           import json, pathlib
