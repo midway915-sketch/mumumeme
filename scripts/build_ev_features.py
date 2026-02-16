@@ -96,22 +96,29 @@ def compute_event_ev(events: pd.DataFrame, win_events: int) -> pd.DataFrame:
 
 def merge_ev_to_daily(features: pd.DataFrame, ev_events: pd.DataFrame) -> pd.DataFrame:
     """
-    merge_asof는 키 정렬 조건이 매우 까다로워서,
-    by='Ticker'로 한 번에 붙이기보다 티커별로 쪼개서 안전하게 asof merge 한다.
+    merge_asof는 키 정렬 + 컬럼 충돌에 민감.
+    - 티커별로 split 해서 merge_asof
+    - ev_events의 Ticker는 merge 전에 제거(충돌 방지)
+    - merge 후 Ticker 컬럼 강제 복구
     """
     features = features.copy()
     ev_events = ev_events.copy()
 
-    # ---- key 통일 (ns) ----
-    if "Date" not in features.columns:
-        raise ValueError(f"features missing Date. cols={list(features.columns)}")
-    if "Ticker" not in features.columns:
-        raise ValueError(f"features missing Ticker. cols={list(features.columns)}")
+    def _dt_ns(x: pd.Series) -> pd.Series:
+        s = pd.to_datetime(x, errors="coerce")
+        try:
+            s = s.dt.tz_localize(None)
+        except Exception:
+            pass
+        return s.astype("datetime64[ns]")
+
+    if "Date" not in features.columns or "Ticker" not in features.columns:
+        raise ValueError(f"features must have Date,Ticker. cols={list(features.columns)}")
 
     features["Date"] = _dt_ns(features["Date"])
     features["Ticker"] = features["Ticker"].astype(str).str.upper().str.strip()
 
-    # ev_events의 datetime key 자동 탐지
+    # ev_events datetime key 자동 탐지
     if "EventDate" in ev_events.columns:
         right_key = "EventDate"
     elif "ExitDate" in ev_events.columns:
@@ -121,10 +128,13 @@ def merge_ev_to_daily(features: pd.DataFrame, ev_events: pd.DataFrame) -> pd.Dat
     else:
         raise ValueError(f"ev_events has no datetime key col. cols={list(ev_events.columns)}")
 
+    if "Ticker" not in ev_events.columns:
+        raise ValueError(f"ev_events must have Ticker. cols={list(ev_events.columns)}")
+
     ev_events[right_key] = _dt_ns(ev_events[right_key])
     ev_events["Ticker"] = ev_events["Ticker"].astype(str).str.upper().str.strip()
 
-    # ---- NaT 제거 + 중복 제거(정렬 안정화 핵심) ----
+    # 정렬 안정화: NaT 제거 + 중복 제거
     features = (
         features.dropna(subset=["Date", "Ticker"])
         .sort_values(["Ticker", "Date"])
@@ -139,43 +149,54 @@ def merge_ev_to_daily(features: pd.DataFrame, ev_events: pd.DataFrame) -> pd.Dat
         .reset_index(drop=True)
     )
 
-    # ---- 티커별 merge_asof ----
-    out_parts = []
-    tickers = features["Ticker"].unique().tolist()
-
-    # (옵션) 디버그: 정렬 체크(액션 로그에서 원인 파악용)
-    # print("[DEBUG] features sample:", features.head(3).to_dict("records"))
-    # print("[DEBUG] ev_events sample:", ev_events.head(3).to_dict("records"))
-
+    # 티커별 이벤트 맵
     ev_map = {t: g for t, g in ev_events.groupby("Ticker", sort=False)}
 
-    for t in tickers:
-        f = features[features["Ticker"] == t].sort_values("Date").reset_index(drop=True)
+    out_parts = []
+    for t, f in features.groupby("Ticker", sort=False):
+        f = f.sort_values("Date").reset_index(drop=True)
 
         e = ev_map.get(t)
         if e is None or e.empty:
-            # 해당 티커에 이벤트가 없다면 그대로 NaN 붙인 상태로 통과
             out_parts.append(f)
             continue
 
-        e = e.sort_values(right_key).reset_index(drop=True)
+        # ✅ 충돌 방지: 이벤트쪽 Ticker 제거
+        e2 = e.drop(columns=["Ticker"], errors="ignore").sort_values(right_key).reset_index(drop=True)
 
-        # merge_asof는 양쪽 키가 정렬되어야 함
         merged_t = pd.merge_asof(
             f,
-            e,
+            e2,
             left_on="Date",
             right_on=right_key,
             direction="backward",
             allow_exact_matches=True,
         )
+
+        # ✅ merge 결과에서 Ticker가 깨졌을 때 복구
+        if "Ticker" not in merged_t.columns:
+            if "Ticker_x" in merged_t.columns:
+                merged_t = merged_t.rename(columns={"Ticker_x": "Ticker"})
+                if "Ticker_y" in merged_t.columns:
+                    merged_t = merged_t.drop(columns=["Ticker_y"])
+            else:
+                merged_t["Ticker"] = t
+
         out_parts.append(merged_t)
 
     merged = pd.concat(out_parts, ignore_index=True)
-    # 최종 정렬
+
+    # 최종 안전장치: Ticker가 또 없으면 만들기
+    if "Ticker" not in merged.columns:
+        if "Ticker_x" in merged.columns:
+            merged = merged.rename(columns={"Ticker_x": "Ticker"})
+            if "Ticker_y" in merged.columns:
+                merged = merged.drop(columns=["Ticker_y"])
+        else:
+            raise RuntimeError(f"merged has no Ticker column. cols={list(merged.columns)}")
+
     merged = merged.sort_values(["Ticker", "Date"]).reset_index(drop=True)
     return merged
-
 
 
 def add_cross_sectional_ranks(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
