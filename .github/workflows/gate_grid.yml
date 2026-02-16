@@ -61,9 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install -U pip wheel setuptools
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install -U pyarrow
 
       - name: Prepare universe.csv
@@ -83,16 +81,14 @@ jobs:
         run: |
           set -euo pipefail
           cd "${GITHUB_WORKSPACE}"
-
           if [ "${REBUILD_ALL}" = "true" ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full
           else
             python scripts/fetch_prices.py --include-extra
           fi
-
           python scripts/build_features.py
 
-      - name: Run PT/H/SL grid + gate grid (reusable bash lib)
+      - name: Run grid (PT/H/SL + gate)
         shell: bash
         env:
           PROFIT_TARGET_INPUT: "${{ inputs.profit_target }}"
@@ -105,101 +101,7 @@ jobs:
           LAMBDA_TAIL: "${{ inputs.lambda_tail }}"
         run: |
           set -euo pipefail
-          cd "${GITHUB_WORKSPACE}"
-
-          if [ ! -f scripts/gate_grid_lib.sh ]; then
-            echo "[ERROR] scripts/gate_grid_lib.sh not found"
-            exit 1
-          fi
-          source scripts/gate_grid_lib.sh
-
-          trim(){ echo "$1" | xargs; }
-
-          IFS=',' read -r -a PT_LIST <<< "${PROFIT_TARGET_INPUT}"
-          IFS=',' read -r -a H_LIST  <<< "${HOLDING_DAYS_INPUT}"
-          IFS=',' read -r -a SL_LIST <<< "${STOP_LEVEL_INPUT}"
-
-          make_tag () {
-            python -c "pt=float('${1}'); h=int('${2}'); sl=float('${3}'); ex=int('${4}'); \
-            pt_tag=f'pt{int(round(pt*100))}'; sl_tag=f'sl{int(round(abs(sl)*100))}'; \
-            print(f'{pt_tag}_h{h}_{sl_tag}_ex{ex}')"
-                      }
-
-          for PT in "${PT_LIST[@]}"; do
-            PT="$(trim "${PT}")"
-            for H in "${H_LIST[@]}"; do
-              H="$(trim "${H}")"
-              for SL in "${SL_LIST[@]}"; do
-                SL="$(trim "${SL}")"
-
-                export PROFIT_TARGET="${PT}"
-                export HOLDING_DAYS="${H}"
-                export STOP_LEVEL="${SL}"
-                export TAG
-                TAG="$(make_tag "${PT}" "${H}" "${SL}" "${MAX_EXTEND_DAYS}")"
-                export TAG
-
-                echo ""
-                echo "===================================================="
-                echo "[GRID] TAG=${TAG} (PT=${PT}, H=${H}, SL=${SL}, EX=${MAX_EXTEND_DAYS})"
-                echo "===================================================="
-
-                python scripts/build_labels.py \
-                  --profit-target "${PT}" \
-                  --max-days "${H}" \
-                  --stop-level "${SL}" \
-                  --max-extend-days "${MAX_EXTEND_DAYS}"
-
-                python scripts/train_model.py
-
-                if [ -f scripts/build_strategy_labels.py ] && [ -f scripts/train_strategy_models.py ]; then
-                  python scripts/build_strategy_labels.py \
-                    --profit-target "${PT}" \
-                    --max-days "${H}" \
-                    --stop-level "${SL}" \
-                    --max-extend-days "${MAX_EXTEND_DAYS}"
-
-                  python scripts/train_strategy_models.py \
-                    --profit-target "${PT}" \
-                    --max-days "${H}" \
-                    --stop-level "${SL}" \
-                    --max-extend-days "${MAX_EXTEND_DAYS}"
-                else
-                  echo "[WARN] strategy label/model scripts missing -> skipping"
-                fi
-
-                if [ -f app/tail_model.pkl ] && [ -f app/tail_scaler.pkl ]; then
-                  export TAIL_OK=1
-                else
-                  export TAIL_OK=0
-                fi
-
-                run_gate_grid
-                
-                echo "=== DEBUG data/signals ==="
-                ls -la data/signals || true
-                echo "=== DEBUG find summaries under data/** ==="
-                find data -maxdepth 6 -type f -name "sim_engine_summary*.csv" -print || true
-                
-                python -c "import os,glob,pandas as pd; tag=os.environ['TAG']; \
-                paths=[p for p in glob.glob(f'data/**/sim_engine_summary*{tag}*.csv', recursive=True) if 'GATES_ALL' not in p]; \
-                print('[INFO] found summaries:',len(paths)); \
-                [print('  -',p) for p in paths[:20]]; \
-                assert paths, f'no sim_engine_summary files for {tag}'; \
-                df=pd.concat([pd.read_csv(p) for p in paths], ignore_index=True); \
-                df=df.drop_duplicates(subset=['label'], keep='last') if 'label' in df.columns else df; \
-                os.makedirs('data/signals', exist_ok=True); \
-                out=f'data/signals/sim_engine_summary_{tag}_GATES_ALL.csv'; \
-                df.to_csv(out, index=False); \
-                print('[DONE] wrote', out, 'rows=', len(df))"
-                
-                python scripts/make_gate_summary.py --tag "${TAG}" --max-days "${H}" --recent-years 10
-                
-
-            done
-          done
-
-          python scripts/aggregate_gate_grid.py
+          bash scripts/run_grid_workflow.sh
 
       - name: Upload artifacts
         if: always()
@@ -214,4 +116,3 @@ jobs:
             data/signals/gate_grid_top_by_recent10y.csv
             data/**/sim_engine_summary*.csv
             data/signals/picks_*.csv
-
