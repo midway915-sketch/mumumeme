@@ -95,44 +95,87 @@ def compute_event_ev(events: pd.DataFrame, win_events: int) -> pd.DataFrame:
 
 
 def merge_ev_to_daily(features: pd.DataFrame, ev_events: pd.DataFrame) -> pd.DataFrame:
-    # 🔥 핵심: merge_asof는 datetime 단위까지 같아야 함 (us vs ms면 터짐)
-    # 아래에서 ns로 강제 통일
+    """
+    merge_asof는 키 정렬 조건이 매우 까다로워서,
+    by='Ticker'로 한 번에 붙이기보다 티커별로 쪼개서 안전하게 asof merge 한다.
+    """
     features = features.copy()
     ev_events = ev_events.copy()
 
-    # 네 코드에서 merge_asof에 쓰는 키 컬럼명이 뭔지에 따라 수정 필요
-    # 보통: features["Date"] 와 ev_events["EventDate"] 또는 ["ExitDate"]
-    if "Date" in features.columns:
-        features["Date"] = _dt_ns(features["Date"])
+    # ---- key 통일 (ns) ----
+    if "Date" not in features.columns:
+        raise ValueError(f"features missing Date. cols={list(features.columns)}")
+    if "Ticker" not in features.columns:
+        raise ValueError(f"features missing Ticker. cols={list(features.columns)}")
 
-    # 여기 컬럼명은 네 ev_events 실제 컬럼에 맞춰 하나만 남겨
+    features["Date"] = _dt_ns(features["Date"])
+    features["Ticker"] = features["Ticker"].astype(str).str.upper().str.strip()
+
+    # ev_events의 datetime key 자동 탐지
     if "EventDate" in ev_events.columns:
-        ev_events["EventDate"] = _dt_ns(ev_events["EventDate"])
         right_key = "EventDate"
     elif "ExitDate" in ev_events.columns:
-        ev_events["ExitDate"] = _dt_ns(ev_events["ExitDate"])
         right_key = "ExitDate"
     elif "Date" in ev_events.columns:
-        ev_events["Date"] = _dt_ns(ev_events["Date"])
         right_key = "Date"
     else:
-        raise ValueError(f"ev_events has no datetime key column. cols={list(ev_events.columns)}")
+        raise ValueError(f"ev_events has no datetime key col. cols={list(ev_events.columns)}")
 
-    # NaT 제거 (asof는 NaT 있으면 또 난리남)
-    features = features.dropna(subset=["Date"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    ev_events = ev_events.dropna(subset=[right_key]).sort_values(["Ticker", right_key]).reset_index(drop=True)
+    ev_events[right_key] = _dt_ns(ev_events[right_key])
+    ev_events["Ticker"] = ev_events["Ticker"].astype(str).str.upper().str.strip()
 
-    # ✅ merge_asof (by=Tcker 기준, 과거 이벤트를 현재 날짜에 붙임)
-    merged = pd.merge_asof(
-        features,
-        ev_events,
-        left_on="Date",
-        right_on=right_key,
-        by="Ticker",
-        direction="backward",
-        allow_exact_matches=True,
+    # ---- NaT 제거 + 중복 제거(정렬 안정화 핵심) ----
+    features = (
+        features.dropna(subset=["Date", "Ticker"])
+        .sort_values(["Ticker", "Date"])
+        .drop_duplicates(["Ticker", "Date"], keep="last")
+        .reset_index(drop=True)
     )
+
+    ev_events = (
+        ev_events.dropna(subset=[right_key, "Ticker"])
+        .sort_values(["Ticker", right_key])
+        .drop_duplicates(["Ticker", right_key], keep="last")
+        .reset_index(drop=True)
+    )
+
+    # ---- 티커별 merge_asof ----
+    out_parts = []
+    tickers = features["Ticker"].unique().tolist()
+
+    # (옵션) 디버그: 정렬 체크(액션 로그에서 원인 파악용)
+    # print("[DEBUG] features sample:", features.head(3).to_dict("records"))
+    # print("[DEBUG] ev_events sample:", ev_events.head(3).to_dict("records"))
+
+    ev_map = {t: g for t, g in ev_events.groupby("Ticker", sort=False)}
+
+    for t in tickers:
+        f = features[features["Ticker"] == t].sort_values("Date").reset_index(drop=True)
+
+        e = ev_map.get(t)
+        if e is None or e.empty:
+            # 해당 티커에 이벤트가 없다면 그대로 NaN 붙인 상태로 통과
+            out_parts.append(f)
+            continue
+
+        e = e.sort_values(right_key).reset_index(drop=True)
+
+        # merge_asof는 양쪽 키가 정렬되어야 함
+        merged_t = pd.merge_asof(
+            f,
+            e,
+            left_on="Date",
+            right_on=right_key,
+            direction="backward",
+            allow_exact_matches=True,
+        )
+        out_parts.append(merged_t)
+
+    merged = pd.concat(out_parts, ignore_index=True)
+    # 최종 정렬
+    merged = merged.sort_values(["Ticker", "Date"]).reset_index(drop=True)
     return merged
+
 
 
 def add_cross_sectional_ranks(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
