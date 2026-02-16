@@ -19,18 +19,21 @@ on:
         description: "tag only (ex: 30)"
         required: true
         default: "30"
-      TAIL_MAX:
-        description: "tail gate threshold (e.g. 0.25)"
+
+      # ✅ 여러 값 실험(콤마로 구분)
+      TAIL_MAX_LIST:
+        description: "comma-separated tail thresholds (e.g. 0.15,0.25,0.35)"
         required: true
-        default: "0.25"
-      U_QUANTILE:
-        description: "utility quantile cutoff (e.g. 0.75)"
+        default: "0.20,0.30"
+      U_QUANTILE_LIST:
+        description: "comma-separated utility quantiles (e.g. 0.60,0.75,0.90)"
         required: true
-        default: "0.75"
-      RANK_BY:
-        description: "ranking metric (utility|ret_score|p_success)"
+        default: "0.75,0.90"
+      RANK_BY_LIST:
+        description: "comma-separated rank metric (utility|ret_score|p_success). e.g. utility,ret_score"
         required: true
         default: "utility"
+
       LAMBDA_TAIL:
         description: "utility tail penalty lambda (e.g. 0.05)"
         required: true
@@ -44,9 +47,10 @@ jobs:
       HOLDING_DAYS: ${{ inputs.HOLDING_DAYS }}
       STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
       MAX_EXTEND_DAYS: ${{ inputs.MAX_EXTEND_DAYS }}
-      TAIL_MAX: ${{ inputs.TAIL_MAX }}
-      U_QUANTILE: ${{ inputs.U_QUANTILE }}
-      RANK_BY: ${{ inputs.RANK_BY }}
+
+      TAIL_MAX_LIST: ${{ inputs.TAIL_MAX_LIST }}
+      U_QUANTILE_LIST: ${{ inputs.U_QUANTILE_LIST }}
+      RANK_BY_LIST: ${{ inputs.RANK_BY_LIST }}
       LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
 
     steps:
@@ -62,8 +66,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy pandas scikit-learn joblib yfinance pyarrow
 
-      # ---- 여기 아래는 네 파이프라인에 맞게 이미 있는 스텝이 있으면 그대로 유지해도 됨 ----
-      # 예시: universe, fetch_prices, build_features, train models 등이 필요
+      # ---- 네 파이프라인 기본 스텝(이미 있으면 유지/조정) ----
       - name: Universe
         run: |
           python scripts/universe.py
@@ -99,18 +102,18 @@ jobs:
         run: |
           python scripts/train_strategy_models.py
 
-      # ---- 4개 게이트 조합 순차 실행 ----
-      - name: Gate runs (none / tail / utility / tail_utility)
+      # ---- ✅ 게이트 조합 실험 ----
+      - name: Gate grid runs (none / tail / utility / tail_utility) x (lists)
         run: |
-          set -e
+          set -euo pipefail
 
           PT="${PROFIT_TARGET}"
           H="${HOLDING_DAYS}"
           SL="${STOP_LEVEL}"
           EX="${MAX_EXTEND_DAYS}"
+          LAM="${LAMBDA_TAIL}"
 
-          # tag는 predict_gate/engine 내부에서도 동일 계산하지만,
-          # merge 단계에서 필요하니까 여기서도 만들어둠
+          # TAG 생성(파일명/머지용)
           python - <<PY
           pt=float("${PROFIT_TARGET}")
           h=int("${HOLDING_DAYS}")
@@ -119,15 +122,38 @@ jobs:
           pt_tag=int(round(pt*100))
           sl_tag=int(round(abs(sl)*100))
           tag=f"pt{pt_tag}_h{h}_sl{sl_tag}_ex{ex}"
-          print("TAG="+tag)
           with open("${GITHUB_ENV}","a",encoding="utf-8") as f:
               f.write("TAG="+tag+"\\n")
+          print("TAG="+tag)
           PY
 
-          for MODE in none tail utility tail_utility; do
-            SUFFIX="${MODE}_t${TAIL_MAX}_q${U_QUANTILE}_r${RANK_BY}"
+          # 리스트 파싱(콤마 구분)
+          IFS=',' read -ra TAILS <<< "${TAIL_MAX_LIST}"
+          IFS=',' read -ra UQS   <<< "${U_QUANTILE_LIST}"
+          IFS=',' read -ra RANKS <<< "${RANK_BY_LIST}"
 
-            echo "[RUN] gate MODE=${MODE} SUFFIX=${SUFFIX}"
+          # 공백 트림 함수
+          trim () { echo "$1" | xargs; }
+
+          # 파일명 안전용(0.25 -> 0p25)
+          safe () { echo "$1" | sed 's/\./p/g' | sed 's/-/m/g'; }
+
+          run_one () {
+            local MODE="$1"
+            local TMAX="$2"
+            local UQ="$3"
+            local RANK="$4"
+
+            local TMAX_T="$(safe "$(trim "$TMAX")")"
+            local UQ_T="$(safe "$(trim "$UQ")")"
+            local RANK_T="$(trim "$RANK")"
+
+            local SUFFIX="${MODE}_t${TMAX_T}_q${UQ_T}_r${RANK_T}"
+
+            echo ""
+            echo "=============================="
+            echo "[RUN] mode=${MODE} tail_max=${TMAX} u_q=${UQ} rank_by=${RANK} suffix=${SUFFIX}"
+            echo "=============================="
 
             python scripts/predict_gate.py \
               --profit-target "${PT}" \
@@ -135,10 +161,10 @@ jobs:
               --stop-level "${SL}" \
               --max-extend-days "${EX}" \
               --gate-mode "${MODE}" \
-              --tail-max "${TAIL_MAX}" \
-              --u-quantile "${U_QUANTILE}" \
-              --rank-by "${RANK_BY}" \
-              --lambda-tail "${LAMBDA_TAIL}" \
+              --tail-max "$(trim "$TMAX")" \
+              --u-quantile "$(trim "$UQ")" \
+              --rank-by "${RANK_T}" \
+              --lambda-tail "${LAM}" \
               --out-suffix "${SUFFIX}"
 
             python scripts/simulate_single_position_engine.py \
@@ -152,6 +178,36 @@ jobs:
               --label "${SUFFIX}" \
               --out-suffix "${SUFFIX}" \
               --initial-seed 40000000
+          }
+
+          # ✅ baseline (none) — 1회만 (첫 값만 사용)
+          BASE_T="${TAILS[0]}"
+          BASE_Q="${UQS[0]}"
+          for R in "${RANKS[@]}"; do
+            run_one "none" "${BASE_T}" "${BASE_Q}" "${R}"
+          done
+
+          # ✅ tail gate — tail list만 loop (u는 첫 값 고정)
+          for T in "${TAILS[@]}"; do
+            for R in "${RANKS[@]}"; do
+              run_one "tail" "${T}" "${BASE_Q}" "${R}"
+            done
+          done
+
+          # ✅ utility gate — u list만 loop (tail은 첫 값 고정)
+          for Q in "${UQS[@]}"; do
+            for R in "${RANKS[@]}"; do
+              run_one "utility" "${BASE_T}" "${Q}" "${R}"
+            done
+          done
+
+          # ✅ tail + utility gate — cartesian (tail x u)
+          for T in "${TAILS[@]}"; do
+            for Q in "${UQS[@]}"; do
+              for R in "${RANKS[@]}"; do
+                run_one "tail_utility" "${T}" "${Q}" "${R}"
+              done
+            done
           done
 
       - name: Merge gate summaries
