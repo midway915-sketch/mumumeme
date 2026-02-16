@@ -9,305 +9,213 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
+
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
-FEATURE_DIR = DATA_DIR / "features"
+FEAT_DIR = DATA_DIR / "features"
 LABEL_DIR = DATA_DIR / "labels"
 
 PRICES_PARQUET = RAW_DIR / "prices.parquet"
 PRICES_CSV = RAW_DIR / "prices.csv"
-FEATURES_PARQUET = FEATURE_DIR / "features.parquet"
-FEATURES_CSV = FEATURE_DIR / "features.csv"
+
+FEATURES_PARQUET = FEAT_DIR / "features_model.parquet"
+FEATURES_CSV = FEAT_DIR / "features_model.csv"
+
+OUT_STRATEGY_RAW = DATA_DIR / "strategy_raw_data.csv"
+
+DEFAULT_FEATURE_COLS = [
+    "Drawdown_252",
+    "Drawdown_60",
+    "ATR_ratio",
+    "Z_score",
+    "MACD_hist",
+    "MA20_slope",
+    "Market_Drawdown",
+    "Market_ATR_ratio",
+]
 
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def fmt_tag(pt: float, max_days: int, sl: float, max_ext: int) -> str:
+def fmt_tag(pt: float, max_days: int, sl: float, ex: int) -> str:
     pt_tag = int(round(pt * 100))
     sl_tag = int(round(abs(sl) * 100))
-    return f"pt{pt_tag}_h{max_days}_sl{sl_tag}_ex{max_ext}"
+    return f"pt{pt_tag}_h{max_days}_sl{sl_tag}_ex{ex}"
 
 
-def load_prices() -> pd.DataFrame:
-    if PRICES_PARQUET.exists():
-        df = pd.read_parquet(PRICES_PARQUET)
-    elif PRICES_CSV.exists():
-        df = pd.read_csv(PRICES_CSV)
-    else:
-        raise FileNotFoundError("No prices found. Run scripts/fetch_prices.py first.")
-
-    df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"])
-    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-    df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    return df
+def read_table(parq: Path, csv: Path) -> pd.DataFrame:
+    if parq.exists():
+        return pd.read_parquet(parq)
+    if csv.exists():
+        return pd.read_csv(csv)
+    raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
 
 
-def load_feature_tickers() -> list[str]:
-    if FEATURES_PARQUET.exists():
-        f = pd.read_parquet(FEATURES_PARQUET, columns=["Ticker"])
-    elif FEATURES_CSV.exists():
-        f = pd.read_csv(FEATURES_CSV, usecols=["Ticker"])
-    else:
-        raise FileNotFoundError("features not found. Run scripts/build_features.py first.")
-    f["Ticker"] = f["Ticker"].astype(str).str.upper().str.strip()
-    return sorted(f["Ticker"].unique().tolist())
+def save_table(df: pd.DataFrame, parq: Path, csv: Path) -> str:
+    parq.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_parquet(parq, index=False)
+        return str(parq)
+    except Exception:
+        df.to_csv(csv, index=False)
+        return str(csv)
 
 
-def simulate_cycle(
-    i: int,
-    dates: np.ndarray,
-    close: np.ndarray,
-    high: np.ndarray,
-    low: np.ndarray,
-    profit_target: float,
-    max_days: int,
-    stop_level: float,
-    unit: float,
-    max_extend_days: int,
-) -> dict:
-    """
-    단일 티커/단일 사이클 시뮬(네 엔진 핵심 로직 반영)
-    - entry: close[i]
-    - 일반구간: PT 익절 or (max_days 도달 시) 조건부 손절/extend
-    - extend구간: avg*(1+stop_level) 회복손절이면 종료, 아니면 full DCA
-    - extend가 max_extend_days 초과면 강제 종료(실패 간주)
-    반환: CycleReturn, ExitDate, CycleDays, ExtendDays, MinCycleRet, MaxCycleRet, ExtendedFlag, ForcedExitFlag
-    """
-    n = len(close)
-    if i >= n or not np.isfinite(close[i]) or close[i] <= 0:
-        return {
-            "CycleReturn": np.nan,
-            "ExitDate": pd.NaT,
-            "CycleDays": 0,
-            "ExtendDays": 0,
-            "MinCycleRet": np.nan,
-            "MaxCycleRet": np.nan,
-            "ExtendedFlag": 0,
-            "ForcedExitFlag": 0,
-        }
+def forward_roll_max_excl_today(s: pd.Series, window: int) -> pd.Series:
+    return s[::-1].rolling(window, min_periods=window).max()[::-1].shift(-1)
 
-    invested = unit
-    shares = unit / close[i]
-    holding_day = 1
-    extending = False
-    extend_days = 0
-    extended_flag = 0
-    forced_flag = 0
 
-    min_ret = 0.0
-    max_ret = 0.0
-
-    for j in range(i + 1, n):
-        holding_day += 1
-
-        avg = invested / shares
-        mtm = (shares * close[j] - invested) / invested
-        if np.isfinite(mtm):
-            min_ret = min(min_ret, mtm)
-            max_ret = max(max_ret, mtm)
-
-        if not extending:
-            # 익절
-            if high[j] >= avg * (1.0 + profit_target):
-                exit_price = avg * (1.0 + profit_target)
-                proceeds = shares * exit_price
-                cycle_ret = (proceeds - invested) / invested
-                return {
-                    "CycleReturn": float(cycle_ret),
-                    "ExitDate": dates[j],
-                    "CycleDays": int(holding_day),
-                    "ExtendDays": int(extend_days),
-                    "MinCycleRet": float(min_ret),
-                    "MaxCycleRet": float(max_ret),
-                    "ExtendedFlag": int(extended_flag),
-                    "ForcedExitFlag": int(forced_flag),
-                }
-
-            # max_days 도달 분기
-            if holding_day >= max_days:
-                current_ret = (close[j] - avg) / avg
-                if current_ret >= stop_level:
-                    # 종가 청산
-                    exit_price = close[j]
-                    proceeds = shares * exit_price
-                    cycle_ret = (proceeds - invested) / invested
-                    return {
-                        "CycleReturn": float(cycle_ret),
-                        "ExitDate": dates[j],
-                        "CycleDays": int(holding_day),
-                        "ExtendDays": int(extend_days),
-                        "MinCycleRet": float(min_ret),
-                        "MaxCycleRet": float(max_ret),
-                        "ExtendedFlag": int(extended_flag),
-                        "ForcedExitFlag": int(forced_flag),
-                    }
-                else:
-                    # extend 시작
-                    extending = True
-                    extended_flag = 1
-
-            # 일반구간 DCA
-            avg = invested / shares
-            cp = close[j]
-            add = 0.0
-            if cp <= avg:
-                add = unit
-            elif cp <= avg * 1.05:
-                add = unit / 2.0
-
-            if add > 0 and cp > 0 and np.isfinite(cp):
-                invested += add
-                shares += add / cp
-
-        # extend 구간
-        if extending:
-            extend_days += 1
-            avg = invested / shares
-
-            # extend 너무 길면 강제 종료(실패 간주)
-            if extend_days > max_extend_days:
-                forced_flag = 1
-                exit_price = close[j]
-                proceeds = shares * exit_price
-                cycle_ret = (proceeds - invested) / invested
-                return {
-                    "CycleReturn": float(cycle_ret),
-                    "ExitDate": dates[j],
-                    "CycleDays": int(holding_day),
-                    "ExtendDays": int(extend_days),
-                    "MinCycleRet": float(min_ret),
-                    "MaxCycleRet": float(max_ret),
-                    "ExtendedFlag": int(extended_flag),
-                    "ForcedExitFlag": int(forced_flag),
-                }
-
-            # 회복손절
-            if high[j] >= avg * (1.0 + stop_level):
-                exit_price = avg * (1.0 + stop_level)
-                proceeds = shares * exit_price
-                cycle_ret = (proceeds - invested) / invested
-                return {
-                    "CycleReturn": float(cycle_ret),
-                    "ExitDate": dates[j],
-                    "CycleDays": int(holding_day),
-                    "ExtendDays": int(extend_days),
-                    "MinCycleRet": float(min_ret),
-                    "MaxCycleRet": float(max_ret),
-                    "ExtendedFlag": int(extended_flag),
-                    "ForcedExitFlag": int(forced_flag),
-                }
-
-            # full DCA
-            cp = close[j]
-            if cp > 0 and np.isfinite(cp):
-                invested += unit
-                shares += unit / cp
-
-    # 데이터 끝 → 미완료
-    return {
-        "CycleReturn": np.nan,
-        "ExitDate": pd.NaT,
-        "CycleDays": int(holding_day),
-        "ExtendDays": int(extend_days),
-        "MinCycleRet": float(min_ret),
-        "MaxCycleRet": float(max_ret),
-        "ExtendedFlag": int(extended_flag),
-        "ForcedExitFlag": int(forced_flag),
-    }
+def forward_roll_min_excl_today(s: pd.Series, window: int) -> pd.Series:
+    return s[::-1].rolling(window, min_periods=window).min()[::-1].shift(-1)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Build strategy labels (Success + Tail).")
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
-    ap.add_argument("--unit", type=float, default=1.0)
-    ap.add_argument("--max-extend-days", type=int, default=30, help="extend가 이 일수 넘으면 강제 종료(실패 간주)")
+    ap.add_argument("--max-extend-days", type=int, required=True)
+
+    ap.add_argument("--tail-threshold", type=float, default=-0.30,
+                    help="Tail event threshold as return (e.g. -0.30 means -30% drawdown event).")
+
+    ap.add_argument("--features-path", type=str, default=None)
+    ap.add_argument("--feature-cols", type=str, default="",
+                    help="콤마로 feature 컬럼 지정(비우면 기본 8개)")
     args = ap.parse_args()
 
-    prices = load_prices()
-    tickers = load_feature_tickers()
+    pt = float(args.profit_target)
+    max_days = int(args.max_days)
+    sl = float(args.stop_level)
+    ex = int(args.max_extend_days)
+    tail_thr = float(args.tail_threshold)
 
-    tag = fmt_tag(args.profit_target, args.max_days, args.stop_level, args.max_extend_days)
+    tag = fmt_tag(pt, max_days, sl, ex)
+
+    # load prices
+    prices = read_table(PRICES_PARQUET, PRICES_CSV).copy()
+    prices["Date"] = pd.to_datetime(prices["Date"])
+    prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
+    prices = prices.sort_values(["Ticker", "Date"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
+
+    need_px = {"Date", "Ticker", "High", "Low", "Close"}
+    miss_px = [c for c in need_px if c not in prices.columns]
+    if miss_px:
+        raise ValueError(f"prices missing columns: {miss_px}")
+
+    # load features_model
+    if args.features_path:
+        fp = Path(args.features_path)
+        if not fp.exists():
+            raise FileNotFoundError(f"features-path not found: {fp}")
+        feats = pd.read_parquet(fp) if fp.suffix.lower() == ".parquet" else pd.read_csv(fp)
+    else:
+        feats = read_table(FEATURES_PARQUET, FEATURES_CSV)
+
+    feats = feats.copy()
+    feats["Date"] = pd.to_datetime(feats["Date"])
+    feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
+    feats = feats.sort_values(["Ticker", "Date"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
+
+    feature_cols = DEFAULT_FEATURE_COLS
+    if str(args.feature_cols).strip():
+        feature_cols = [c.strip() for c in args.feature_cols.split(",") if c.strip()]
+
+    missing_feat = [c for c in feature_cols if c not in feats.columns]
+    if missing_feat:
+        raise ValueError(f"features_model missing feature columns: {missing_feat}")
+
+    # merge prices into features to label
+    base = feats[["Date", "Ticker"] + feature_cols].merge(
+        prices[["Date", "Ticker", "High", "Low", "Close"]],
+        on=["Date", "Ticker"],
+        how="left",
+        validate="one_to_one",
+    )
+
+    base = base.dropna(subset=["Close"] + feature_cols).reset_index(drop=True)
+    base = base.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+
+    # horizons
+    success_h = max_days
+    tail_h = max_days + ex  # “max_days 이후 연장구간까지”를 대충 대표하는 관측창
+
+    out = []
+    for tkr, g in base.groupby("Ticker", sort=False):
+        g = g.sort_values("Date").reset_index(drop=True)
+
+        close = g["Close"].astype(float)
+        high = g["High"].astype(float)
+        low = g["Low"].astype(float)
+
+        fut_max_high_success = forward_roll_max_excl_today(high, success_h)
+        fut_min_low_tail = forward_roll_min_excl_today(low, tail_h)
+
+        success = (fut_max_high_success >= close * (1.0 + pt)).astype("float")
+
+        # tail: horizon 내 한번이라도 tail_thr 이하 DD 찍었는지
+        fut_dd_tail = (fut_min_low_tail / close) - 1.0
+        tail = (fut_dd_tail <= tail_thr).astype("float")
+
+        # 참고용: max_days 시점 close 수익률(엔진의 extending 진입 조건 근사)
+        # holding_day=1이 entry day이므로 holding_day=max_days => entry+(max_days-1)일
+        offset = max_days - 1
+        close_at_max = close.shift(-offset)
+        ret_at_max = (close_at_max / close) - 1.0
+
+        extend_needed = ((success == 0) & (ret_at_max < sl)).astype("float")
+
+        g["Success"] = success
+        g["Tail"] = tail
+        g["FutureMinDD_TailH"] = fut_dd_tail
+        g["RetAtMaxDays"] = ret_at_max
+        g["ExtendNeeded"] = extend_needed
+
+        g = g.dropna(subset=["Success", "Tail", "FutureMinDD_TailH", "RetAtMaxDays", "ExtendNeeded"]).reset_index(drop=True)
+        out.append(g)
+
+    labeled = pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+    if labeled.empty:
+        raise RuntimeError("No strategy labeled rows produced. Check horizons and raw data.")
+
+    labeled["Success"] = labeled["Success"].astype(int)
+    labeled["Tail"] = labeled["Tail"].astype(int)
+    labeled["ExtendNeeded"] = labeled["ExtendNeeded"].astype(int)
+
     LABEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    out_path = LABEL_DIR / f"strategy_labels_{tag}.parquet"
-    out_csv = LABEL_DIR / f"strategy_labels_{tag}.csv"
-    meta_path = LABEL_DIR / f"strategy_labels_{tag}_meta.json"
+    out_parq = LABEL_DIR / f"strategy_raw_data_{tag}.parquet"
+    out_csv = LABEL_DIR / f"strategy_raw_data_{tag}.csv"
+    saved_to = save_table(labeled, out_parq, out_csv)
 
-    rows = []
-    for t in tickers:
-        d = prices[prices["Ticker"] == t].copy()
-        if d.empty:
-            continue
-        d = d.dropna(subset=["Close", "High", "Low"]).sort_values("Date").reset_index(drop=True)
-        if len(d) < args.max_days + 10:
-            continue
-
-        dates = d["Date"].to_numpy()
-        close = d["Close"].astype(float).to_numpy()
-        high = d["High"].astype(float).to_numpy()
-        low = d["Low"].astype(float).to_numpy()
-
-        for i in range(len(d)):
-            r = simulate_cycle(
-                i=i,
-                dates=dates,
-                close=close,
-                high=high,
-                low=low,
-                profit_target=args.profit_target,
-                max_days=args.max_days,
-                stop_level=args.stop_level,
-                unit=args.unit,
-                max_extend_days=args.max_extend_days,
-            )
-            rows.append(
-                {
-                    "Date": dates[i],
-                    "Ticker": t,
-                    **r,
-                }
-            )
-
-    lab = pd.DataFrame(rows).sort_values(["Date", "Ticker"]).reset_index(drop=True)
-
-    # 미완료 제거(학습용)
-    before = len(lab)
-    lab = lab.dropna(subset=["CycleReturn", "ExitDate"]).reset_index(drop=True)
-    after = len(lab)
-    print(f"[INFO] drop unfinished: {before} -> {after}")
-
-    saved_to = ""
-    try:
-        lab.to_parquet(out_path, index=False)
-        saved_to = f"parquet:{out_path}"
-    except Exception as e:
-        print(f"[WARN] parquet save failed ({e}), saving csv: {out_csv}")
-        lab.to_csv(out_csv, index=False)
-        saved_to = f"csv:{out_csv}"
+    labeled.to_csv(OUT_STRATEGY_RAW, index=False)
 
     meta = {
         "updated_at_utc": now_utc_iso(),
-        "saved_to": saved_to,
         "tag": tag,
-        "profit_target": args.profit_target,
-        "max_days": args.max_days,
-        "stop_level": args.stop_level,
-        "unit": args.unit,
-        "max_extend_days": args.max_extend_days,
-        "rows": int(len(lab)),
-        "min_date": str(lab["Date"].min().date()) if len(lab) else None,
-        "max_date": str(lab["Date"].max().date()) if len(lab) else None,
-        "tickers": tickers,
+        "profit_target": pt,
+        "max_days": max_days,
+        "stop_level": sl,
+        "max_extend_days": ex,
+        "tail_threshold": tail_thr,
+        "rows": int(len(labeled)),
+        "base_success_rate": float(labeled["Success"].mean()),
+        "base_tail_rate": float(labeled["Tail"].mean()),
+        "base_extend_needed_rate": float(labeled["ExtendNeeded"].mean()),
+        "min_date": str(labeled["Date"].min().date()),
+        "max_date": str(labeled["Date"].max().date()),
+        "saved_to": saved_to,
+        "also_written": str(OUT_STRATEGY_RAW),
+        "feature_cols": feature_cols,
+        "tail_horizon_days": int(tail_h),
     }
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (LABEL_DIR / f"strategy_raw_data_{tag}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    print(f"[DONE] {saved_to} rows={len(lab)}")
-    print(lab.head(5).to_string(index=False))
+    print(f"[DONE] strategy labels saved -> {saved_to}")
+    print(f"[DONE] also wrote -> {OUT_STRATEGY_RAW}")
+    print(json.dumps(meta, ensure_ascii=False))
 
 
 if __name__ == "__main__":
