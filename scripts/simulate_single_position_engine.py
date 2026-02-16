@@ -427,12 +427,17 @@ def main() -> None:
         avg_hold = float(closed_trades["HoldingDays"].mean()) if n_closed > 0 else 0.0
         avg_lev = float(closed_trades["LeveragePctMax"].replace([np.inf, -np.inf], np.nan).dropna().mean()) if n_closed > 0 else 0.0
         max_lev = float(closed_trades["LeveragePctMax"].replace([np.inf, -np.inf], np.nan).dropna().max()) if n_closed > 0 else 0.0
+        avg_cycle_unit = float(closed_trades["CycleUnit"].mean()) if n_closed > 0 else 0.0
+        max_cycle_unit = float(closed_trades["CycleUnit"].max()) if n_closed > 0 else 0.0
 
         summary = {
             "method": method_key,
             "tag": tag,
             "initial_seed": float(args.initial_seed),
-            "daily_buy": daily_buy,
+            "cycle_unit_mode": ("fixed" if fixed_daily_buy is not None else "entry_seed_div_max_days"),
+            "fixed_daily_buy": (float(fixed_daily_buy) if fixed_daily_buy is not None else None),
+            "avg_cycle_unit_closed": avg_cycle_unit,
+            "max_cycle_unit_closed": max_cycle_unit,
             "final_equity": float(final_equity),
             "total_return": float(final_equity / float(args.initial_seed) - 1.0) if args.initial_seed != 0 else np.nan,
             "max_drawdown": float(max_dd),
