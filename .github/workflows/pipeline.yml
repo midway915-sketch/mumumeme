@@ -1,30 +1,68 @@
-name: daily-pipeline
+name: mumumeme-pipeline
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      PROFIT_TARGET:
+        description: "profit target (e.g. 0.10)"
+        required: true
+        default: "0.10"
+      HOLDING_DAYS:
+        description: "max holding days (e.g. 40)"
+        required: true
+        default: "40"
+      STOP_LEVEL:
+        description: "stop level (e.g. -0.10)"
+        required: true
+        default: "-0.10"
+      MAX_EXTEND_DAYS:
+        description: "max extend days (e.g. 30)"
+        required: true
+        default: "30"
+      TAIL_THRESHOLD:
+        description: "tail threshold for MinCycleRet (e.g. -0.30)"
+        required: true
+        default: "-0.30"
+      LAMBDA_RISK:
+        description: "utility lambda for p_tail (e.g. 0.05)"
+        required: true
+        default: "0.05"
+      TOPK:
+        description: "gate top-k by p_pos (e.g. 5)"
+        required: true
+        default: "5"
+
+  # KST 07:20 (UTC 22:20) 월~금 자동 실행 예시
   schedule:
-    # GitHub Actions cron is UTC
-    # 00:30 UTC = 09:30 KST
-    - cron: "30 0 * * *"
+    - cron: "20 22 * * 1-5"
 
 concurrency:
-  group: pipeline-${{ github.ref }}
+  group: mumumeme-pipeline
   cancel-in-progress: true
-
-permissions:
-  contents: read
-
-env:
-  PYTHONUNBUFFERED: "1"
-  # 기본 라벨/모델 파라미터(너가 바꾸면 여기만 바꿔도 됨)
-  PROFIT_TARGET: "0.10"
-  HOLDING_DAYS: "40"
-  STOP_LEVEL: "-0.10"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 35
+
+    env:
+      # workflow_dispatch 값이 있으면 그것을 쓰고, 없으면 default
+      PROFIT_TARGET: ${{ inputs.PROFIT_TARGET || '0.10' }}
+      HOLDING_DAYS: ${{ inputs.HOLDING_DAYS || '40' }}
+      STOP_LEVEL: ${{ inputs.STOP_LEVEL || '-0.10' }}
+      MAX_EXTEND_DAYS: ${{ inputs.MAX_EXTEND_DAYS || '30' }}
+
+      TAIL_THRESHOLD: ${{ inputs.TAIL_THRESHOLD || '-0.30' }}
+      LAMBDA_RISK: ${{ inputs.LAMBDA_RISK || '0.05' }}
+      TOPK: ${{ inputs.TOPK || '5' }}
+
+      # killswitch 기본값(원하면 inputs로 빼도 됨)
+      SOFT_VIX: "30"
+      HARD_VIX: "40"
+      SOFT_DD60: "0.12"
+      HARD_DD60: "0.18"
+      SOFT_TOPK: "2"
+      SOFT_LAMBDA: "0.10"
 
     steps:
       - name: Checkout
@@ -34,29 +72,93 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: |
-            requirements.txt
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      # raw 데이터(가격) 캐시: yfinance 재다운로드 최소화
-      # 캐시는 "키가 같으면 저장이 안되므로" run_number를 키에 넣고,
-      # restore-keys로 직전 캐시를 끌어오게 구성
-      - name: Restore raw data cache
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: |
-            data/raw/
-          key: raw-${{ runner.os }}-${{ hashFiles('data/universe.csv', 'scripts/universe.py') }}-${{ github.run_number }}
+            ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
-            raw-${{ runner.os }}-${{ hashFiles('data/universe.csv', 'scripts/universe.py') }}-
-            raw-${{ runner.os }}-
+            ${{ runner.os }}-pip-
 
-      - name: Build universe.csv
+      - name: Install dependencies
+        run: |
+          python -V
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Make label tag (ptXX_hYY_slZZ_exWW)
+        run: |
+          python - <<'PY' >> $GITHUB_ENV
+          pt = float("${PROFIT_TARGET}")
+          h  = int("${HOLDING_DAYS}")
+          sl = float("${STOP_LEVEL}")
+          ex = int("${MAX_EXTEND_DAYS}")
+          pt_tag = int(round(pt*100))
+          sl_tag = int(round(abs(sl)*100))
+          tag = f"pt{pt_tag}_h{h}_sl{sl_tag}_ex{ex}"
+          print(f"LABEL_TAG={tag}")
+          PY
+
+      - name: Build universe
         run: |
           python scripts/universe.py
-          ls -la data | sed -n '1,200p'
+
+      - name: Fetch prices (Yahoo Finance)
+        run: |
+          # 네 fetch_prices.py CLI에 맞게 옵션 수정 가능
+          python scripts/fetch_prices.py
+
+      - name: Build features (strict mode)
+        run: |
+          # 네 build_features.py CLI에 맞게 옵션 수정 가능
+          python scripts/build_features.py
+
+      - name: Build strategy labels (engine-sim labels)
+        run: |
+          python scripts/build_strategy_labels.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${HOLDING_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}"
+
+      - name: Build EV features (EV as features; leakage-safe via ExitDate)
+        run: |
+          python scripts/build_ev_features.py \
+            --label-tag "${LABEL_TAG}" \
+            --ev-windows "50,200" \
+            --add-cs-rank
+
+      - name: Train strategy models (p_pos + pred_ret + p_tail)
+        run: |
+          python scripts/train_strategy_models.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${HOLDING_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}" \
+            --tail-threshold "${TAIL_THRESHOLD}"
+
+      - name: Predict & select (utility + killswitch + shadow)
+        run: |
+          python scripts/predict_select.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${HOLDING_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}" \
+            --tail-threshold "${TAIL_THRESHOLD}" \
+            --lambda-risk "${LAMBDA_RISK}" \
+            --topk "${TOPK}" \
+            --soft-vix "${SOFT_VIX}" --hard-vix "${HARD_VIX}" \
+            --soft-dd60 "${SOFT_DD60}" --hard-dd60 "${HARD_DD60}" \
+            --soft-topk "${SOFT_TOPK}" --soft-lambda "${SOFT_LAMBDA}" \
+            --shadow-on-skip
+
+      - name: Upload artifacts (signals/models/logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mumumeme-artifacts-${{ env.LABEL_TAG }}
+          path: |
+            data/**
+            app/model/**
+          if-no-files-found: warn
