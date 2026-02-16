@@ -169,6 +169,59 @@ jobs:
             python scripts/build_features.py
           fi
 
+      - name: Normalize features output (ensure features_model.*)
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+
+          feat_dir = Path("data/features")
+          feat_dir.mkdir(parents=True, exist_ok=True)
+
+          target_parq = feat_dir / "features_model.parquet"
+          target_csv  = feat_dir / "features_model.csv"
+
+          if target_parq.exists() or target_csv.exists():
+            print("[SKIP] features_model already exists")
+            raise SystemExit(0)
+
+          candidates = []
+          candidates += list(feat_dir.glob("*.parquet"))
+          candidates += list(feat_dir.glob("*.csv"))
+          candidates = [p for p in candidates if p.is_file()]
+
+          if not candidates:
+            raise FileNotFoundError(f"No feature files found in {feat_dir}. build_features.py output 확인 필요.")
+
+          candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+          chosen = None
+          for p in candidates:
+            try:
+              df = pd.read_parquet(p) if p.suffix.lower()==".parquet" else pd.read_csv(p)
+              if {"Date","Ticker"}.issubset(df.columns):
+                chosen = (p, df)
+                break
+            except Exception as e:
+              print("[WARN] cannot read", p, e)
+
+          if chosen is None:
+            raise RuntimeError("No usable feature file (need Date/Ticker columns).")
+
+          p, df = chosen
+          print("[INFO] chosen features file:", p)
+
+          # write canonical
+          try:
+            df.to_parquet(target_parq, index=False)
+            print("[DONE] wrote", target_parq)
+          except Exception as e:
+            print("[WARN] parquet write failed:", e, "-> writing csv")
+            df.to_csv(target_csv, index=False)
+            print("[DONE] wrote", target_csv)
+          PY
+
+
       # Labels (Success) -> data/raw_data.csv
       - name: Build labels (Success) - if missing for TAG
         run: |
