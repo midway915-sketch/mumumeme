@@ -437,6 +437,58 @@ jobs:
             echo "[WARN] scripts/merge_gate_summaries.py not found (skip merge)"
           fi
 
+      - name: Build gate summary CSV (recent10y + maxextend + cycles + success)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+
+          # pyarrow가 없으면 parquet 읽기에서 죽을 수 있어서 안전하게 보장
+          python - <<'PY'
+          import importlib, sys
+          try:
+            importlib.import_module("pyarrow")
+            print("[OK] pyarrow exists")
+          except Exception:
+            print("[WARN] pyarrow missing -> installing")
+            sys.exit(1)
+          PY
+        continue-on-error: true
+
+      - name: Ensure pyarrow (if missing)
+        if: ${{ failure() }}
+        run: |
+          pip install -U pyarrow
+
+      - name: Make gate summary csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+
+          python scripts/make_gate_summary.py \
+            --tag "${TAG}" \
+            --max-days "${HOLDING_DAYS}" \
+            --recent-years 10
+
+          echo "=== produced files ==="
+          ls -la data/signals | tail -n 200
+
+      - name: Upload gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-results-${{ env.TAG }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            data/signals/gate_summary_${{ env.TAG }}.csv
+            data/signals/sim_engine_summary_${{ env.TAG }}_GATES_ALL.csv
+            data/signals/picks_${{ env.TAG }}_gate_*.csv
+            data/signals/sim_engine_trade_log_${{ env.TAG }}_*.csv
+            data/signals/sim_engine_curve_${{ env.TAG }}_*.parquet
+
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
