@@ -155,6 +155,16 @@ jobs:
             --soft-topk "${SOFT_TOPK}" --soft-lambda "${SOFT_LAMBDA}" \
             --shadow-on-skip
 
+      - name: Simulate single-position (all methods)
+        run: |
+          python scripts/simulate_single_position.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${HOLDING_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}" \
+            --method all \
+            --initial-equity 1.0
+
       - name: Simulate engine single-position (daily fixed buy, loan allowed, no same-day reentry, unlimited extend)
         run: |
           python scripts/simulate_single_position_engine.py \
