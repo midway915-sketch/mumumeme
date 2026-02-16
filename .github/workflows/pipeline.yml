@@ -110,7 +110,7 @@ jobs:
 
       - name: Fetch prices (Yahoo Finance)
         run: |
-          python scripts/fetch_prices.py --include-extra --reset --force-full
+          python scripts/fetch_prices.py --include-extra --reset --force-full --period max
 
       - name: Build features (strict mode)
         run: |
