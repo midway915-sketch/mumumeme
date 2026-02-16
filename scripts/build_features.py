@@ -238,4 +238,224 @@ def eligibility_filter(prices: pd.DataFrame, universe: pd.DataFrame) -> tuple[li
 
 def build_features_for_ticker(df: pd.DataFrame, market_feat: pd.DataFrame, vix_feat: pd.DataFrame) -> pd.DataFrame:
     """
-    단일 티커 피처 생성. raw 가격은 채우지
+    단일 티커 피처 생성. raw 가격은 채우지 않고, 계산 결과 NaN은 나중에 drop.
+    """
+    d = df.sort_values("Date").reset_index(drop=True).copy()
+
+    close = d["AdjClose"].astype(float)  # 수익률은 adj가 더 안정적
+    px = d["Close"].astype(float)
+    high = d["High"].astype(float)
+    low = d["Low"].astype(float)
+    open_ = d["Open"].astype(float)
+    vol = d["Volume"].astype(float)
+
+    ret1 = close.pct_change(1)
+    ret5 = close.pct_change(5)
+    ret10 = close.pct_change(10)
+    ret20 = close.pct_change(20)
+    ret60 = close.pct_change(60)
+
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    ma200 = close.rolling(200, min_periods=200).mean()
+
+    ma20_slope = ma20.pct_change(5)
+    ma60_slope = ma60.pct_change(10)
+
+    std20 = close.rolling(20, min_periods=20).std()
+    z20 = (close - ma20) / std20
+
+    atr14 = atr(high, low, px, 14)
+    atr_ratio = atr14 / px
+
+    rvol20 = ret1.rolling(20, min_periods=20).std() * np.sqrt(252)
+    down_vol20 = ret1.where(ret1 < 0).rolling(20, min_periods=20).std() * np.sqrt(252)
+
+    # Drawdown (현재 drawdown)
+    roll_max_252 = close.rolling(252, min_periods=252).max()
+    dd252 = close / roll_max_252 - 1.0
+    roll_max_60 = close.rolling(60, min_periods=60).max()
+    dd60 = close / roll_max_60 - 1.0
+
+    # Rolling max drawdown
+    # (drawdown series 대비 rolling min)
+    dd_series = close / close.cummax() - 1.0
+    maxdd_60 = dd_series.rolling(60, min_periods=60).min()
+    maxdd_252 = dd_series.rolling(252, min_periods=252).min()
+
+    # Bollinger
+    bb_ma, bb_up, bb_low = bollinger(close, 20, 2.0)
+    bb_width = (bb_up - bb_low) / bb_ma
+    bb_pos = (close - bb_low) / (bb_up - bb_low).replace(0, np.nan)
+
+    # MACD hist
+    macd_h = macd_hist(close)
+
+    # RSI
+    rsi14 = rsi(close, 14)
+
+    # Candles / gap
+    prev_close = px.shift(1)
+    gap = open_ / prev_close - 1.0
+    true_range = (high - low).abs()
+    rng = true_range / px
+    body = (px - open_).abs() / px
+    upper_wick = (high - np.maximum(px, open_)) / px
+    lower_wick = (np.minimum(px, open_) - low) / px
+    close_pos = (px - low) / (high - low).replace(0, np.nan)
+
+    # Volume / liquidity proxies
+    dollar_vol = px * vol
+    dollar_vol_ma20 = dollar_vol.rolling(20, min_periods=20).mean()
+    dollar_vol_ma252 = dollar_vol.rolling(252, min_periods=252).mean()
+    dollar_vol_ratio = dollar_vol_ma20 / dollar_vol_ma252
+
+    vol_ma20 = vol.rolling(20, min_periods=20).mean()
+    vol_sd20 = vol.rolling(20, min_periods=20).std()
+    vol_z20 = (vol - vol_ma20) / vol_sd20
+
+    # OBV & slope
+    obv = (np.sign(ret1.fillna(0)) * vol.fillna(0)).cumsum()
+    obv_slope20 = obv.pct_change(20)
+
+    # Tail risk
+    worst_ret_20 = ret1.rolling(20, min_periods=20).min()
+    max_gap_down_60 = gap.rolling(60, min_periods=60).min()
+
+    out = pd.DataFrame(
+        {
+            "Date": d["Date"],
+            "Ticker": d["Ticker"],
+            # --- 기존 호환 이름 (너가 쓰던 것) ---
+            "Drawdown_252": dd252,
+            "Drawdown_60": dd60,
+            "ATR_ratio": atr_ratio,
+            "Z_score": z20,
+            "MACD_hist": macd_h,
+            "MA20_slope": ma20_slope,
+            # --- 확장 피처 ---
+            "ret_1d": ret1,
+            "ret_5d": ret5,
+            "ret_10d": ret10,
+            "ret_20d": ret20,
+            "ret_60d": ret60,
+            "price_vs_ma20": close / ma20 - 1.0,
+            "price_vs_ma60": close / ma60 - 1.0,
+            "price_vs_ma200": close / ma200 - 1.0,
+            "MA60_slope": ma60_slope,
+            "realized_vol_20": rvol20,
+            "downside_vol_20": down_vol20,
+            "max_drawdown_60": maxdd_60,
+            "max_drawdown_252": maxdd_252,
+            "bb_width": bb_width,
+            "bb_pos": bb_pos,
+            "rsi_14": rsi14,
+            "gap": gap,
+            "range": rng,
+            "body": body,
+            "upper_wick": upper_wick,
+            "lower_wick": lower_wick,
+            "close_position": close_pos,
+            "dollar_vol_ma20": dollar_vol_ma20,
+            "dollar_vol_ratio": dollar_vol_ratio,
+            "vol_zscore_20": vol_z20,
+            "obv_slope_20": obv_slope20,
+            "worst_ret_20": worst_ret_20,
+            "max_gap_down_60": max_gap_down_60,
+        }
+    )
+
+    # merge market + vix by Date
+    out = out.merge(market_feat, on="Date", how="left")
+    out = out.merge(vix_feat, on="Date", how="left")
+
+    # corr/beta with market (using daily returns)
+    # (merge 후 계산해도 되지만, 여기서 간단히)
+    m = market_feat.set_index("Date")["Market_ret_1d"]
+    out = out.set_index("Date")
+    out["corr_mkt_60"] = out["ret_1d"].rolling(60, min_periods=60).corr(m.reindex(out.index))
+    out["beta_mkt_60"] = rolling_beta(out["ret_1d"], m.reindex(out.index), 60)
+    out = out.reset_index()
+
+    return out
+
+
+def save_features(df: pd.DataFrame) -> str:
+    FEATURE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_parquet(OUT_PARQUET, index=False)
+        return f"parquet:{OUT_PARQUET}"
+    except Exception as e:
+        print(f"[WARN] parquet save failed ({e}). saving csv fallback: {OUT_CSV_FALLBACK}")
+        df.to_csv(OUT_CSV_FALLBACK, index=False)
+        return f"csv:{OUT_CSV_FALLBACK}"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-window", type=int, default=252, help="Max rolling window; implicit warm-up.")
+    parser.add_argument("--strict-dropna", action="store_true", help="Drop any row with NaN in feature columns.")
+    args = parser.parse_args()
+
+    prices = load_prices()
+    universe = load_universe()
+
+    # eligibility filter
+    eligible, excluded = eligibility_filter(prices, universe)
+
+    # market frames
+    market_feat, vix_feat = compute_market_frames(prices, args.max_window)
+
+    # build per ticker
+    feats_all = []
+    for t in eligible:
+        d = prices[prices["Ticker"] == t].copy()
+
+        # raw 결측은 채우지 않음: 피처 계산 전에 최소한의 유효값만 남김
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "AdjClose", "Volume"])
+        if d.empty:
+            excluded.append({"Ticker": t, "Reason": "all_rows_missing_after_dropna"})
+            continue
+
+        f = build_features_for_ticker(d, market_feat, vix_feat)
+        feats_all.append(f)
+
+    if not feats_all:
+        raise RuntimeError("No eligible tickers produced features. Check eligibility thresholds and raw data.")
+
+    features_df = pd.concat(feats_all, ignore_index=True).sort_values(["Date", "Ticker"]).reset_index(drop=True)
+
+    # strict NaN drop (features columns only)
+    feature_cols = [c for c in features_df.columns if c not in ("Date", "Ticker")]
+    if args.strict_dropna or True:
+        before = len(features_df)
+        features_df = features_df.dropna(subset=feature_cols).reset_index(drop=True)
+        after = len(features_df)
+        print(f"[INFO] strict dropna: {before} -> {after} rows")
+
+    # Start only after max window is effectively satisfied:
+    # (dropna already handles warm-up, but this makes intent explicit)
+    # We'll still keep it simple and trust dropna.
+
+    saved_to = save_features(features_df)
+
+    meta = {
+        "updated_at_utc": now_utc_iso(),
+        "saved_to": saved_to,
+        "rows": int(len(features_df)),
+        "min_date": str(features_df["Date"].min().date()),
+        "max_date": str(features_df["Date"].max().date()),
+        "eligible_tickers": eligible,
+        "excluded": excluded,
+        "feature_columns": feature_cols,
+        "market_ticker": MARKET_TICKER,
+        "vix_ticker": VIX_TICKER,
+    }
+    META_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    print(f"[DONE] features saved={saved_to} rows={len(features_df)} tickers={len(eligible)}")
+    print(features_df.head(5).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
