@@ -21,7 +21,9 @@ PRICES_CSV = RAW_DIR / "prices.csv"
 FEATURES_PARQUET = FEAT_DIR / "features_model.parquet"
 FEATURES_CSV = FEAT_DIR / "features_model.csv"
 
-OUT_RAW_CSV = DATA_DIR / "raw_data.csv"  # train_model.py 기본 입력
+OUT_RAW_CSV = DATA_DIR / "raw_data.csv"
+
+MARKET_TICKER = "SPY"
 
 DEFAULT_FEATURE_COLS = [
     "Drawdown_252",
@@ -64,11 +66,6 @@ def save_table(df: pd.DataFrame, parq: Path, csv: Path) -> str:
 
 
 def auto_load_features(features_path: str | None) -> tuple[pd.DataFrame, str]:
-    """
-    1) --features-path가 있으면 그걸 사용
-    2) 기본 features_model.* 있으면 사용
-    3) 없으면 data/features 내에서 Date/Ticker 컬럼 있는 파일 자동탐색
-    """
     if features_path:
         fp = Path(features_path)
         if not fp.exists():
@@ -84,12 +81,10 @@ def auto_load_features(features_path: str | None) -> tuple[pd.DataFrame, str]:
     if not FEAT_DIR.exists():
         raise FileNotFoundError(f"features dir not found: {FEAT_DIR}")
 
-    # 후보: parquet 우선, 없으면 csv. 최신 수정 파일부터
     candidates = []
-    for ext in ("*.parquet", "*.csv"):
-        candidates.extend(FEAT_DIR.glob(ext))
+    candidates += list(FEAT_DIR.glob("*.parquet"))
+    candidates += list(FEAT_DIR.glob("*.csv"))
     candidates = [p for p in candidates if p.is_file()]
-
     if not candidates:
         raise FileNotFoundError(
             f"Missing file: {FEATURES_PARQUET} (or {FEATURES_CSV}) and no candidates in {FEAT_DIR}"
@@ -101,8 +96,7 @@ def auto_load_features(features_path: str | None) -> tuple[pd.DataFrame, str]:
     for p in candidates:
         try:
             df = pd.read_parquet(p) if p.suffix.lower() == ".parquet" else pd.read_csv(p)
-            cols = set(df.columns)
-            if {"Date", "Ticker"}.issubset(cols):
+            if {"Date", "Ticker"}.issubset(df.columns):
                 return df, str(p)
         except Exception as e:
             last_err = e
@@ -113,15 +107,78 @@ def auto_load_features(features_path: str | None) -> tuple[pd.DataFrame, str]:
     )
 
 
+def compute_market_frame_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Market_Drawdown: SPY 기준 252일 롤링 고점 대비 드로우다운
+    Market_ATR_ratio: SPY ATR(14) / Close
+    """
+    px = prices.copy()
+    px["Date"] = pd.to_datetime(px["Date"])
+    px["Ticker"] = px["Ticker"].astype(str).str.upper().str.strip()
+
+    m = px[px["Ticker"] == MARKET_TICKER].sort_values("Date").copy()
+    if m.empty:
+        raise RuntimeError(f"Market ticker {MARKET_TICKER} not found in prices. Run fetch_prices.py --include-extra")
+
+    for c in ["Open", "High", "Low", "Close"]:
+        if c not in m.columns:
+            raise ValueError(f"prices missing {c} for market ticker {MARKET_TICKER}")
+
+    close = m["Close"].astype(float)
+    high = m["High"].astype(float)
+    low = m["Low"].astype(float)
+
+    # Drawdown_252
+    roll_max = close.rolling(252, min_periods=252).max()
+    mdd = (close / roll_max) - 1.0
+
+    # ATR(14) ratio
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr14 = tr.rolling(14, min_periods=14).mean()
+    atr_ratio = atr14 / close
+
+    out = pd.DataFrame(
+        {
+            "Date": m["Date"].values,
+            "Market_Drawdown": mdd.values,
+            "Market_ATR_ratio": atr_ratio.values,
+        }
+    )
+    return out
+
+
+def ensure_market_features(feats: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+    need_any = ("Market_Drawdown" not in feats.columns) or ("Market_ATR_ratio" not in feats.columns)
+    if not need_any:
+        return feats
+
+    market = compute_market_frame_from_prices(prices)
+
+    merged = feats.merge(market, on="Date", how="left")
+
+    # feats에 없던 값만 채움(혹시 이미 있는 컬럼이면 left를 우선)
+    if "Market_Drawdown" in feats.columns:
+        merged["Market_Drawdown"] = merged["Market_Drawdown"].combine_first(feats["Market_Drawdown"])
+    if "Market_ATR_ratio" in feats.columns:
+        merged["Market_ATR_ratio"] = merged["Market_ATR_ratio"].combine_first(feats["Market_ATR_ratio"])
+
+    return merged
+
+
 def forward_roll_max_excl_today(s: pd.Series, window: int) -> pd.Series:
-    # next window days (t+1 .. t+window) max
-    r = s[::-1].rolling(window, min_periods=window).max()[::-1].shift(-1)
-    return r
+    return s[::-1].rolling(window, min_periods=window).max()[::-1].shift(-1)
 
 
 def forward_roll_min_excl_today(s: pd.Series, window: int) -> pd.Series:
-    r = s[::-1].rolling(window, min_periods=window).min()[::-1].shift(-1)
-    return r
+    return s[::-1].rolling(window, min_periods=window).min()[::-1].shift(-1)
 
 
 def main() -> None:
@@ -141,7 +198,6 @@ def main() -> None:
     ex = int(args.max_extend_days)
     tag = fmt_tag(pt, max_days, sl, ex)
 
-    # load prices
     prices = read_table(PRICES_PARQUET, PRICES_CSV).copy()
     prices["Date"] = pd.to_datetime(prices["Date"])
     prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
@@ -156,7 +212,6 @@ def main() -> None:
     if miss_px:
         raise ValueError(f"prices missing columns: {miss_px}")
 
-    # load features (auto)
     feats, feats_src = auto_load_features(args.features_path)
     feats = feats.copy()
     feats["Date"] = pd.to_datetime(feats["Date"])
@@ -167,6 +222,9 @@ def main() -> None:
         .reset_index(drop=True)
     )
 
+    # ✅ Market_* 컬럼이 없으면 SPY로 만들어 붙임
+    feats = ensure_market_features(feats, prices)
+
     feature_cols = DEFAULT_FEATURE_COLS
     if str(args.feature_cols).strip():
         feature_cols = [c.strip() for c in args.feature_cols.split(",") if c.strip()]
@@ -175,7 +233,6 @@ def main() -> None:
     if missing_feat:
         raise ValueError(f"features missing feature columns: {missing_feat} (src={feats_src})")
 
-    # merge prices into features to label
     base = feats[["Date", "Ticker"] + feature_cols].merge(
         prices[["Date", "Ticker", "High", "Low", "Close"]],
         on=["Date", "Ticker"],
@@ -186,10 +243,10 @@ def main() -> None:
     base = base.dropna(subset=["Close"] + feature_cols).reset_index(drop=True)
     base = base.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-    # compute labels per ticker
     out = []
     for tkr, g in base.groupby("Ticker", sort=False):
         g = g.sort_values("Date").reset_index(drop=True)
+
         close = g["Close"].astype(float)
         high = g["High"].astype(float)
         low = g["Low"].astype(float)
@@ -213,7 +270,6 @@ def main() -> None:
     labeled["Success"] = labeled["Success"].astype(int)
 
     LABEL_DIR.mkdir(parents=True, exist_ok=True)
-
     out_parq = LABEL_DIR / f"raw_data_{tag}.parquet"
     out_csv = LABEL_DIR / f"raw_data_{tag}.csv"
     saved_to = save_table(labeled, out_parq, out_csv)
