@@ -112,11 +112,9 @@ jobs:
         run: |
           python scripts/fetch_prices.py --include-extra --reset --force-full
 
-
       - name: Build features (strict mode)
         run: |
-          # 네 build_features.py CLI에 맞게 옵션 수정 가능
-          python scripts/build_features.py
+          python scripts/build_features.py --strict-dropna --min-history-days 260 --min-dollar-vol 0 --min-feature-rows 120
 
       - name: Build strategy labels (engine-sim labels)
         run: |
