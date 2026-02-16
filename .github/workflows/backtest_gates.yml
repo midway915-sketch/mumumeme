@@ -215,11 +215,16 @@ jobs:
           else
             if [ -f scripts/train_strategy_models.py ]; then
               echo "[RUN] train_strategy_models.py"
-              python scripts/train_strategy_models.py
+              python scripts/train_strategy_models.py \
+                --profit-target "${PROFIT_TARGET}" \
+                --max-days "${HOLDING_DAYS}" \
+                --stop-level "${STOP_LEVEL}" \
+                --max-extend-days "${MAX_EXTEND_DAYS}"
             else
               echo "[WARN] scripts/train_strategy_models.py not found"
             fi
           fi
+
 
       # ✅ gate 실행에 필요한 모델 확인(없으면 여기서 깔끔하게 종료)
       - name: Sanity check models for gating
