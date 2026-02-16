@@ -156,19 +156,31 @@ def compute_market_frame_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
 
 
 def ensure_market_features(feats: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    feats에 Market_Drawdown / Market_ATR_ratio가 없으면 SPY로 계산해서 붙인다.
+    feats에 이미 있더라도(부분만 있거나 NaN이 많을 수 있음), market 계산값으로 NaN만 채운다.
+    merge 시 컬럼 겹침으로 suffix가 붙는 문제를 방지하기 위해 suffixes=('', '_m') 사용.
+    """
     need_any = ("Market_Drawdown" not in feats.columns) or ("Market_ATR_ratio" not in feats.columns)
     if not need_any:
         return feats
 
     market = compute_market_frame_from_prices(prices)
 
-    merged = feats.merge(market, on="Date", how="left")
+    # ✅ 겹치는 컬럼은 market 쪽에 _m suffix를 강제로 붙인다
+    merged = feats.merge(market, on="Date", how="left", suffixes=("", "_m"))
 
-    # feats에 없던 값만 채움(혹시 이미 있는 컬럼이면 left를 우선)
-    if "Market_Drawdown" in feats.columns:
-        merged["Market_Drawdown"] = merged["Market_Drawdown"].combine_first(feats["Market_Drawdown"])
-    if "Market_ATR_ratio" in feats.columns:
-        merged["Market_ATR_ratio"] = merged["Market_ATR_ratio"].combine_first(feats["Market_ATR_ratio"])
+    for col in ["Market_Drawdown", "Market_ATR_ratio"]:
+        col_m = f"{col}_m"
+
+        if col in merged.columns and col_m in merged.columns:
+            # feats에 기존 col이 있었던 케이스: 기존값 우선, NaN만 market으로 채움
+            merged[col] = merged[col].combine_first(merged[col_m])
+            merged.drop(columns=[col_m], inplace=True)
+
+        elif col not in merged.columns and col_m in merged.columns:
+            # feats에 없어서 market 값이 _m로 들어온 케이스(드물지만 안전하게 처리)
+            merged.rename(columns={col_m: col}, inplace=True)
 
     return merged
 
