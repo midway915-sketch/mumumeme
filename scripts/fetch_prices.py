@@ -20,7 +20,8 @@ OUT_CSV_FALLBACK = RAW_DIR / "prices.csv"
 META_JSON = RAW_DIR / "prices_meta.json"
 
 DEFAULT_EXTRA_TICKERS = ["SPY", "^VIX"]
-
+if args.include_extra:
+    tickers = sorted(set(tickers) | set(DEFAULT_EXTRA_TICKERS))
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
