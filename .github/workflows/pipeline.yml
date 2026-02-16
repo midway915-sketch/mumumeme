@@ -155,16 +155,15 @@ jobs:
             --soft-topk "${SOFT_TOPK}" --soft-lambda "${SOFT_LAMBDA}" \
             --shadow-on-skip
 
-      - name: Simulate single-position (all methods)
+      - name: Simulate engine single-position (daily fixed buy, loan allowed, no same-day reentry, unlimited extend)
         run: |
-          python scripts/simulate_single_position.py \
+          python scripts/simulate_single_position_engine.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${HOLDING_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}" \
             --method all \
-            --initial-equity 1.0
-
+            --initial-seed 40000000
 
       - name: Upload artifacts (signals/models/logs)
         uses: actions/upload-artifact@v4
