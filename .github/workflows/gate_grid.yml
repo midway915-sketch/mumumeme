@@ -57,25 +57,29 @@ jobs:
           cache: "pip"
 
       - name: Install deps
+        shell: bash
         run: |
           set -euo pipefail
           python -m pip install -U pip wheel setuptools
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # parquet 읽기/쓰기용(없으면 make_gate_summary/aggregate에서 필요)
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
           pip install -U pyarrow
 
       - name: Prepare universe.csv
+        shell: bash
         run: |
           set -euo pipefail
           if [ -f scripts/universe.py ]; then
             python scripts/universe.py
           else
-            echo "[WARN] scripts/universe.py not found. Assuming data/universe.csv already exists."
+            echo "[WARN] scripts/universe.py not found. Assuming data/universe.csv exists."
           fi
 
       - name: Fetch prices + Build base features (only once)
+        shell: bash
         env:
-          REBUILD_ALL: ${{ inputs.rebuild_all }}
+          REBUILD_ALL: "${{ inputs.rebuild_all }}"
         run: |
           set -euo pipefail
           cd "${GITHUB_WORKSPACE}"
@@ -88,63 +92,49 @@ jobs:
 
           python scripts/build_features.py
 
-      - name: Run PT/H/SL grid (reuse gate function)
-        env:
-          # inputs (keep schema)
-          PROFIT_TARGET_INPUT: ${{ inputs.profit_target }}
-          HOLDING_DAYS_INPUT: ${{ inputs.max_holding_days }}
-          STOP_LEVEL_INPUT: ${{ inputs.stop_level }}
-          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
-
-          TAIL_MAX_LIST: ${{ inputs.tail_max_list }}
-          U_QUANTILE_LIST: ${{ inputs.u_quantile_list }}
-          RANK_BY_LIST: ${{ inputs.rank_by_list }}
-          LAMBDA_TAIL: ${{ inputs.lambda_tail }}
-
+      - name: Run PT/H/SL grid + gate grid (reusable bash lib)
         shell: bash
+        env:
+          PROFIT_TARGET_INPUT: "${{ inputs.profit_target }}"
+          HOLDING_DAYS_INPUT: "${{ inputs.max_holding_days }}"
+          STOP_LEVEL_INPUT: "${{ inputs.stop_level }}"
+          MAX_EXTEND_DAYS: "${{ inputs.max_extend_days }}"
+          TAIL_MAX_LIST: "${{ inputs.tail_max_list }}"
+          U_QUANTILE_LIST: "${{ inputs.u_quantile_list }}"
+          RANK_BY_LIST: "${{ inputs.rank_by_list }}"
+          LAMBDA_TAIL: "${{ inputs.lambda_tail }}"
         run: |
           set -euo pipefail
           cd "${GITHUB_WORKSPACE}"
 
-          # --- 리스트 파싱(콤마 없으면 1개로 처리됨)
-          IFS=',' read -ra PT_LIST <<< "${PROFIT_TARGET_INPUT}"
-          IFS=',' read -ra H_LIST  <<< "${HOLDING_DAYS_INPUT}"
-          IFS=',' read -ra SL_LIST <<< "${STOP_LEVEL_INPUT}"
-
-          trim(){ echo "$1" | xargs; }
-
-          # tag 생성: pt10_h40_sl10_ex30
-          make_tag () {
-            python - <<PY
-pt=float("${1}")
-h=int("${2}")
-sl=float("${3}")
-ex=int("${4}")
-pt_tag=f"pt{int(round(pt*100))}"
-sl_tag=f"sl{int(round(abs(sl)*100))}"
-print(f"{pt_tag}_h{h}_{sl_tag}_ex{ex}")
-PY
-          }
-
-          # gate 함수 로드
           if [ ! -f scripts/gate_grid_lib.sh ]; then
             echo "[ERROR] scripts/gate_grid_lib.sh not found"
             exit 1
           fi
           source scripts/gate_grid_lib.sh
 
-          # 조합 루프
+          trim(){ echo "$1" | xargs; }
+
+          IFS=',' read -r -a PT_LIST <<< "${PROFIT_TARGET_INPUT}"
+          IFS=',' read -r -a H_LIST  <<< "${HOLDING_DAYS_INPUT}"
+          IFS=',' read -r -a SL_LIST <<< "${STOP_LEVEL_INPUT}"
+
+          make_tag () {
+            python -c "pt=float('${1}'); h=int('${2}'); sl=float('${3}'); ex=int('${4}'); \
+pt_tag=f'pt{int(round(pt*100))}'; sl_tag=f'sl{int(round(abs(sl)*100))}'; \
+print(f'{pt_tag}_h{h}_{sl_tag}_ex{ex}')"
+          }
+
           for PT in "${PT_LIST[@]}"; do
-            PT="$(trim "$PT")"
+            PT="$(trim "${PT}")"
             for H in "${H_LIST[@]}"; do
-              H="$(trim "$H")"
+              H="$(trim "${H}")"
               for SL in "${SL_LIST[@]}"; do
-                SL="$(trim "$SL")"
+                SL="$(trim "${SL}")"
 
                 export PROFIT_TARGET="${PT}"
                 export HOLDING_DAYS="${H}"
                 export STOP_LEVEL="${SL}"
-
                 export TAG
                 TAG="$(make_tag "${PT}" "${H}" "${SL}" "${MAX_EXTEND_DAYS}")"
                 export TAG
@@ -154,7 +144,6 @@ PY
                 echo "[GRID] TAG=${TAG} (PT=${PT}, H=${H}, SL=${SL}, EX=${MAX_EXTEND_DAYS})"
                 echo "===================================================="
 
-                # 라벨/모델은 PT/H/SL 바뀔 때마다 재생성/재학습
                 python scripts/build_labels.py \
                   --profit-target "${PT}" \
                   --max-days "${H}" \
@@ -163,7 +152,6 @@ PY
 
                 python scripts/train_model.py
 
-                # tail/strategy 쪽 (있으면 실행)
                 if [ -f scripts/build_strategy_labels.py ] && [ -f scripts/train_strategy_models.py ]; then
                   python scripts/build_strategy_labels.py \
                     --profit-target "${PT}" \
@@ -180,52 +168,34 @@ PY
                   echo "[WARN] strategy label/model scripts missing -> skipping"
                 fi
 
-                # tail 모델 있으면 gate에서 tail 모드 활성화
                 if [ -f app/tail_model.pkl ] && [ -f app/tail_scaler.pkl ]; then
                   export TAIL_OK=1
                 else
                   export TAIL_OK=0
                 fi
 
-                # ✅ Gate grid runs (분리한 함수 재사용)
                 run_gate_grid
 
-                # ✅ (tag별) GATES_ALL summary 생성 (없으면 make_gate_summary가 못 돎)
-                python - <<PY
-import glob, os
-import pandas as pd
+                python -c "import glob, pandas as pd, os; tag=os.environ['TAG']; \
+base=f'data/signals/sim_engine_summary_{tag}_'; \
+paths=[p for p in glob.glob(base+'*.csv') if 'GATES_ALL' not in p]; \
+assert paths, f'no sim_engine_summary files for {tag}'; \
+df=pd.concat([pd.read_csv(p) for p in paths], ignore_index=True).drop_duplicates(subset=['label'], keep='last'); \
+df.to_csv(f'data/signals/sim_engine_summary_{tag}_GATES_ALL.csv', index=False); \
+print('[DONE] wrote sim_engine_summary_'+tag+'_GATES_ALL.csv rows=', len(df))"
 
-tag=os.environ["TAG"]
-base=f"data/signals/sim_engine_summary_{tag}_"
-outs=sorted([p for p in glob.glob(base+"*.csv") if "GATES_ALL" not in p])
-
-if not outs:
-    raise SystemExit(f"[ERROR] no sim_engine_summary files for tag={tag}")
-
-df=pd.concat([pd.read_csv(p) for p in outs], ignore_index=True)
-df=df.drop_duplicates(subset=["label"], keep="last")
-df=df.sort_values("seed_multiple", ascending=False) if "seed_multiple" in df.columns else df
-
-out=f"data/signals/sim_engine_summary_{tag}_GATES_ALL.csv"
-df.to_csv(out, index=False)
-print("[DONE] wrote", out, "rows=", len(df))
-PY
-
-                # ✅ tag별 gate_summary_{TAG}.csv 생성(최근10년 배수/최대홀딩 포함)
                 python scripts/make_gate_summary.py --tag "${TAG}" --max-days "${H}" --recent-years 10
-
               done
             done
           done
 
-          # 전체 집계(PT/H/SL x gate 파라미터)
           python scripts/aggregate_gate_grid.py
 
-      - name: Upload artifacts (grid tables)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-grid-results
+          name: "gate-grid-results"
           retention-days: 14
           if-no-files-found: error
           path: |
