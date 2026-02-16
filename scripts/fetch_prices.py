@@ -19,12 +19,19 @@ OUT_PARQUET = RAW_DIR / "prices.parquet"
 OUT_CSV_FALLBACK = RAW_DIR / "prices.csv"
 META_JSON = RAW_DIR / "prices_meta.json"
 
+# build_features.py가 요구하는 시장 티커들
 DEFAULT_EXTRA_TICKERS = ["SPY", "^VIX"]
-if args.include_extra:
-    tickers = sorted(set(tickers) | set(DEFAULT_EXTRA_TICKERS))
+
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def preview_list(xs: list[str], n: int = 25) -> str:
+    xs = list(xs)
+    if len(xs) <= n:
+        return str(xs)
+    return str(xs[:n] + ["..."])
 
 
 def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
@@ -171,96 +178,4 @@ def main() -> None:
     parser.add_argument("--start", type=str, default=None)
     parser.add_argument("--end", type=str, default=None)
     parser.add_argument("--lookback-days", type=int, default=7)
-    parser.add_argument("--retries", type=int, default=3)
-    parser.add_argument("--sleep-base", type=float, default=1.2)
-    parser.add_argument("--include-extra", action="store_true")
-    args = parser.parse_args()
-
-    tickers = read_universe(UNIVERSE_CSV)
-    if args.include_extra:
-        tickers = sorted(set(tickers + DEFAULT_EXTRA_TICKERS))
-    else:
-        tickers = sorted(set(tickers))
-
-    print(f"[INFO] tickers={len(tickers)} -> {tickers}")
-
-    if args.reset:
-        for p in [OUT_PARQUET, OUT_CSV_FALLBACK, META_JSON]:
-            if p.exists():
-                p.unlink()
-        print("[INFO] reset done")
-
-    existing = pd.DataFrame()
-    if not args.force_full:
-        existing = load_existing_prices()
-
-    last_dates = {}
-    if not existing.empty:
-        last_dates = existing.groupby("Ticker")["Date"].max().to_dict()
-
-    downloads = []
-    failed = []
-
-    for t in tickers:
-        try:
-            if args.force_full or existing.empty or t not in last_dates:
-                start = args.start
-            else:
-                ld = pd.to_datetime(last_dates[t])
-                start_dt = (ld - pd.Timedelta(days=args.lookback_days)).date()
-                start = args.start or str(start_dt)
-
-            df_new = safe_download_one(
-                ticker=t,
-                start=start,
-                end=args.end,
-                retries=args.retries,
-                sleep_base=args.sleep_base,
-            )
-            downloads.append(df_new)
-            print(f"[OK] {t}: {df_new['Date'].min().date()} -> {df_new['Date'].max().date()} rows={len(df_new)}")
-
-        except Exception as e:
-            failed.append((t, str(e)))
-            print(f"[FAIL] {t}: {e}")
-
-    if not downloads:
-        raise RuntimeError("No data downloaded.")
-
-    new_all = normalize_schema(pd.concat(downloads, ignore_index=True))
-
-    if existing.empty:
-        combined = new_all
-    else:
-        combined = normalize_schema(pd.concat([existing, new_all], ignore_index=True))
-
-    combined = (
-        combined.sort_values(["Date", "Ticker"])
-        .drop_duplicates(["Date", "Ticker"], keep="last")
-        .reset_index(drop=True)
-    )
-
-    saved_to = save_prices(combined)
-
-    meta = {
-        "updated_at_utc": now_utc_iso(),
-        "saved_to": saved_to,
-        "tickers_requested": tickers,
-        "tickers_downloaded": sorted(set(new_all["Ticker"].unique().tolist())),
-        "min_date": str(combined["Date"].min().date()) if not combined.empty else None,
-        "max_date": str(combined["Date"].max().date()) if not combined.empty else None,
-        "rows": int(len(combined)),
-        "failed": [{"ticker": t, "error": err} for t, err in failed],
-        "force_full": bool(args.force_full),
-        "reset": bool(args.reset),
-    }
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    META_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    print(f"[DONE] saved={saved_to} rows={len(combined)} range={meta['min_date']}..{meta['max_date']}")
-    if failed and len(failed) >= max(3, len(tickers) // 2):
-        raise RuntimeError(f"Too many ticker download failures: {len(failed)}/{len(tickers)}")
-
-
-if __name__ == "__main__":
-    main()
+    parser.add_argumen_
