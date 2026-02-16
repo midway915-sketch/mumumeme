@@ -288,8 +288,19 @@ def main() -> None:
     if args.shadow_on_skip:
         def attach_shadow(method_col: str, name: str) -> pd.DataFrame:
             # non-skip: method_col, skip: ret_only
-            use = picks[["Date", "Skipped", "pick_ret_only", method_col]].copy()
-            use["Ticker"] = np.where(use["Skipped"].to_numpy() == 1, use["pick_ret_only"], use[method_col])
+            # ⚠️ method_col이 pick_ret_only면 컬럼 중복이 생겨 Series가 아니라 DF가 되어 np.where가 터짐
+            if method_col == "pick_ret_only":
+                use = picks[["Date", "Skipped", "pick_ret_only"]].copy()
+                use["Ticker"] = use["pick_ret_only"]
+            else:
+                use = picks[["Date", "Skipped", "pick_ret_only", method_col]].copy()
+                use = use.rename(columns={method_col: "_method_pick"})
+                use["Ticker"] = np.where(
+                    use["Skipped"].to_numpy() == 1,
+                    use["pick_ret_only"].to_numpy(),
+                    use["_method_pick"].to_numpy(),
+                )
+
             out = use[["Date", "Skipped", "Ticker"]].merge(lab_eval, on=["Date", "Ticker"], how="left")
             out["method"] = name
             out["ShadowRule"] = "ret_only_on_skips"
@@ -306,6 +317,7 @@ def main() -> None:
             ],
             ignore_index=True,
         )
+
 
         summary_shadow = (
             eval_shadow.dropna(subset=["CycleReturn"])
