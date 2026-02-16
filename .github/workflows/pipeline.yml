@@ -90,16 +90,19 @@ jobs:
 
       - name: Make label tag (ptXX_hYY_slZZ_exWW)
         run: |
-          python - <<'PY' >> $GITHUB_ENV
-          pt = float("${PROFIT_TARGET}")
-          h  = int("${HOLDING_DAYS}")
-          sl = float("${STOP_LEVEL}")
-          ex = int("${MAX_EXTEND_DAYS}")
-          pt_tag = int(round(pt*100))
-          sl_tag = int(round(abs(sl)*100))
+          python - <<'PY' >> "$GITHUB_ENV"
+          import os
+          pt = float(os.environ.get("PROFIT_TARGET", "0.10"))
+          h  = int(os.environ.get("HOLDING_DAYS", "40"))
+          sl = float(os.environ.get("STOP_LEVEL", "-0.10"))
+          ex = int(os.environ.get("MAX_EXTEND_DAYS", "30"))
+
+          pt_tag = int(round(pt * 100))
+          sl_tag = int(round(abs(sl) * 100))
           tag = f"pt{pt_tag}_h{h}_sl{sl_tag}_ex{ex}"
           print(f"LABEL_TAG={tag}")
           PY
+
 
       - name: Build universe
         run: |
