@@ -1,0 +1,170 @@
+name: backtest-gates
+
+on:
+  workflow_dispatch:
+    inputs:
+      PROFIT_TARGET:
+        description: "profit target (e.g. 0.10)"
+        required: true
+        default: "0.10"
+      HOLDING_DAYS:
+        description: "max holding days (e.g. 40)"
+        required: true
+        default: "40"
+      STOP_LEVEL:
+        description: "stop level (e.g. -0.10)"
+        required: true
+        default: "-0.10"
+      MAX_EXTEND_DAYS:
+        description: "tag only (ex: 30)"
+        required: true
+        default: "30"
+      TAIL_MAX:
+        description: "tail gate threshold (e.g. 0.25)"
+        required: true
+        default: "0.25"
+      U_QUANTILE:
+        description: "utility quantile cutoff (e.g. 0.75)"
+        required: true
+        default: "0.75"
+      RANK_BY:
+        description: "ranking metric (utility|ret_score|p_success)"
+        required: true
+        default: "utility"
+      LAMBDA_TAIL:
+        description: "utility tail penalty lambda (e.g. 0.05)"
+        required: true
+        default: "0.05"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
+      HOLDING_DAYS: ${{ inputs.HOLDING_DAYS }}
+      STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
+      MAX_EXTEND_DAYS: ${{ inputs.MAX_EXTEND_DAYS }}
+      TAIL_MAX: ${{ inputs.TAIL_MAX }}
+      U_QUANTILE: ${{ inputs.U_QUANTILE }}
+      RANK_BY: ${{ inputs.RANK_BY }}
+      LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scikit-learn joblib yfinance pyarrow
+
+      # ---- 여기 아래는 네 파이프라인에 맞게 이미 있는 스텝이 있으면 그대로 유지해도 됨 ----
+      # 예시: universe, fetch_prices, build_features, train models 등이 필요
+      - name: Universe
+        run: |
+          python scripts/universe.py
+
+      - name: Fetch prices (include market tickers)
+        run: |
+          python scripts/fetch_prices.py --include-extra --reset --force-full
+
+      - name: Build features
+        run: |
+          python scripts/build_features.py
+
+      - name: Build labels
+        run: |
+          python scripts/build_labels.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${HOLDING_DAYS}" \
+            --stop-level "${STOP_LEVEL}"
+
+      - name: Build strategy labels
+        run: |
+          python scripts/build_strategy_labels.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${HOLDING_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}"
+
+      - name: Train success model
+        run: |
+          python scripts/train_model.py
+
+      - name: Train strategy models (tail model etc)
+        run: |
+          python scripts/train_strategy_models.py
+
+      # ---- 4개 게이트 조합 순차 실행 ----
+      - name: Gate runs (none / tail / utility / tail_utility)
+        run: |
+          set -e
+
+          PT="${PROFIT_TARGET}"
+          H="${HOLDING_DAYS}"
+          SL="${STOP_LEVEL}"
+          EX="${MAX_EXTEND_DAYS}"
+
+          # tag는 predict_gate/engine 내부에서도 동일 계산하지만,
+          # merge 단계에서 필요하니까 여기서도 만들어둠
+          python - <<PY
+          pt=float("${PROFIT_TARGET}")
+          h=int("${HOLDING_DAYS}")
+          sl=float("${STOP_LEVEL}")
+          ex=int("${MAX_EXTEND_DAYS}")
+          pt_tag=int(round(pt*100))
+          sl_tag=int(round(abs(sl)*100))
+          tag=f"pt{pt_tag}_h{h}_sl{sl_tag}_ex{ex}"
+          print("TAG="+tag)
+          with open("${GITHUB_ENV}","a",encoding="utf-8") as f:
+              f.write("TAG="+tag+"\\n")
+          PY
+
+          for MODE in none tail utility tail_utility; do
+            SUFFIX="${MODE}_t${TAIL_MAX}_q${U_QUANTILE}_r${RANK_BY}"
+
+            echo "[RUN] gate MODE=${MODE} SUFFIX=${SUFFIX}"
+
+            python scripts/predict_gate.py \
+              --profit-target "${PT}" \
+              --max-days "${H}" \
+              --stop-level "${SL}" \
+              --max-extend-days "${EX}" \
+              --gate-mode "${MODE}" \
+              --tail-max "${TAIL_MAX}" \
+              --u-quantile "${U_QUANTILE}" \
+              --rank-by "${RANK_BY}" \
+              --lambda-tail "${LAMBDA_TAIL}" \
+              --out-suffix "${SUFFIX}"
+
+            python scripts/simulate_single_position_engine.py \
+              --profit-target "${PT}" \
+              --max-days "${H}" \
+              --stop-level "${SL}" \
+              --max-extend-days "${EX}" \
+              --method custom \
+              --pick-col pick_custom \
+              --picks-path "data/signals/picks_${TAG}_gate_${SUFFIX}.csv" \
+              --label "${SUFFIX}" \
+              --out-suffix "${SUFFIX}" \
+              --initial-seed 40000000
+          done
+
+      - name: Merge gate summaries
+        run: |
+          python scripts/merge_gate_summaries.py --tag "${TAG}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-results
+          path: |
+            data/signals/**
+            data/features/**
+            data/labels/**
+            data/raw/**
+            app/**
