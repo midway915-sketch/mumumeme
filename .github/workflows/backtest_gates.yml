@@ -16,12 +16,13 @@ on:
         required: true
         default: "-0.10"
       MAX_EXTEND_DAYS:
-        description: "tag only (ex: 30)"
+        description: "extend horizon tag + strategy label horizon add (e.g. 30)"
         required: true
         default: "30"
 
+      # gate 실험용 리스트
       TAIL_MAX_LIST:
-        description: "comma-separated tail thresholds (e.g. 0.15,0.25,0.35)"
+        description: "comma-separated p_tail thresholds (e.g. 0.15,0.25,0.35)"
         required: true
         default: "0.20,0.30"
       U_QUANTILE_LIST:
@@ -38,6 +39,7 @@ on:
         required: true
         default: "0.05"
 
+      # 캐시 무시하고 강제 재생성
       REFRESH_DATA:
         description: "true to rebuild prices/features/labels/models from scratch"
         required: true
@@ -78,6 +80,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy pandas scikit-learn joblib yfinance pyarrow
 
+      # TAG 계산(파일명/머지용)
       - name: Compute TAG
         run: |
           python - <<PY
@@ -93,21 +96,14 @@ jobs:
           print("TAG="+tag)
           PY
 
-      # ✅ 디버그: scripts 폴더에 뭐가 있는지 로그로 박아두자(로컬 없이 확인 가능)
       - name: Debug list scripts
         run: |
           echo "=== scripts/ ==="
           ls -la scripts || true
+          echo "=== data/ ==="
+          ls -la data || true
 
-      - name: Universe (if exists)
-        run: |
-          if [ -f scripts/universe.py ]; then
-            python scripts/universe.py
-          else
-            echo "[WARN] scripts/universe.py not found (skip)"
-          fi
-
-      # ✅ 캐시: prices + features
+      # ✅ 캐시: prices + features (스크립트/유니버스 바뀌면 무효화)
       - name: Cache static data (prices/features)
         uses: actions/cache@v4
         with:
@@ -116,134 +112,139 @@ jobs:
             data/raw/prices.csv
             data/raw/prices_meta.json
             data/features/**
-          key: static-${{ runner.os }}-${{ hashFiles('scripts/fetch_prices.py','scripts/build_features.py','scripts/universe.py','data/universe.csv') }}-v2
+            data/universe.csv
+          key: static-${{ runner.os }}-${{ hashFiles('scripts/fetch_prices.py','scripts/build_features.py','scripts/universe.py','data/universe.csv') }}-v3
           restore-keys: |
             static-${{ runner.os }}-
 
-      # ✅ 캐시: labels + models (TAG 종속)
+      # ✅ 캐시: labels + models (TAG별)
       - name: Cache param data (labels/models by TAG)
         uses: actions/cache@v4
         with:
           path: |
             data/labels/**
+            data/raw_data.csv
+            data/strategy_raw_data.csv
             app/model.pkl
             app/scaler.pkl
             app/tail_model.pkl
             app/tail_scaler.pkl
-          key: param-${{ runner.os }}-${{ env.TAG }}-${{ hashFiles('scripts/build_labels.py','scripts/build_strategy_labels.py','scripts/train_model.py','scripts/train_strategy_models.py') }}-v2
+          key: param-${{ runner.os }}-${{ env.TAG }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/build_strategy_labels.py','scripts/train_strategy_models.py') }}-v3
           restore-keys: |
             param-${{ runner.os }}-${{ env.TAG }}-
 
+      # REFRESH_DATA=true면 결과물 삭제
       - name: Optional clean (refresh)
         run: |
           if [ "${REFRESH_DATA}" = "true" ]; then
             echo "[REFRESH] cleaning outputs..."
             rm -f data/raw/prices.parquet data/raw/prices.csv data/raw/prices_meta.json || true
             rm -rf data/features data/labels || true
+            rm -f data/raw_data.csv data/strategy_raw_data.csv || true
             rm -f app/model.pkl app/scaler.pkl app/tail_model.pkl app/tail_scaler.pkl || true
           else
             echo "[REFRESH] false (skip clean)"
           fi
 
-      - name: Fetch prices - if missing
+      # Universe
+      - name: Universe
+        run: |
+          python scripts/universe.py
+
+      # Prices (없으면 생성)
+      - name: Fetch prices (include market tickers) - if missing
         run: |
           if [ -f data/raw/prices.parquet ] || [ -f data/raw/prices.csv ]; then
             echo "[SKIP] prices already exist"
           else
-            if [ ! -f scripts/fetch_prices.py ]; then
-              echo "[ERROR] scripts/fetch_prices.py not found"
-              exit 1
-            fi
             python scripts/fetch_prices.py --include-extra --force-full
           fi
 
+      # Features (없으면 생성)
       - name: Build features - if missing
         run: |
           if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
             echo "[SKIP] features_model already exists"
           else
-            if [ ! -f scripts/build_features.py ]; then
-              echo "[ERROR] scripts/build_features.py not found"
-              exit 1
-            fi
             python scripts/build_features.py
           fi
 
-      # ✅ build_labels.py가 없으면 스킵 (네 에러 방지 포인트)
-      - name: Build labels (optional) - if script exists
+      # Labels (Success) -> data/raw_data.csv
+      - name: Build labels (Success) - if missing for TAG
         run: |
-          if [ -f scripts/build_labels.py ]; then
-            echo "[RUN] build_labels.py"
+          mkdir -p data/labels
+          if ls data/labels 2>/dev/null | grep -q "raw_data_${TAG}"; then
+            echo "[SKIP] raw_data_${TAG} exists"
+          else
             python scripts/build_labels.py \
               --profit-target "${PROFIT_TARGET}" \
               --max-days "${HOLDING_DAYS}" \
-              --stop-level "${STOP_LEVEL}"
-          else
-            echo "[SKIP] scripts/build_labels.py not found"
+              --stop-level "${STOP_LEVEL}" \
+              --max-extend-days "${MAX_EXTEND_DAYS}"
           fi
 
-      - name: Build strategy labels (optional) - if script exists
+      # Train success model -> app/model.pkl, app/scaler.pkl
+      - name: Train success model - ensure app/model.pkl & app/scaler.pkl
         run: |
-          if [ -f scripts/build_strategy_labels.py ]; then
-            echo "[RUN] build_strategy_labels.py"
+          set -euo pipefail
+          mkdir -p app
+
+          if [ -f app/model.pkl ] && [ -f app/scaler.pkl ]; then
+            echo "[SKIP] success model already exists"
+          else
+            python scripts/train_model.py
+          fi
+
+          echo "=== app/ ==="
+          ls -la app || true
+
+          if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
+            echo "[ERROR] Missing app/model.pkl or app/scaler.pkl after training"
+            exit 1
+          fi
+
+      # Strategy labels (Tail 등) -> data/strategy_raw_data.csv
+      - name: Build strategy labels (Tail) - if missing for TAG
+        run: |
+          mkdir -p data/labels
+          if ls data/labels 2>/dev/null | grep -q "strategy_raw_data_${TAG}"; then
+            echo "[SKIP] strategy_raw_data_${TAG} exists"
+          else
             python scripts/build_strategy_labels.py \
               --profit-target "${PROFIT_TARGET}" \
               --max-days "${HOLDING_DAYS}" \
               --stop-level "${STOP_LEVEL}" \
               --max-extend-days "${MAX_EXTEND_DAYS}"
-          else
-            echo "[SKIP] scripts/build_strategy_labels.py not found"
           fi
 
-      - name: Train success model (optional) - if script exists
+      # Train tail model -> app/tail_model.pkl, app/tail_scaler.pkl
+      - name: Train tail model - ensure app/tail_model.pkl & app/tail_scaler.pkl
         run: |
-          if [ -f app/model.pkl ] && [ -f app/scaler.pkl ]; then
-            echo "[SKIP] success model already exists"
-          else
-            if [ -f scripts/train_model.py ]; then
-              echo "[RUN] train_model.py"
-              python scripts/train_model.py
-            else
-              echo "[WARN] scripts/train_model.py not found"
-            fi
-          fi
+          set -euo pipefail
+          mkdir -p app
 
-      - name: Train tail model (optional) - if script exists
-        run: |
           if [ -f app/tail_model.pkl ] && [ -f app/tail_scaler.pkl ]; then
             echo "[SKIP] tail model already exists"
           else
-            if [ -f scripts/train_strategy_models.py ]; then
-              echo "[RUN] train_strategy_models.py"
-              python scripts/train_strategy_models.py \
-                --profit-target "${PROFIT_TARGET}" \
-                --max-days "${HOLDING_DAYS}" \
-                --stop-level "${STOP_LEVEL}" \
-                --max-extend-days "${MAX_EXTEND_DAYS}"
-            else
-              echo "[WARN] scripts/train_strategy_models.py not found"
-            fi
+            python scripts/train_strategy_models.py \
+              --profit-target "${PROFIT_TARGET}" \
+              --max-days "${HOLDING_DAYS}" \
+              --stop-level "${STOP_LEVEL}" \
+              --max-extend-days "${MAX_EXTEND_DAYS}"
           fi
 
+          echo "=== app/ ==="
+          ls -la app || true
 
-      # ✅ gate 실행에 필요한 모델 확인(없으면 여기서 깔끔하게 종료)
-      - name: Sanity check models for gating
-        run: |
-          if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
-            echo "[ERROR] Missing app/model.pkl or app/scaler.pkl -> gate picks cannot run."
-            echo "       Either add/train the success model, or adjust workflow to not use predict_gate.py."
-            exit 1
-          fi
-
-          if [ -f app/tail_model.pkl ] && [ -f app/tail_scaler.pkl ]; then
-            echo "TAIL_OK=1" >> $GITHUB_ENV
-            echo "[INFO] tail model available"
-          else
+          if [ ! -f app/tail_model.pkl ] || [ ! -f app/tail_scaler.pkl ]; then
+            echo "[WARN] tail model missing -> tail gates will be skipped"
             echo "TAIL_OK=0" >> $GITHUB_ENV
-            echo "[WARN] tail model not found -> tail gates will be skipped (tail, tail_utility)"
+          else
+            echo "TAIL_OK=1" >> $GITHUB_ENV
           fi
 
-      - name: Gate grid runs
+      # Gate + Sim
+      - name: Gate grid runs (none / tail / utility / tail_utility) x (lists)
         run: |
           set -euo pipefail
 
@@ -314,13 +315,13 @@ jobs:
           BASE_T="${TAILS[0]}"
           BASE_Q="${UQS[0]}"
 
-          # baseline(none): 각 rank_by마다 1회
+          # 1) baseline: no gate
           for R in "${RANKS[@]}"; do
             run_one "none" "${BASE_T}" "${BASE_Q}" "${R}"
           done
 
-          # tail gate / tail_utility는 tail 모델 있을 때만
-          if [ "${TAIL_OK}" = "1" ]; then
+          # 2) tail gate (tail model 있을 때만)
+          if [ "${TAIL_OK:-0}" = "1" ]; then
             for T in "${TAILS[@]}"; do
               for R in "${RANKS[@]}"; do
                 run_one "tail" "${T}" "${BASE_Q}" "${R}"
@@ -330,15 +331,15 @@ jobs:
             echo "[SKIP] tail gates skipped (TAIL_OK=0)"
           fi
 
-          # utility gate
+          # 3) utility gate
           for Q in "${UQS[@]}"; do
             for R in "${RANKS[@]}"; do
               run_one "utility" "${BASE_T}" "${Q}" "${R}"
             done
           done
 
-          # tail + utility gate
-          if [ "${TAIL_OK}" = "1" ]; then
+          # 4) tail + utility gate (tail model 있을 때만)
+          if [ "${TAIL_OK:-0}" = "1" ]; then
             for T in "${TAILS[@]}"; do
               for Q in "${UQS[@]}"; do
                 for R in "${RANKS[@]}"; do
@@ -348,7 +349,7 @@ jobs:
             done
           fi
 
-      - name: Merge gate summaries (if script exists)
+      - name: Merge gate summaries (optional)
         run: |
           if [ -f scripts/merge_gate_summaries.py ]; then
             python scripts/merge_gate_summaries.py --tag "${TAG}"
@@ -365,4 +366,6 @@ jobs:
             data/features/**
             data/labels/**
             data/raw/**
+            data/raw_data.csv
+            data/strategy_raw_data.csv
             app/**
