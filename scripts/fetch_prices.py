@@ -19,7 +19,6 @@ OUT_PARQUET = RAW_DIR / "prices.parquet"
 OUT_CSV_FALLBACK = RAW_DIR / "prices.csv"
 META_JSON = RAW_DIR / "prices_meta.json"
 
-# build_features.py가 요구하는 시장 티커들
 DEFAULT_EXTRA_TICKERS = ["SPY", "^VIX"]
 
 
@@ -35,22 +34,16 @@ def preview_list(xs: list[str], n: int = 25) -> str:
 
 
 def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure df has columns:
-    Date, Ticker, Open, High, Low, Close, AdjClose, Volume
-    """
     if df is None:
         return pd.DataFrame()
 
     df = df.copy()
 
-    # MultiIndex columns -> flatten
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Date column normalize
     if "Date" not in df.columns:
         if isinstance(df.index, pd.DatetimeIndex) or df.index.name in ("Date", "Datetime"):
             idx_name = df.index.name or "Date"
@@ -60,11 +53,9 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
         elif "date" in df.columns:
             df = df.rename(columns={"date": "Date"})
 
-    # Ticker normalize
     if "Ticker" not in df.columns and "ticker" in df.columns:
         df = df.rename(columns={"ticker": "Ticker"})
 
-    # Adj Close normalize
     if "AdjClose" not in df.columns:
         if "Adj Close" in df.columns:
             df = df.rename(columns={"Adj Close": "AdjClose"})
@@ -93,34 +84,57 @@ def read_universe(path: Path) -> list[str]:
     if "Enabled" in uni.columns:
         uni = uni[uni["Enabled"] == True]  # noqa: E712
 
-    tickers = (
-        uni["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+    return uni["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+
+
+def yf_download(
+    ticker: str,
+    start: str | None,
+    end: str | None,
+    period: str,
+) -> pd.DataFrame:
+    """
+    핵심:
+    - start가 None이면 yfinance 기본이 1mo라서 데이터가 22행만 나옴.
+    - 그래서 start가 None일 때는 period='max'로 받아야 함.
+    """
+    kwargs = dict(
+        tickers=ticker,
+        progress=False,
+        auto_adjust=False,
+        actions=False,
+        threads=False,
     )
-    return tickers
+
+    if start is None:
+        # ✅ period 기반 다운로드 (기본 max)
+        kwargs["period"] = period
+        if end is not None:
+            kwargs["end"] = end
+        return yf.download(**kwargs)
+
+    # start가 있으면 start/end로 받기
+    kwargs["start"] = start
+    if end is not None:
+        kwargs["end"] = end
+    return yf.download(**kwargs)
 
 
 def safe_download_one(
     ticker: str,
     start: str | None,
     end: str | None,
+    period: str,
     retries: int = 3,
     sleep_base: float = 1.2,
 ) -> pd.DataFrame:
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            df = yf.download(
-                tickers=ticker,
-                start=start,
-                end=end,
-                progress=False,
-                auto_adjust=False,
-                actions=False,
-                threads=False,
-            )
+            df = yf_download(ticker=ticker, start=start, end=end, period=period)
 
             if df is None or df.empty:
-                raise ValueError(f"Empty data for {ticker} (start={start}, end={end})")
+                raise ValueError(f"Empty data for {ticker} (start={start}, end={end}, period={period})")
 
             df = df.copy()
             df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -177,16 +191,15 @@ def main() -> None:
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--start", type=str, default=None)
     parser.add_argument("--end", type=str, default=None)
+    parser.add_argument("--period", type=str, default="max", help="Used when --start is not set (default: max)")
     parser.add_argument("--lookback-days", type=int, default=7)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--sleep-base", type=float, default=1.2)
     parser.add_argument("--include-extra", action="store_true", help="Also fetch market tickers (SPY, ^VIX)")
     args = parser.parse_args()
 
-    # Universe tickers
     tickers = read_universe(UNIVERSE_CSV)
 
-    # ✅ include-extra는 args 파싱 후 여기서만 적용
     if args.include_extra:
         tickers = sorted(set(tickers) | set(DEFAULT_EXTRA_TICKERS))
     else:
@@ -214,7 +227,7 @@ def main() -> None:
     for t in tickers:
         try:
             if args.force_full or existing.empty or t not in last_dates:
-                start = args.start
+                start = args.start  # None이면 period=max로 받게 됨
             else:
                 ld = pd.to_datetime(last_dates[t])
                 start_dt = (ld - pd.Timedelta(days=args.lookback_days)).date()
@@ -224,6 +237,7 @@ def main() -> None:
                 ticker=t,
                 start=start,
                 end=args.end,
+                period=args.period,
                 retries=args.retries,
                 sleep_base=args.sleep_base,
             )
@@ -257,22 +271,20 @@ def main() -> None:
         "updated_at_utc": now_utc_iso(),
         "saved_to": saved_to,
         "include_extra": bool(args.include_extra),
-        "extra_tickers": DEFAULT_EXTRA_TICKERS if args.include_extra else [],
+        "period": args.period,
+        "start_arg": args.start,
+        "end_arg": args.end,
         "tickers_requested_count": int(len(tickers)),
-        "tickers_requested_sample": tickers[:50],
         "tickers_downloaded_count": int(len(downloaded)),
         "tickers_downloaded": downloaded,
-        "has_SPY": ("SPY" in set(downloaded)) or ("SPY" in set(combined["Ticker"].unique())),
-        "has_VIX": ("^VIX" in set(downloaded)) or ("^VIX" in set(combined["Ticker"].unique())),
+        "has_SPY": ("SPY" in set(combined["Ticker"].unique())),
+        "has_VIX": ("^VIX" in set(combined["Ticker"].unique())),
         "min_date": str(combined["Date"].min().date()) if not combined.empty else None,
         "max_date": str(combined["Date"].max().date()) if not combined.empty else None,
         "rows": int(len(combined)),
         "failed": [{"ticker": t, "error": err} for t, err in failed],
         "force_full": bool(args.force_full),
         "reset": bool(args.reset),
-        "start_arg": args.start,
-        "end_arg": args.end,
-        "lookback_days": int(args.lookback_days),
     }
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     META_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -280,7 +292,6 @@ def main() -> None:
     print(f"[DONE] saved={saved_to} rows={len(combined)} range={meta['min_date']}..{meta['max_date']}")
     print(f"[CHECK] has_SPY={meta['has_SPY']} has_^VIX={meta['has_VIX']}")
 
-    # 너무 많이 실패했으면 fail-fast
     if failed and len(failed) >= max(3, len(tickers) // 2):
         raise RuntimeError(f"Too many ticker download failures: {len(failed)}/{len(tickers)}")
 
