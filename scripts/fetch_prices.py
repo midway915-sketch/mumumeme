@@ -178,4 +178,112 @@ def main() -> None:
     parser.add_argument("--start", type=str, default=None)
     parser.add_argument("--end", type=str, default=None)
     parser.add_argument("--lookback-days", type=int, default=7)
-    parser.add_argumen_
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--sleep-base", type=float, default=1.2)
+    parser.add_argument("--include-extra", action="store_true", help="Also fetch market tickers (SPY, ^VIX)")
+    args = parser.parse_args()
+
+    # Universe tickers
+    tickers = read_universe(UNIVERSE_CSV)
+
+    # ✅ include-extra는 args 파싱 후 여기서만 적용
+    if args.include_extra:
+        tickers = sorted(set(tickers) | set(DEFAULT_EXTRA_TICKERS))
+    else:
+        tickers = sorted(set(tickers))
+
+    print(f"[INFO] tickers={len(tickers)} sample={preview_list(tickers)}")
+
+    if args.reset:
+        for p in [OUT_PARQUET, OUT_CSV_FALLBACK, META_JSON]:
+            if p.exists():
+                p.unlink()
+        print("[INFO] reset done")
+
+    existing = pd.DataFrame()
+    if not args.force_full:
+        existing = load_existing_prices()
+
+    last_dates = {}
+    if not existing.empty:
+        last_dates = existing.groupby("Ticker")["Date"].max().to_dict()
+
+    downloads = []
+    failed = []
+
+    for t in tickers:
+        try:
+            if args.force_full or existing.empty or t not in last_dates:
+                start = args.start
+            else:
+                ld = pd.to_datetime(last_dates[t])
+                start_dt = (ld - pd.Timedelta(days=args.lookback_days)).date()
+                start = args.start or str(start_dt)
+
+            df_new = safe_download_one(
+                ticker=t,
+                start=start,
+                end=args.end,
+                retries=args.retries,
+                sleep_base=args.sleep_base,
+            )
+            downloads.append(df_new)
+            print(f"[OK] {t}: {df_new['Date'].min().date()} -> {df_new['Date'].max().date()} rows={len(df_new)}")
+
+        except Exception as e:
+            failed.append((t, str(e)))
+            print(f"[FAIL] {t}: {e}")
+
+    if not downloads:
+        raise RuntimeError("No data downloaded.")
+
+    new_all = normalize_schema(pd.concat(downloads, ignore_index=True))
+
+    if existing.empty:
+        combined = new_all
+    else:
+        combined = normalize_schema(pd.concat([existing, new_all], ignore_index=True))
+
+    combined = (
+        combined.sort_values(["Date", "Ticker"])
+        .drop_duplicates(["Date", "Ticker"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    saved_to = save_prices(combined)
+
+    downloaded = sorted(set(new_all["Ticker"].unique().tolist()))
+    meta = {
+        "updated_at_utc": now_utc_iso(),
+        "saved_to": saved_to,
+        "include_extra": bool(args.include_extra),
+        "extra_tickers": DEFAULT_EXTRA_TICKERS if args.include_extra else [],
+        "tickers_requested_count": int(len(tickers)),
+        "tickers_requested_sample": tickers[:50],
+        "tickers_downloaded_count": int(len(downloaded)),
+        "tickers_downloaded": downloaded,
+        "has_SPY": ("SPY" in set(downloaded)) or ("SPY" in set(combined["Ticker"].unique())),
+        "has_VIX": ("^VIX" in set(downloaded)) or ("^VIX" in set(combined["Ticker"].unique())),
+        "min_date": str(combined["Date"].min().date()) if not combined.empty else None,
+        "max_date": str(combined["Date"].max().date()) if not combined.empty else None,
+        "rows": int(len(combined)),
+        "failed": [{"ticker": t, "error": err} for t, err in failed],
+        "force_full": bool(args.force_full),
+        "reset": bool(args.reset),
+        "start_arg": args.start,
+        "end_arg": args.end,
+        "lookback_days": int(args.lookback_days),
+    }
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    META_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    print(f"[DONE] saved={saved_to} rows={len(combined)} range={meta['min_date']}..{meta['max_date']}")
+    print(f"[CHECK] has_SPY={meta['has_SPY']} has_^VIX={meta['has_VIX']}")
+
+    # 너무 많이 실패했으면 fail-fast
+    if failed and len(failed) >= max(3, len(tickers) // 2):
+        raise RuntimeError(f"Too many ticker download failures: {len(failed)}/{len(tickers)}")
+
+
+if __name__ == "__main__":
+    main()
