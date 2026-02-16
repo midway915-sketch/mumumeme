@@ -143,4 +143,113 @@ def main() -> None:
     unique_dates = np.array(sorted(df["Date"].unique()))
     split_i = int(len(unique_dates) * 0.8)
     split_i = max(1, min(split_i, len(unique_dates) - 1))
-    train_dates = set(un_
+    train_dates = set(unique_dates[:split_i])
+    test_dates = set(unique_dates[split_i:])
+
+    is_train = df["Date"].isin(train_dates).to_numpy()
+    is_test = df["Date"].isin(test_dates).to_numpy()
+
+    X_train, X_test = X[is_train], X[is_test]
+    y_pos_train, y_pos_test = y_pos[is_train], y_pos[is_test]
+    y_tail_train, y_tail_test = y_tail[is_train], y_tail[is_test]
+    y_ret_train, y_ret_test = y_ret[is_train], y_ret[is_test]
+
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    # 날짜 기반 CV splits(캘리브레이션)
+    train_df = df.loc[is_train, ["Date"]].reset_index(drop=True)
+    cv_splits = make_date_cv_splits(train_df, n_splits=3)
+
+    # 1) p_pos 모델
+    base_pos = LogisticRegression(max_iter=800)
+    clf_pos = CalibratedClassifierCV(base_pos, method="isotonic", cv=cv_splits)
+    clf_pos.fit(X_train_s, y_pos_train)
+    p_pos_test = clf_pos.predict_proba(X_test_s)[:, 1]
+    auc_pos = safe_auc(y_pos_test, p_pos_test)
+
+    # 2) tail(큰 손실) 확률 모델
+    base_tail = LogisticRegression(max_iter=800)
+    clf_tail = CalibratedClassifierCV(base_tail, method="isotonic", cv=cv_splits)
+    clf_tail.fit(X_train_s, y_tail_train)
+    p_tail_test = clf_tail.predict_proba(X_test_s)[:, 1]
+    auc_tail = safe_auc(y_tail_test, p_tail_test)
+
+    # 3) 기대수익 회귀
+    reg = HistGradientBoostingRegressor(
+        max_depth=3,
+        learning_rate=0.08,
+        max_iter=350,
+        random_state=42,
+    )
+    reg.fit(X_train_s, y_ret_train)
+    rhat_test = reg.predict(X_test_s)
+
+    # 출력
+    print("=" * 90)
+    print("TAG:", tag)
+    print("Rows train/test:", len(X_train), "/", len(X_test))
+    print("Features:", len(feature_cols))
+    print("Test pos rate:", round(float(y_pos_test.mean()), 4), "  mean p_pos:", round(float(p_pos_test.mean()), 4))
+    if auc_pos is not None:
+        print("p_pos ROC-AUC:", round(auc_pos, 4))
+    else:
+        print("p_pos ROC-AUC: (skipped - single class in test)")
+    print("Test tail rate:", round(float(y_tail_test.mean()), 4), " mean p_tail:", round(float(p_tail_test.mean()), 4))
+    if auc_tail is not None:
+        print("p_tail ROC-AUC:", round(auc_tail, 4))
+    else:
+        print("p_tail ROC-AUC: (skipped - single class in test)")
+    print("Test mean realized return:", round(float(np.mean(y_ret_test)), 6))
+    print("Test mean predicted return:", round(float(np.mean(rhat_test)), 6))
+    print("=" * 90)
+
+    # 저장
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    thr_tag = int(round(abs(args.tail_threshold) * 100))
+
+    clf_pos_path = MODEL_DIR / f"clf_pos_{tag}.pkl"
+    clf_tail_path = MODEL_DIR / f"clf_tail_{tag}_thr{thr_tag}.pkl"
+    reg_path = MODEL_DIR / f"reg_ret_{tag}.pkl"
+    scaler_path = MODEL_DIR / f"scaler_{tag}.pkl"
+    meta_path = MODEL_DIR / f"models_{tag}_meta.json"
+
+    joblib.dump(clf_pos, clf_pos_path)
+    joblib.dump(clf_tail, clf_tail_path)
+    joblib.dump(reg, reg_path)
+    joblib.dump(scaler, scaler_path)
+
+    meta = {
+        "trained_at_utc": now_utc_iso(),
+        "tag": tag,
+        "profit_target": args.profit_target,
+        "max_days": args.max_days,
+        "stop_level": args.stop_level,
+        "max_extend_days": args.max_extend_days,
+        "tail_threshold": args.tail_threshold,
+        "tail_threshold_tag": thr_tag,
+        "n_features": int(len(feature_cols)),
+        "feature_cols": feature_cols,
+        "n_train": int(len(X_train)),
+        "n_test": int(len(X_test)),
+        "auc_pos": auc_pos,
+        "auc_tail": auc_tail,
+        "test_pos_rate": float(y_pos_test.mean()),
+        "test_tail_rate": float(y_tail_test.mean()),
+        "test_mean_p_pos": float(p_pos_test.mean()),
+        "test_mean_p_tail": float(p_tail_test.mean()),
+        "test_mean_realized_ret": float(np.mean(y_ret_test)),
+        "test_mean_pred_ret": float(np.mean(rhat_test)),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    print("✅ saved:", clf_pos_path)
+    print("✅ saved:", clf_tail_path)
+    print("✅ saved:", reg_path)
+    print("✅ saved:", scaler_path)
+    print("✅ saved:", meta_path)
+
+
+if __name__ == "__main__":
+    main()
