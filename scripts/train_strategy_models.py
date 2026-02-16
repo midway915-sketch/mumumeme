@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -13,242 +11,122 @@ import joblib
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import roc_auc_score
 
 
-DATA_DIR = Path("data")
-FEATURE_DIR = DATA_DIR / "features"
-LABEL_DIR = DATA_DIR / "labels"
-MODEL_DIR = Path("app") / "model"
+DATA_PATH = Path("data/strategy_raw_data.csv")
+TAIL_MODEL_PATH = Path("app/tail_model.pkl")
+TAIL_SCALER_PATH = Path("app/tail_scaler.pkl")
 
-FEATURES_MODEL_PARQUET = FEATURE_DIR / "features_model.parquet"
-FEATURES_MODEL_CSV = FEATURE_DIR / "features_model.csv"
-FEATURES_PARQUET = FEATURE_DIR / "features.parquet"
-FEATURES_CSV = FEATURE_DIR / "features.csv"
-
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def fmt_tag(pt: float, max_days: int, sl: float, max_ext: int) -> str:
-    pt_tag = int(round(pt * 100))
-    sl_tag = int(round(abs(sl) * 100))
-    return f"pt{pt_tag}_h{max_days}_sl{sl_tag}_ex{max_ext}"
+FEATURES = [
+    "Drawdown_252",
+    "Drawdown_60",
+    "ATR_ratio",
+    "Z_score",
+    "MACD_hist",
+    "MA20_slope",
+    "Market_Drawdown",
+    "Market_ATR_ratio",
+]
 
 
-def load_features() -> pd.DataFrame:
-    # EV feature 포함된 features_model 우선
-    if FEATURES_MODEL_PARQUET.exists():
-        f = pd.read_parquet(FEATURES_MODEL_PARQUET)
-    elif FEATURES_MODEL_CSV.exists():
-        f = pd.read_csv(FEATURES_MODEL_CSV)
-    else:
-        # fallback
-        if FEATURES_PARQUET.exists():
-            f = pd.read_parquet(FEATURES_PARQUET)
-        else:
-            f = pd.read_csv(FEATURES_CSV)
-
-    f = f.copy()
-    f["Date"] = pd.to_datetime(f["Date"])
-    f["Ticker"] = f["Ticker"].astype(str).str.upper().str.strip()
-    return f.sort_values(["Date", "Ticker"]).reset_index(drop=True)
-
-
-def load_strategy_labels(tag: str) -> pd.DataFrame:
-    p = LABEL_DIR / f"strategy_labels_{tag}.parquet"
-    c = LABEL_DIR / f"strategy_labels_{tag}.csv"
-    if p.exists():
-        df = pd.read_parquet(p)
-    elif c.exists():
-        df = pd.read_csv(c)
-    else:
-        raise FileNotFoundError(f"strategy labels not found for tag={tag}. Run scripts/build_strategy_labels.py first.")
-
-    df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"])
-    df["ExitDate"] = pd.to_datetime(df["ExitDate"])
-    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-    return df.sort_values(["Date", "Ticker"]).reset_index(drop=True)
-
-
-def make_date_cv_splits(train_df: pd.DataFrame, n_splits: int = 3):
-    """
-    CalibratedClassifierCV에 넣을 수 있는 (train_idx, test_idx) 리스트 생성.
-    날짜 단위로 fold를 나눠서 같은 날짜가 train/test에 섞이는 걸 줄임.
-    """
-    unique_dates = np.array(sorted(train_df["Date"].unique()))
-    if len(unique_dates) < (n_splits + 1):
-        # 데이터 너무 적으면 그냥 3-fold로 단순화
-        return 3
-
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    splits = []
-    for tr_d, te_d in tscv.split(unique_dates):
-        tr_dates = set(unique_dates[tr_d])
-        te_dates = set(unique_dates[te_d])
-        tr_idx = np.where(train_df["Date"].isin(tr_dates).to_numpy())[0]
-        te_idx = np.where(train_df["Date"].isin(te_dates).to_numpy())[0]
-        if len(tr_idx) == 0 or len(te_idx) == 0:
-            continue
-        splits.append((tr_idx, te_idx))
-
-    return splits if len(splits) >= 2 else 3
-
-
-def safe_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float | None:
-    if len(np.unique(y_true)) < 2:
-        return None
+def safe_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    uniq = np.unique(y_true)
+    if len(uniq) < 2:
+        return float("nan")
     return float(roc_auc_score(y_true, y_prob))
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--profit-target", type=float, required=True)
-    ap.add_argument("--max-days", type=int, required=True)
-    ap.add_argument("--stop-level", type=float, required=True)
-    ap.add_argument("--max-extend-days", type=int, required=True)
-    ap.add_argument("--tail-threshold", type=float, default=-0.30, help="MinCycleRet가 이 값 이하이면 tail=1")
+    ap = argparse.ArgumentParser(description="Train strategy models (tail).")
+    ap.add_argument("--profit-target", type=float, required=True)  # 로그/재현용 (학습에는 직접 안 씀)
+    ap.add_argument("--max-days", type=int, required=True)         # 로그/재현용
+    ap.add_argument("--stop-level", type=float, required=True)     # 로그/재현용
+    ap.add_argument("--max-extend-days", type=int, required=True)  # 로그/재현용
+    ap.add_argument("--tail-threshold", type=float, default=-0.30, help="라벨 생성 시 사용한 값 기록용")
+
+    ap.add_argument("--data", type=str, default=str(DATA_PATH))
+    ap.add_argument("--target-col", type=str, default="Tail")
+    ap.add_argument("--out-model", type=str, default=str(TAIL_MODEL_PATH))
+    ap.add_argument("--out-scaler", type=str, default=str(TAIL_SCALER_PATH))
+    ap.add_argument("--n-splits", type=int, default=3)
     args = ap.parse_args()
 
-    tag = fmt_tag(args.profit_target, args.max_days, args.stop_level, args.max_extend_days)
+    data_path = Path(args.data)
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Missing {data_path}. Run scripts/build_strategy_labels.py first."
+        )
 
-    feat = load_features()
-    lab = load_strategy_labels(tag)
+    df = pd.read_csv(data_path)
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date")
+    else:
+        df = df.reset_index(drop=True)
 
-    # 학습에 필요한 컬럼만 merge
-    df = feat.merge(
-        lab[["Date", "Ticker", "CycleReturn", "MinCycleRet", "ExtendDays", "ExtendedFlag", "ForcedExitFlag"]],
-        on=["Date", "Ticker"],
-        how="inner",
-    ).sort_values(["Date", "Ticker"]).reset_index(drop=True)
+    if args.target_col not in df.columns:
+        raise ValueError(f"Target column '{args.target_col}' not found in {data_path}")
 
-    # feature columns: 숫자만
-    feature_cols = [c for c in feat.columns if c not in ("Date", "Ticker")]
-    feature_cols = df[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
+    missing = [c for c in FEATURES if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing feature columns in training data: {missing}")
 
-    # NaN 제거(엄격)
-    df = df.dropna(subset=feature_cols + ["CycleReturn", "MinCycleRet"]).reset_index(drop=True)
+    df = df.dropna(subset=FEATURES + [args.target_col]).reset_index(drop=True)
 
-    # Targets
-    y_pos = (df["CycleReturn"].to_numpy(dtype=float) > 0).astype(int)
-    y_tail = (df["MinCycleRet"].to_numpy(dtype=float) <= float(args.tail_threshold)).astype(int)
-    y_ret = df["CycleReturn"].to_numpy(dtype=float)
-    X = df[feature_cols].to_numpy(dtype=float)
+    X = df[FEATURES].to_numpy(dtype=np.float64)
+    y = df[args.target_col].to_numpy(dtype=int)
 
-    # 날짜 기준 80/20 split
-    unique_dates = np.array(sorted(df["Date"].unique()))
-    split_i = int(len(unique_dates) * 0.8)
-    split_i = max(1, min(split_i, len(unique_dates) - 1))
-    train_dates = set(unique_dates[:split_i])
-    test_dates = set(unique_dates[split_i:])
+    if len(np.unique(y)) < 2:
+        raise RuntimeError("Tail target has only one class. tail_threshold/horizon might be off.")
 
-    is_train = df["Date"].isin(train_dates).to_numpy()
-    is_test = df["Date"].isin(test_dates).to_numpy()
-
-    X_train, X_test = X[is_train], X[is_test]
-    y_pos_train, y_pos_test = y_pos[is_train], y_pos[is_test]
-    y_tail_train, y_tail_test = y_tail[is_train], y_tail[is_test]
-    y_ret_train, y_ret_test = y_ret[is_train], y_ret[is_test]
+    split_idx = int(len(df) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    # 날짜 기반 CV splits(캘리브레이션)
-    train_df = df.loc[is_train, ["Date"]].reset_index(drop=True)
-    cv_splits = make_date_cv_splits(train_df, n_splits=3)
+    base = LogisticRegression(max_iter=800)
 
-    # 1) p_pos 모델
-    base_pos = LogisticRegression(max_iter=800)
-    clf_pos = CalibratedClassifierCV(base_pos, method="isotonic", cv=cv_splits)
-    clf_pos.fit(X_train_s, y_pos_train)
-    p_pos_test = clf_pos.predict_proba(X_test_s)[:, 1]
-    auc_pos = safe_auc(y_pos_test, p_pos_test)
+    n_splits = min(int(args.n_splits), 5)
+    if split_idx < 200:
+        n_splits = min(n_splits, 2)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
 
-    # 2) tail(큰 손실) 확률 모델
-    base_tail = LogisticRegression(max_iter=800)
-    clf_tail = CalibratedClassifierCV(base_tail, method="isotonic", cv=cv_splits)
-    clf_tail.fit(X_train_s, y_tail_train)
-    p_tail_test = clf_tail.predict_proba(X_test_s)[:, 1]
-    auc_tail = safe_auc(y_tail_test, p_tail_test)
-
-    # 3) 기대수익 회귀
-    reg = HistGradientBoostingRegressor(
-        max_depth=3,
-        learning_rate=0.08,
-        max_iter=350,
-        random_state=42,
+    model = CalibratedClassifierCV(
+        base_estimator=base,
+        method="isotonic",
+        cv=tscv,
     )
-    reg.fit(X_train_s, y_ret_train)
-    rhat_test = reg.predict(X_test_s)
+    model.fit(X_train_s, y_train)
 
-    # 출력
-    print("=" * 90)
-    print("TAG:", tag)
-    print("Rows train/test:", len(X_train), "/", len(X_test))
-    print("Features:", len(feature_cols))
-    print("Test pos rate:", round(float(y_pos_test.mean()), 4), "  mean p_pos:", round(float(p_pos_test.mean()), 4))
-    if auc_pos is not None:
-        print("p_pos ROC-AUC:", round(auc_pos, 4))
-    else:
-        print("p_pos ROC-AUC: (skipped - single class in test)")
-    print("Test tail rate:", round(float(y_tail_test.mean()), 4), " mean p_tail:", round(float(p_tail_test.mean()), 4))
-    if auc_tail is not None:
-        print("p_tail ROC-AUC:", round(auc_tail, 4))
-    else:
-        print("p_tail ROC-AUC: (skipped - single class in test)")
-    print("Test mean realized return:", round(float(np.mean(y_ret_test)), 6))
-    print("Test mean predicted return:", round(float(np.mean(rhat_test)), 6))
-    print("=" * 90)
+    probs = model.predict_proba(X_test_s)[:, 1]
+    auc = safe_auc(y_test, probs)
 
-    # 저장
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    thr_tag = int(round(abs(args.tail_threshold) * 100))
-
-    clf_pos_path = MODEL_DIR / f"clf_pos_{tag}.pkl"
-    clf_tail_path = MODEL_DIR / f"clf_tail_{tag}_thr{thr_tag}.pkl"
-    reg_path = MODEL_DIR / f"reg_ret_{tag}.pkl"
-    scaler_path = MODEL_DIR / f"scaler_{tag}.pkl"
-    meta_path = MODEL_DIR / f"models_{tag}_meta.json"
-
-    joblib.dump(clf_pos, clf_pos_path)
-    joblib.dump(clf_tail, clf_tail_path)
-    joblib.dump(reg, reg_path)
-    joblib.dump(scaler, scaler_path)
-
-    meta = {
-        "trained_at_utc": now_utc_iso(),
-        "tag": tag,
+    print("=" * 60)
+    print("Tail Test ROC-AUC:", round(auc, 4) if auc == auc else "nan")
+    print("Base Tail Rate:", round(float(y_test.mean()), 4))
+    print("Predicted Mean Probability:", round(float(probs.mean()), 4))
+    print("Rows:", len(df), "Train:", len(y_train), "Test:", len(y_test))
+    print("Args:", {
         "profit_target": args.profit_target,
         "max_days": args.max_days,
         "stop_level": args.stop_level,
         "max_extend_days": args.max_extend_days,
         "tail_threshold": args.tail_threshold,
-        "tail_threshold_tag": thr_tag,
-        "n_features": int(len(feature_cols)),
-        "feature_cols": feature_cols,
-        "n_train": int(len(X_train)),
-        "n_test": int(len(X_test)),
-        "auc_pos": auc_pos,
-        "auc_tail": auc_tail,
-        "test_pos_rate": float(y_pos_test.mean()),
-        "test_tail_rate": float(y_tail_test.mean()),
-        "test_mean_p_pos": float(p_pos_test.mean()),
-        "test_mean_p_tail": float(p_tail_test.mean()),
-        "test_mean_realized_ret": float(np.mean(y_ret_test)),
-        "test_mean_pred_ret": float(np.mean(rhat_test)),
-    }
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    })
+    print("=" * 60)
 
-    print("✅ saved:", clf_pos_path)
-    print("✅ saved:", clf_tail_path)
-    print("✅ saved:", reg_path)
-    print("✅ saved:", scaler_path)
-    print("✅ saved:", meta_path)
+    out_model = Path(args.out_model)
+    out_scaler = Path(args.out_scaler)
+    out_model.parent.mkdir(parents=True, exist_ok=True)
+
+    joblib.dump(model, out_model)
+    joblib.dump(scaler, out_scaler)
+    print(f"✅ saved: {out_model} / {out_scaler}")
 
 
 if __name__ == "__main__":
