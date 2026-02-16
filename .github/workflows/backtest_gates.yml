@@ -296,19 +296,41 @@ jobs:
             echo "TAIL_OK=1" >> $GITHUB_ENV
           fi
 
-      # Gate + Sim
       - name: Gate grid runs (none / tail / utility / tail_utility) x (lists)
         run: |
           set -euo pipefail
 
-          if [ ! -f scripts/predict_gate.py ]; then
-            echo "[ERROR] scripts/predict_gate.py not found"
+          echo "PWD=$(pwd)"
+          echo "=== ls root ==="
+          ls -la || true
+          echo "=== ls scripts ==="
+          ls -la scripts || true
+
+          echo "=== git tracked files (predict/sim) ==="
+          git ls-files | grep -i "predict_gate.py" || true
+          git ls-files | grep -i "simulate_single_position_engine.py" || true
+
+          # working-directory가 scripts로 잡혀 있어도 동작하도록 경로 자동 탐색
+          if [ -f scripts/predict_gate.py ]; then
+            PRED="scripts/predict_gate.py"
+          elif [ -f predict_gate.py ]; then
+            PRED="predict_gate.py"
+          else
+            echo "[ERROR] predict_gate.py not found (checked ./scripts/predict_gate.py and ./predict_gate.py)"
             exit 1
           fi
-          if [ ! -f scripts/simulate_single_position_engine.py ]; then
-            echo "[ERROR] scripts/simulate_single_position_engine.py not found"
+
+          if [ -f scripts/simulate_single_position_engine.py ]; then
+            SIM="scripts/simulate_single_position_engine.py"
+          elif [ -f simulate_single_position_engine.py ]; then
+            SIM="simulate_single_position_engine.py"
+          else
+            echo "[ERROR] simulate_single_position_engine.py not found (checked ./scripts/... and ./...)"
             exit 1
           fi
+
+          echo "[INFO] using PRED=$PRED"
+          echo "[INFO] using SIM=$SIM"
 
           PT="${PROFIT_TARGET}"
           H="${HOLDING_DAYS}"
@@ -340,7 +362,7 @@ jobs:
             echo "[RUN] mode=${MODE} tail_max=${TMAX} u_q=${UQ} rank_by=${RANK} suffix=${SUFFIX}"
             echo "=============================="
 
-            python scripts/predict_gate.py \
+            python "$PRED" \
               --profit-target "${PT}" \
               --max-days "${H}" \
               --stop-level "${SL}" \
@@ -352,7 +374,7 @@ jobs:
               --lambda-tail "${LAM}" \
               --out-suffix "${SUFFIX}"
 
-            python scripts/simulate_single_position_engine.py \
+            python "$SIM" \
               --profit-target "${PT}" \
               --max-days "${H}" \
               --stop-level "${SL}" \
@@ -400,6 +422,8 @@ jobs:
                 done
               done
             done
+          else
+            echo "[SKIP] tail_utility gates skipped (TAIL_OK=0)"
           fi
 
       - name: Merge gate summaries (optional)
