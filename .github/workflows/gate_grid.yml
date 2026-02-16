@@ -121,9 +121,9 @@ jobs:
 
           make_tag () {
             python -c "pt=float('${1}'); h=int('${2}'); sl=float('${3}'); ex=int('${4}'); \
-pt_tag=f'pt{int(round(pt*100))}'; sl_tag=f'sl{int(round(abs(sl)*100))}'; \
-print(f'{pt_tag}_h{h}_{sl_tag}_ex{ex}')"
-          }
+            pt_tag=f'pt{int(round(pt*100))}'; sl_tag=f'sl{int(round(abs(sl)*100))}'; \
+            print(f'{pt_tag}_h{h}_{sl_tag}_ex{ex}')"
+                      }
 
           for PT in "${PT_LIST[@]}"; do
             PT="$(trim "${PT}")"
@@ -177,12 +177,12 @@ print(f'{pt_tag}_h{h}_{sl_tag}_ex{ex}')"
                 run_gate_grid
 
                 python -c "import glob, pandas as pd, os; tag=os.environ['TAG']; \
-base=f'data/signals/sim_engine_summary_{tag}_'; \
-paths=[p for p in glob.glob(base+'*.csv') if 'GATES_ALL' not in p]; \
-assert paths, f'no sim_engine_summary files for {tag}'; \
-df=pd.concat([pd.read_csv(p) for p in paths], ignore_index=True).drop_duplicates(subset=['label'], keep='last'); \
-df.to_csv(f'data/signals/sim_engine_summary_{tag}_GATES_ALL.csv', index=False); \
-print('[DONE] wrote sim_engine_summary_'+tag+'_GATES_ALL.csv rows=', len(df))"
+                base=f'data/signals/sim_engine_summary_{tag}_'; \
+                paths=[p for p in glob.glob(base+'*.csv') if 'GATES_ALL' not in p]; \
+                assert paths, f'no sim_engine_summary files for {tag}'; \
+                df=pd.concat([pd.read_csv(p) for p in paths], ignore_index=True).drop_duplicates(subset=['label'], keep='last'); \
+                df.to_csv(f'data/signals/sim_engine_summary_{tag}_GATES_ALL.csv', index=False); \
+                print('[DONE] wrote sim_engine_summary_'+tag+'_GATES_ALL.csv rows=', len(df))"
 
                 python scripts/make_gate_summary.py --tag "${TAG}" --max-days "${H}" --recent-years 10
               done
