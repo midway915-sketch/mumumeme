@@ -297,40 +297,43 @@ jobs:
           fi
 
       - name: Gate grid runs (none / tail / utility / tail_utility) x (lists)
+        shell: bash
         run: |
           set -euo pipefail
 
+          # ✅ 항상 워크스페이스 루트로 이동
+          cd "${GITHUB_WORKSPACE}"
           echo "PWD=$(pwd)"
-          echo "=== ls root ==="
+          echo "=== top ==="
           ls -la || true
-          echo "=== ls scripts ==="
+          echo "=== scripts ==="
           ls -la scripts || true
 
-          echo "=== git tracked files (predict/sim) ==="
-          git ls-files | grep -i "predict_gate.py" || true
-          git ls-files | grep -i "simulate_single_position_engine.py" || true
+          echo "=== find predict_gate / simulate engine ==="
+          PRED="$(find . -maxdepth 6 -type f \( -iname 'predict_gate.py' \) | head -n 1 || true)"
+          SIM="$(find . -maxdepth 6 -type f \( -iname 'simulate_single_position_engine.py' \) | head -n 1 || true)"
 
-          # working-directory가 scripts로 잡혀 있어도 동작하도록 경로 자동 탐색
-          if [ -f scripts/predict_gate.py ]; then
-            PRED="scripts/predict_gate.py"
-          elif [ -f predict_gate.py ]; then
-            PRED="predict_gate.py"
-          else
-            echo "[ERROR] predict_gate.py not found (checked ./scripts/predict_gate.py and ./predict_gate.py)"
+          echo "[INFO] PRED candidate: ${PRED}"
+          echo "[INFO] SIM  candidate: ${SIM}"
+
+          if [ -z "${PRED}" ]; then
+            echo "[ERROR] predict_gate.py not found anywhere under workspace."
+            echo "Hint: file not committed OR different filename/case OR checked out under different path."
+            echo "=== git ls-files grep predict_gate ==="
+            git ls-files | grep -i "predict_gate.py" || true
             exit 1
           fi
 
-          if [ -f scripts/simulate_single_position_engine.py ]; then
-            SIM="scripts/simulate_single_position_engine.py"
-          elif [ -f simulate_single_position_engine.py ]; then
-            SIM="simulate_single_position_engine.py"
-          else
-            echo "[ERROR] simulate_single_position_engine.py not found (checked ./scripts/... and ./...)"
+          if [ -z "${SIM}" ]; then
+            echo "[ERROR] simulate_single_position_engine.py not found anywhere under workspace."
+            echo "=== git ls-files grep simulate_single_position_engine ==="
+            git ls-files | grep -i "simulate_single_position_engine.py" || true
             exit 1
           fi
 
-          echo "[INFO] using PRED=$PRED"
-          echo "[INFO] using SIM=$SIM"
+          # ./로 시작해도 python이 잘 받음
+          echo "[INFO] using PRED=${PRED}"
+          echo "[INFO] using SIM=${SIM}"
 
           PT="${PROFIT_TARGET}"
           H="${HOLDING_DAYS}"
@@ -362,7 +365,7 @@ jobs:
             echo "[RUN] mode=${MODE} tail_max=${TMAX} u_q=${UQ} rank_by=${RANK} suffix=${SUFFIX}"
             echo "=============================="
 
-            python "$PRED" \
+            python "${PRED}" \
               --profit-target "${PT}" \
               --max-days "${H}" \
               --stop-level "${SL}" \
@@ -374,7 +377,7 @@ jobs:
               --lambda-tail "${LAM}" \
               --out-suffix "${SUFFIX}"
 
-            python "$SIM" \
+            python "${SIM}" \
               --profit-target "${PT}" \
               --max-days "${H}" \
               --stop-level "${SL}" \
