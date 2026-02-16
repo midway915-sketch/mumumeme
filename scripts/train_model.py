@@ -90,11 +90,25 @@ def main() -> None:
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
-    model = CalibratedClassifierCV(
-        base_estimator=base,
-        method="isotonic",
-        cv=tscv,
-    )
+    # Logistic + Isotonic Calibration
+    # TimeSeriesSplit 사용
+    base = LogisticRegression(max_iter=800)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    
+    # ✅ sklearn 버전 호환: estimator= (new) / base_estimator= (old)
+    try:
+        model = CalibratedClassifierCV(
+            estimator=base,
+            method="isotonic",
+            cv=tscv,
+        )
+    except TypeError:
+        model = CalibratedClassifierCV(
+            base_estimator=base,
+            method="isotonic",
+            cv=tscv,
+        )
+    
     model.fit(X_train_s, y_train)
 
     probs = model.predict_proba(X_test_s)[:, 1]
