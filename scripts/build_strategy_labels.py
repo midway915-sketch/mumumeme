@@ -23,6 +23,8 @@ FEATURES_CSV = FEAT_DIR / "features_model.csv"
 
 OUT_STRATEGY_RAW = DATA_DIR / "strategy_raw_data.csv"
 
+MARKET_TICKER = "SPY"
+
 DEFAULT_FEATURE_COLS = [
     "Drawdown_252",
     "Drawdown_60",
@@ -63,6 +65,122 @@ def save_table(df: pd.DataFrame, parq: Path, csv: Path) -> str:
         return str(csv)
 
 
+def auto_load_features(features_path: str | None) -> tuple[pd.DataFrame, str]:
+    """
+    1) --features-path 있으면 사용
+    2) 기본 features_model.* 있으면 사용
+    3) 없으면 data/features 내 Date/Ticker 있는 파일 자동탐색
+    """
+    if features_path:
+        fp = Path(features_path)
+        if not fp.exists():
+            raise FileNotFoundError(f"features-path not found: {fp}")
+        df = pd.read_parquet(fp) if fp.suffix.lower() == ".parquet" else pd.read_csv(fp)
+        return df, str(fp)
+
+    if FEATURES_PARQUET.exists():
+        return pd.read_parquet(FEATURES_PARQUET), str(FEATURES_PARQUET)
+    if FEATURES_CSV.exists():
+        return pd.read_csv(FEATURES_CSV), str(FEATURES_CSV)
+
+    if not FEAT_DIR.exists():
+        raise FileNotFoundError(f"features dir not found: {FEAT_DIR}")
+
+    candidates = []
+    candidates += list(FEAT_DIR.glob("*.parquet"))
+    candidates += list(FEAT_DIR.glob("*.csv"))
+    candidates = [p for p in candidates if p.is_file()]
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"Missing file: {FEATURES_PARQUET} (or {FEATURES_CSV}) and no candidates in {FEAT_DIR}"
+        )
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    last_err = None
+    for p in candidates:
+        try:
+            df = pd.read_parquet(p) if p.suffix.lower() == ".parquet" else pd.read_csv(p)
+            if {"Date", "Ticker"}.issubset(df.columns):
+                return df, str(p)
+        except Exception as e:
+            last_err = e
+
+    raise FileNotFoundError(
+        f"Could not find a usable features file in {FEAT_DIR}. "
+        f"Need columns Date/Ticker. Last error: {last_err}"
+    )
+
+
+def compute_market_frame_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Market_Drawdown: SPY 기준 252일 롤링 고점 대비 드로우다운
+    Market_ATR_ratio: SPY ATR(14) / Close
+    """
+    px = prices.copy()
+    px["Date"] = pd.to_datetime(px["Date"])
+    px["Ticker"] = px["Ticker"].astype(str).str.upper().str.strip()
+
+    m = px[px["Ticker"] == MARKET_TICKER].sort_values("Date").copy()
+    if m.empty:
+        raise RuntimeError(
+            f"Market ticker {MARKET_TICKER} not found in prices. "
+            f"Run fetch_prices.py --include-extra"
+        )
+
+    for c in ["Open", "High", "Low", "Close"]:
+        if c not in m.columns:
+            raise ValueError(f"prices missing {c} for market ticker {MARKET_TICKER}")
+
+    close = m["Close"].astype(float)
+    high = m["High"].astype(float)
+    low = m["Low"].astype(float)
+
+    # Drawdown_252
+    roll_max = close.rolling(252, min_periods=252).max()
+    mdd = (close / roll_max) - 1.0
+
+    # ATR(14) ratio
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr14 = tr.rolling(14, min_periods=14).mean()
+    atr_ratio = atr14 / close
+
+    out = pd.DataFrame(
+        {
+            "Date": m["Date"].values,
+            "Market_Drawdown": mdd.values,
+            "Market_ATR_ratio": atr_ratio.values,
+        }
+    )
+    return out
+
+
+def ensure_market_features(feats: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+    need_any = ("Market_Drawdown" not in feats.columns) or ("Market_ATR_ratio" not in feats.columns)
+    if not need_any:
+        return feats
+
+    market = compute_market_frame_from_prices(prices)
+    merged = feats.merge(market, on="Date", how="left")
+
+    # 만약 feats에 이미 Market_*가 있었으면(부분만 있거나), 기존값 우선
+    if "Market_Drawdown" in feats.columns:
+        merged["Market_Drawdown"] = merged["Market_Drawdown"].combine_first(feats["Market_Drawdown"])
+    if "Market_ATR_ratio" in feats.columns:
+        merged["Market_ATR_ratio"] = merged["Market_ATR_ratio"].combine_first(feats["Market_ATR_ratio"])
+
+    return merged
+
+
 def forward_roll_max_excl_today(s: pd.Series, window: int) -> pd.Series:
     return s[::-1].rolling(window, min_periods=window).max()[::-1].shift(-1)
 
@@ -72,14 +190,18 @@ def forward_roll_min_excl_today(s: pd.Series, window: int) -> pd.Series:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build strategy labels (Success + Tail).")
+    ap = argparse.ArgumentParser(description="Build strategy labels (Success + Tail + ExtendNeeded).")
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
     ap.add_argument("--max-extend-days", type=int, required=True)
 
-    ap.add_argument("--tail-threshold", type=float, default=-0.30,
-                    help="Tail event threshold as return (e.g. -0.30 means -30% drawdown event).")
+    ap.add_argument(
+        "--tail-threshold",
+        type=float,
+        default=-0.30,
+        help="Tail event threshold as return (e.g. -0.30 means -30% drawdown event).",
+    )
 
     ap.add_argument("--features-path", type=str, default=None)
     ap.add_argument("--feature-cols", type=str, default="",
@@ -94,30 +216,34 @@ def main() -> None:
 
     tag = fmt_tag(pt, max_days, sl, ex)
 
-    # load prices
+    # prices
     prices = read_table(PRICES_PARQUET, PRICES_CSV).copy()
     prices["Date"] = pd.to_datetime(prices["Date"])
     prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
-    prices = prices.sort_values(["Ticker", "Date"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
+    prices = (
+        prices.sort_values(["Ticker", "Date"])
+        .drop_duplicates(["Date", "Ticker"], keep="last")
+        .reset_index(drop=True)
+    )
 
     need_px = {"Date", "Ticker", "High", "Low", "Close"}
     miss_px = [c for c in need_px if c not in prices.columns]
     if miss_px:
         raise ValueError(f"prices missing columns: {miss_px}")
 
-    # load features_model
-    if args.features_path:
-        fp = Path(args.features_path)
-        if not fp.exists():
-            raise FileNotFoundError(f"features-path not found: {fp}")
-        feats = pd.read_parquet(fp) if fp.suffix.lower() == ".parquet" else pd.read_csv(fp)
-    else:
-        feats = read_table(FEATURES_PARQUET, FEATURES_CSV)
-
+    # features (auto)
+    feats, feats_src = auto_load_features(args.features_path)
     feats = feats.copy()
     feats["Date"] = pd.to_datetime(feats["Date"])
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
-    feats = feats.sort_values(["Ticker", "Date"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
+    feats = (
+        feats.sort_values(["Ticker", "Date"])
+        .drop_duplicates(["Date", "Ticker"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    # ✅ Market_* 없으면 SPY로 생성해서 붙임
+    feats = ensure_market_features(feats, prices)
 
     feature_cols = DEFAULT_FEATURE_COLS
     if str(args.feature_cols).strip():
@@ -125,22 +251,20 @@ def main() -> None:
 
     missing_feat = [c for c in feature_cols if c not in feats.columns]
     if missing_feat:
-        raise ValueError(f"features_model missing feature columns: {missing_feat}")
+        raise ValueError(f"features missing feature columns: {missing_feat} (src={feats_src})")
 
-    # merge prices into features to label
     base = feats[["Date", "Ticker"] + feature_cols].merge(
         prices[["Date", "Ticker", "High", "Low", "Close"]],
         on=["Date", "Ticker"],
         how="left",
         validate="one_to_one",
     )
-
     base = base.dropna(subset=["Close"] + feature_cols).reset_index(drop=True)
     base = base.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
     # horizons
     success_h = max_days
-    tail_h = max_days + ex  # “max_days 이후 연장구간까지”를 대충 대표하는 관측창
+    tail_h = max_days + ex  # max_days + extend 구간까지 대충 포함
 
     out = []
     for tkr, g in base.groupby("Ticker", sort=False):
@@ -155,16 +279,15 @@ def main() -> None:
 
         success = (fut_max_high_success >= close * (1.0 + pt)).astype("float")
 
-        # tail: horizon 내 한번이라도 tail_thr 이하 DD 찍었는지
         fut_dd_tail = (fut_min_low_tail / close) - 1.0
         tail = (fut_dd_tail <= tail_thr).astype("float")
 
-        # 참고용: max_days 시점 close 수익률(엔진의 extending 진입 조건 근사)
-        # holding_day=1이 entry day이므로 holding_day=max_days => entry+(max_days-1)일
+        # max_days 시점 close 수익률 (extend 필요 여부 근사용)
         offset = max_days - 1
         close_at_max = close.shift(-offset)
         ret_at_max = (close_at_max / close) - 1.0
 
+        # success 못했고 max_days 시점 수익률이 stop_level보다 더 나쁘면 extend 필요한 케이스로 표시
         extend_needed = ((success == 0) & (ret_at_max < sl)).astype("float")
 
         g["Success"] = success
@@ -173,7 +296,10 @@ def main() -> None:
         g["RetAtMaxDays"] = ret_at_max
         g["ExtendNeeded"] = extend_needed
 
-        g = g.dropna(subset=["Success", "Tail", "FutureMinDD_TailH", "RetAtMaxDays", "ExtendNeeded"]).reset_index(drop=True)
+        g = g.dropna(
+            subset=["Success", "Tail", "FutureMinDD_TailH", "RetAtMaxDays", "ExtendNeeded"]
+        ).reset_index(drop=True)
+
         out.append(g)
 
     labeled = pd.concat(out, ignore_index=True) if out else pd.DataFrame()
@@ -209,9 +335,13 @@ def main() -> None:
         "saved_to": saved_to,
         "also_written": str(OUT_STRATEGY_RAW),
         "feature_cols": feature_cols,
+        "features_source": feats_src,
         "tail_horizon_days": int(tail_h),
+        "market_ticker": MARKET_TICKER,
     }
-    (LABEL_DIR / f"strategy_raw_data_{tag}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (LABEL_DIR / f"strategy_raw_data_{tag}_meta.json").write_text(
+        json.dumps(meta, indent=2), encoding="utf-8"
+    )
 
     print(f"[DONE] strategy labels saved -> {saved_to}")
     print(f"[DONE] also wrote -> {OUT_STRATEGY_RAW}")
