@@ -39,6 +39,12 @@ on:
         required: true
         default: "0.05"
 
+      # ✅ 캐시 무시하고 강제 재생성
+      REFRESH_DATA:
+        description: "true to rebuild prices/features/labels/models from scratch"
+        required: true
+        default: "false"
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -53,6 +59,8 @@ jobs:
       RANK_BY_LIST: ${{ inputs.RANK_BY_LIST }}
       LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
 
+      REFRESH_DATA: ${{ inputs.REFRESH_DATA }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -61,59 +69,20 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py311-v1
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install numpy pandas scikit-learn joblib yfinance pyarrow
 
-      # ---- 네 파이프라인 기본 스텝(이미 있으면 유지/조정) ----
-      - name: Universe
+      # ✅ TAG 먼저 계산(파라미터 캐시 키로 사용)
+      - name: Compute TAG
         run: |
-          python scripts/universe.py
-
-      - name: Fetch prices (include market tickers)
-        run: |
-          python scripts/fetch_prices.py --include-extra --reset --force-full
-
-      - name: Build features
-        run: |
-          python scripts/build_features.py
-
-      - name: Build labels
-        run: |
-          python scripts/build_labels.py \
-            --profit-target "${PROFIT_TARGET}" \
-            --max-days "${HOLDING_DAYS}" \
-            --stop-level "${STOP_LEVEL}"
-
-      - name: Build strategy labels
-        run: |
-          python scripts/build_strategy_labels.py \
-            --profit-target "${PROFIT_TARGET}" \
-            --max-days "${HOLDING_DAYS}" \
-            --stop-level "${STOP_LEVEL}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}"
-
-      - name: Train success model
-        run: |
-          python scripts/train_model.py
-
-      - name: Train strategy models (tail model etc)
-        run: |
-          python scripts/train_strategy_models.py
-
-      # ---- ✅ 게이트 조합 실험 ----
-      - name: Gate grid runs (none / tail / utility / tail_utility) x (lists)
-        run: |
-          set -euo pipefail
-
-          PT="${PROFIT_TARGET}"
-          H="${HOLDING_DAYS}"
-          SL="${STOP_LEVEL}"
-          EX="${MAX_EXTEND_DAYS}"
-          LAM="${LAMBDA_TAIL}"
-
-          # TAG 생성(파일명/머지용)
           python - <<PY
           pt=float("${PROFIT_TARGET}")
           h=int("${HOLDING_DAYS}")
@@ -127,15 +96,127 @@ jobs:
           print("TAG="+tag)
           PY
 
-          # 리스트 파싱(콤마 구분)
+      # ---- universe 생성(가벼우니 항상)
+      - name: Universe
+        run: |
+          python scripts/universe.py
+
+      # ✅ 정적 캐시: prices + features
+      - name: Cache static data (prices/features)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/raw/prices.parquet
+            data/raw/prices.csv
+            data/raw/prices_meta.json
+            data/features/**
+          key: static-${{ runner.os }}-${{ hashFiles('scripts/fetch_prices.py','scripts/build_features.py','scripts/universe.py','data/universe.csv') }}-v2
+          restore-keys: |
+            static-${{ runner.os }}-
+
+      # ✅ 파라미터 캐시: labels + models (TAG에 종속)
+      - name: Cache param data (labels/models by TAG)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/labels/**
+            app/model.pkl
+            app/scaler.pkl
+            app/tail_model.pkl
+            app/tail_scaler.pkl
+          key: param-${{ runner.os }}-${{ env.TAG }}-${{ hashFiles('scripts/build_labels.py','scripts/build_strategy_labels.py','scripts/train_model.py','scripts/train_strategy_models.py') }}-v2
+          restore-keys: |
+            param-${{ runner.os }}-${{ env.TAG }}-
+
+      # ✅ 필요하면 강제 클린(REFRESH_DATA=true)
+      - name: Optional clean (refresh)
+        run: |
+          if [ "${REFRESH_DATA}" = "true" ]; then
+            echo "[REFRESH] cleaning cached outputs..."
+            rm -f data/raw/prices.parquet data/raw/prices.csv data/raw/prices_meta.json || true
+            rm -rf data/features data/labels || true
+            rm -f app/model.pkl app/scaler.pkl app/tail_model.pkl app/tail_scaler.pkl || true
+          else
+            echo "[REFRESH] false (skip clean)"
+          fi
+
+      # ---- prices: 있으면 스킵
+      - name: Fetch prices (include market tickers) - if missing
+        run: |
+          if [ -f data/raw/prices.parquet ] || [ -f data/raw/prices.csv ]; then
+            echo "[SKIP] prices already exist"
+          else
+            python scripts/fetch_prices.py --include-extra --force-full
+          fi
+
+      # ---- features: 있으면 스킵
+      - name: Build features - if missing
+        run: |
+          if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
+            echo "[SKIP] features_model already exists"
+          else
+            python scripts/build_features.py
+          fi
+
+      # ---- labels: TAG 포함 파일이 있으면 스킵(파일명 몰라도 동작하도록 grep 방식)
+      - name: Build labels - if missing for TAG
+        run: |
+          mkdir -p data/labels
+          if ls data/labels 2>/dev/null | grep -q "${TAG}"; then
+            echo "[SKIP] labels for ${TAG} seem to exist"
+          else
+            python scripts/build_labels.py \
+              --profit-target "${PROFIT_TARGET}" \
+              --max-days "${HOLDING_DAYS}" \
+              --stop-level "${STOP_LEVEL}"
+          fi
+
+      - name: Build strategy labels - if missing for TAG
+        run: |
+          mkdir -p data/labels
+          if ls data/labels 2>/dev/null | grep -q "${TAG}"; then
+            echo "[SKIP] strategy labels for ${TAG} seem to exist"
+          else
+            python scripts/build_strategy_labels.py \
+              --profit-target "${PROFIT_TARGET}" \
+              --max-days "${HOLDING_DAYS}" \
+              --stop-level "${STOP_LEVEL}" \
+              --max-extend-days "${MAX_EXTEND_DAYS}"
+          fi
+
+      # ---- models: pkl 있으면 스킵
+      - name: Train success model - if missing
+        run: |
+          if [ -f app/model.pkl ] && [ -f app/scaler.pkl ]; then
+            echo "[SKIP] success model already exists"
+          else
+            python scripts/train_model.py
+          fi
+
+      - name: Train strategy models (tail etc) - if missing
+        run: |
+          if [ -f app/tail_model.pkl ] && [ -f app/tail_scaler.pkl ]; then
+            echo "[SKIP] tail model already exists"
+          else
+            python scripts/train_strategy_models.py
+          fi
+
+      # ---- ✅ 게이트 조합 실험 ----
+      - name: Gate grid runs (none / tail / utility / tail_utility) x (lists)
+        run: |
+          set -euo pipefail
+
+          PT="${PROFIT_TARGET}"
+          H="${HOLDING_DAYS}"
+          SL="${STOP_LEVEL}"
+          EX="${MAX_EXTEND_DAYS}"
+          LAM="${LAMBDA_TAIL}"
+
           IFS=',' read -ra TAILS <<< "${TAIL_MAX_LIST}"
           IFS=',' read -ra UQS   <<< "${U_QUANTILE_LIST}"
           IFS=',' read -ra RANKS <<< "${RANK_BY_LIST}"
 
-          # 공백 트림 함수
           trim () { echo "$1" | xargs; }
-
-          # 파일명 안전용(0.25 -> 0p25)
           safe () { echo "$1" | sed 's/\./p/g' | sed 's/-/m/g'; }
 
           run_one () {
@@ -180,28 +261,28 @@ jobs:
               --initial-seed 40000000
           }
 
-          # ✅ baseline (none) — 1회만 (첫 값만 사용)
+          # baseline(none): 각 rank_by마다 1회(첫 tail/u 사용)
           BASE_T="${TAILS[0]}"
           BASE_Q="${UQS[0]}"
           for R in "${RANKS[@]}"; do
             run_one "none" "${BASE_T}" "${BASE_Q}" "${R}"
           done
 
-          # ✅ tail gate — tail list만 loop (u는 첫 값 고정)
+          # tail gate: tail list x rank
           for T in "${TAILS[@]}"; do
             for R in "${RANKS[@]}"; do
               run_one "tail" "${T}" "${BASE_Q}" "${R}"
             done
           done
 
-          # ✅ utility gate — u list만 loop (tail은 첫 값 고정)
+          # utility gate: u list x rank
           for Q in "${UQS[@]}"; do
             for R in "${RANKS[@]}"; do
               run_one "utility" "${BASE_T}" "${Q}" "${R}"
             done
           done
 
-          # ✅ tail + utility gate — cartesian (tail x u)
+          # tail+utility: tail x u x rank
           for T in "${TAILS[@]}"; do
             for Q in "${UQS[@]}"; do
               for R in "${RANKS[@]}"; do
