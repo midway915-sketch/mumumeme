@@ -37,12 +37,17 @@ def fmt_tag(pt: float, max_days: int, sl: float) -> str:
 
 
 def load_features() -> pd.DataFrame:
-    if FEATURES_PARQUET.exists():
-        f = pd.read_parquet(FEATURES_PARQUET)
-    elif FEATURES_CSV.exists():
-        f = pd.read_csv(FEATURES_CSV)
+    p = Path("data/features/features_model.parquet")
+    c = Path("data/features/features_model.csv")
+    if p.exists():
+        f = pd.read_parquet(p)
+    elif c.exists():
+        f = pd.read_csv(c)
     else:
-        raise FileNotFoundError("features not found. Run scripts/build_features.py first.")
+        # fallback
+        p0 = Path("data/features/features.parquet")
+        c0 = Path("data/features/features.csv")
+        f = pd.read_parquet(p0) if p0.exists() else pd.read_csv(c0)
 
     f = f.copy()
     f["Date"] = pd.to_datetime(f["Date"])
