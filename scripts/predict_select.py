@@ -56,10 +56,6 @@ def load_labels(tag: str) -> pd.DataFrame:
 
 
 def get_market_row(day_df: pd.DataFrame) -> dict:
-    """
-    같은 Date의 모든 티커가 동일한 market 피처를 갖는 구조라면
-    아무 행 1개에서 market 정보를 뽑아도 됨.
-    """
     cols = [
         "VIX",
         "Market_Drawdown_60",
@@ -85,13 +81,13 @@ def apply_killswitch(market: dict, args) -> tuple[bool, int, float, str]:
     lam_used = args.lambda_risk
     reason = ""
 
-    # 하드 스킵 조건
+    # hard skip
     if np.isfinite(vix) and vix >= args.hard_vix:
         return True, topk_used, lam_used, f"hard_skip_vix>={args.hard_vix} (vix={vix:.2f})"
     if np.isfinite(dd60) and dd60 <= -abs(args.hard_dd60):
         return True, topk_used, lam_used, f"hard_skip_dd60<={-abs(args.hard_dd60):.2f} (dd60={dd60:.3f})"
 
-    # 소프트 리스크 모드
+    # soft risk mode
     if np.isfinite(vix) and vix >= args.soft_vix:
         topk_used = max(1, min(topk_used, args.soft_topk))
         lam_used = max(lam_used, args.soft_lambda)
@@ -102,6 +98,30 @@ def apply_killswitch(market: dict, args) -> tuple[bool, int, float, str]:
         reason = f"soft_risk_dd60<={-abs(args.soft_dd60):.2f} (dd60={dd60:.3f})"
 
     return False, topk_used, lam_used, reason
+
+
+def summarize_eval(df: pd.DataFrame, tail_col: str = "TailFlag") -> pd.DataFrame:
+    """
+    df columns expected:
+      - method
+      - CycleReturn, MinCycleRet, ExtendDays, ForcedExitFlag, TailFlag
+    """
+    out = (
+        df.dropna(subset=["CycleReturn"])
+        .groupby("method")
+        .agg(
+            n=("CycleReturn", "count"),
+            win_rate=("CycleReturn", lambda x: float((x > 0).mean())),
+            avg_ret=("CycleReturn", "mean"),
+            tail_rate=(tail_col, "mean"),
+            worst_min_ret=("MinCycleRet", "min"),
+            avg_extend_days=("ExtendDays", "mean"),
+            forced_exit_rate=("ForcedExitFlag", "mean"),
+        )
+        .reset_index()
+        .sort_values("avg_ret", ascending=False)
+    )
+    return out
 
 
 def main() -> None:
@@ -117,11 +137,14 @@ def main() -> None:
 
     # killswitch params
     ap.add_argument("--hard-vix", type=float, default=40.0)
-    ap.add_argument("--hard-dd60", type=float, default=0.18)  # abs value, dd60 <= -0.18이면 스킵
+    ap.add_argument("--hard-dd60", type=float, default=0.18)
     ap.add_argument("--soft-vix", type=float, default=30.0)
     ap.add_argument("--soft-dd60", type=float, default=0.12)
     ap.add_argument("--soft-topk", type=int, default=2)
     ap.add_argument("--soft-lambda", type=float, default=0.10)
+
+    # shadow evaluation: skip day에는 ret_only로 들어간다고 가정
+    ap.add_argument("--shadow-on-skip", action="store_true", help="skipped day에 ret_only trade를 넣은 shadow 성과도 출력")
 
     args = ap.parse_args()
 
@@ -147,7 +170,7 @@ def main() -> None:
     feat["p_tail"] = clf_tail.predict_proba(Xs)[:, 1]
     feat["pred_ret"] = reg.predict(Xs)
 
-    # 날짜별 picks
+    # 날짜별 picks (스킵이어도 "만약 거래했다면" 픽은 계산해둠)
     pick_rows = []
     for date, g in feat.groupby("Date", sort=False):
         g = g.reset_index(drop=True)
@@ -155,43 +178,19 @@ def main() -> None:
         market = get_market_row(g)
         skip, topk_used, lam_used, reason = apply_killswitch(market, args)
 
-        if skip:
-            pick_rows.append(
-                {
-                    "Date": date,
-                    "Skipped": 1,
-                    "SkipReason": reason,
-                    "topk_used": topk_used,
-                    "lambda_used": lam_used,
-                    "pick_ret_only": None,
-                    "pick_p_only": None,
-                    "pick_gate_ret": None,
-                    "pick_utility": None,
-                    "pick_gate_utility": None,
-                    "pick_blend": None,
-                    "VIX": market.get("VIX", np.nan),
-                    "Market_Drawdown_60": market.get("Market_Drawdown_60", np.nan),
-                }
-            )
-            continue
-
-        # utility 계산(리스크 조절 반영)
         g = g.copy()
         g["utility"] = g["pred_ret"] - float(lam_used) * g["p_tail"]
 
-        # ret-only / p-only
+        # always compute "would-be picks"
         pick_ret = g.loc[g["pred_ret"].idxmax(), "Ticker"]
         pick_p = g.loc[g["p_pos"].idxmax(), "Ticker"]
 
-        # gate topk by p_pos
         gg = g.sort_values("p_pos", ascending=False).head(max(1, min(topk_used, len(g))))
         pick_gate_ret = gg.loc[gg["pred_ret"].idxmax(), "Ticker"]
         pick_gate_utility = gg.loc[gg["utility"].idxmax(), "Ticker"]
 
-        # utility only
         pick_utility = g.loc[g["utility"].idxmax(), "Ticker"]
 
-        # blend rank(p, pred_ret)
         g2 = g.copy()
         g2["rank_p"] = g2["p_pos"].rank(ascending=False, method="average")
         g2["rank_r"] = g2["pred_ret"].rank(ascending=False, method="average")
@@ -201,10 +200,11 @@ def main() -> None:
         pick_rows.append(
             {
                 "Date": date,
-                "Skipped": 0,
-                "SkipReason": reason,
+                "Skipped": 1 if skip else 0,
+                "SkipReason": reason if skip else "",
                 "topk_used": topk_used,
                 "lambda_used": lam_used,
+                # would-be picks (skip이어도 기록)
                 "pick_ret_only": pick_ret,
                 "pick_p_only": pick_p,
                 "pick_gate_ret": pick_gate_ret,
@@ -218,72 +218,154 @@ def main() -> None:
 
     picks = pd.DataFrame(pick_rows).sort_values("Date").reset_index(drop=True)
 
-    # 평가
+    # 라벨 준비
     lab_eval = lab[["Date", "Ticker", "CycleReturn", "MinCycleRet", "ExtendDays", "ForcedExitFlag"]].copy()
     lab_eval["TailFlag"] = (lab_eval["MinCycleRet"].astype(float) <= float(args.tail_threshold)).astype(int)
 
-    def attach(method_col: str, name: str) -> pd.DataFrame:
+    # ====== 1) 기존 방식: "거래한 날만" 평가 ======
+    def attach_traded(method_col: str, name: str) -> pd.DataFrame:
         tmp = picks[picks["Skipped"] == 0][["Date", method_col]].rename(columns={method_col: "Ticker"})
         out = tmp.merge(lab_eval, on=["Date", "Ticker"], how="left")
         out["method"] = name
+        out["Skipped"] = 0
         return out
 
-    eval_df = pd.concat(
+    eval_traded = pd.concat(
         [
-            attach("pick_ret_only", "ret_only"),
-            attach("pick_p_only", "p_only"),
-            attach("pick_gate_ret", "gate_topk_then_ret"),
-            attach("pick_utility", "utility"),
-            attach("pick_gate_utility", "gate_topk_then_utility"),
-            attach("pick_blend", "blend_rank"),
+            attach_traded("pick_ret_only", "ret_only"),
+            attach_traded("pick_p_only", "p_only"),
+            attach_traded("pick_gate_ret", "gate_topk_then_ret"),
+            attach_traded("pick_utility", "utility"),
+            attach_traded("pick_gate_utility", "gate_topk_then_utility"),
+            attach_traded("pick_blend", "blend_rank"),
+        ],
+        ignore_index=True,
+    )
+    summary_traded = summarize_eval(eval_traded)
+
+    # ====== 2) "스킵은 0 수익" 포함한 일별 성과(기회비용 확인용) ======
+    def attach_daily_zero(method_col: str, name: str) -> pd.DataFrame:
+        tmp = picks[["Date", "Skipped", method_col]].rename(columns={method_col: "Ticker"})
+        out = tmp.merge(lab_eval, on=["Date", "Ticker"], how="left")
+        out["method"] = name
+        # 스킵은 0 수익으로 간주(그리고 리스크 지표도 neutral 처리)
+        out.loc[out["Skipped"] == 1, "CycleReturn"] = 0.0
+        out.loc[out["Skipped"] == 1, "TailFlag"] = 0
+        out.loc[out["Skipped"] == 1, "ForcedExitFlag"] = 0
+        # ExtendDays/MinCycleRet는 NaN로 둬도 되고 0으로 둬도 되는데, 여기선 NaN 유지
+        return out
+
+    eval_daily_zero = pd.concat(
+        [
+            attach_daily_zero("pick_ret_only", "ret_only_daily0"),
+            attach_daily_zero("pick_p_only", "p_only_daily0"),
+            attach_daily_zero("pick_gate_ret", "gate_topk_then_ret_daily0"),
+            attach_daily_zero("pick_utility", "utility_daily0"),
+            attach_daily_zero("pick_gate_utility", "gate_topk_then_utility_daily0"),
+            attach_daily_zero("pick_blend", "blend_rank_daily0"),
         ],
         ignore_index=True,
     )
 
-    summary = (
-        eval_df.dropna(subset=["CycleReturn"])
+    # daily0 summary는 "일 단위"로 보는게 목적이라, n=전체일수에 가까워야 함
+    summary_daily0 = (
+        eval_daily_zero.dropna(subset=["CycleReturn"])
         .groupby("method")
         .agg(
-            n=("CycleReturn", "count"),
+            days=("CycleReturn", "count"),
+            avg_daily_ret=("CycleReturn", "mean"),
+            cum_ret=("CycleReturn", lambda x: float((1.0 + x).prod() - 1.0)),
             win_rate=("CycleReturn", lambda x: float((x > 0).mean())),
-            avg_ret=("CycleReturn", "mean"),
             tail_rate=("TailFlag", "mean"),
-            worst_min_ret=("MinCycleRet", "min"),
-            avg_extend_days=("ExtendDays", "mean"),
-            forced_exit_rate=("ForcedExitFlag", "mean"),
         )
         .reset_index()
-        .sort_values("avg_ret", ascending=False)
+        .sort_values("avg_daily_ret", ascending=False)
     )
+
+    # ====== 3) Shadow: "스킵한 날은 ret_only로 거래했다면?" ======
+    eval_shadow = None
+    summary_shadow = None
+    if args.shadow_on_skip:
+        def attach_shadow(method_col: str, name: str) -> pd.DataFrame:
+            # non-skip: method_col, skip: ret_only
+            use = picks[["Date", "Skipped", "pick_ret_only", method_col]].copy()
+            use["Ticker"] = np.where(use["Skipped"].to_numpy() == 1, use["pick_ret_only"], use[method_col])
+            out = use[["Date", "Skipped", "Ticker"]].merge(lab_eval, on=["Date", "Ticker"], how="left")
+            out["method"] = name
+            out["ShadowRule"] = "ret_only_on_skips"
+            return out
+
+        eval_shadow = pd.concat(
+            [
+                attach_shadow("pick_ret_only", "ret_only_shadow"),  # 사실상 동일
+                attach_shadow("pick_p_only", "p_only_shadow"),
+                attach_shadow("pick_gate_ret", "gate_topk_then_ret_shadow"),
+                attach_shadow("pick_utility", "utility_shadow"),
+                attach_shadow("pick_gate_utility", "gate_topk_then_utility_shadow"),
+                attach_shadow("pick_blend", "blend_rank_shadow"),
+            ],
+            ignore_index=True,
+        )
+
+        summary_shadow = (
+            eval_shadow.dropna(subset=["CycleReturn"])
+            .groupby("method")
+            .agg(
+                days=("CycleReturn", "count"),
+                avg_daily_ret=("CycleReturn", "mean"),
+                cum_ret=("CycleReturn", lambda x: float((1.0 + x).prod() - 1.0)),
+                win_rate=("CycleReturn", lambda x: float((x > 0).mean())),
+                tail_rate=("TailFlag", "mean"),
+                worst_min_ret=("MinCycleRet", "min"),
+                forced_exit_rate=("ForcedExitFlag", "mean"),
+            )
+            .reset_index()
+            .sort_values("avg_daily_ret", ascending=False)
+        )
 
     # 스킵 통계
-    skip_stats = picks.agg(
-        total_days=("Date", "count"),
-        skipped_days=("Skipped", "sum"),
-    )
     skip_stats = {
-        "total_days": int(skip_stats["total_days"]),
-        "skipped_days": int(skip_stats["skipped_days"]),
-        "skip_rate": float(skip_stats["skipped_days"] / max(1, skip_stats["total_days"])),
+        "total_days": int(len(picks)),
+        "skipped_days": int(picks["Skipped"].sum()),
+        "skip_rate": float(picks["Skipped"].sum() / max(1, len(picks))),
     }
 
+    # 저장
     SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
     picks_path = SIGNAL_DIR / f"picks_{tag}_ks.csv"
-    eval_path = SIGNAL_DIR / f"eval_{tag}_ks.csv"
-    summary_path = SIGNAL_DIR / f"summary_{tag}_ks.csv"
+    eval_traded_path = SIGNAL_DIR / f"eval_traded_{tag}_ks.csv"
+    summary_traded_path = SIGNAL_DIR / f"summary_traded_{tag}_ks.csv"
+    summary_daily0_path = SIGNAL_DIR / f"summary_daily0_{tag}_ks.csv"
     skip_path = SIGNAL_DIR / f"skip_{tag}_ks.json"
 
     picks.to_csv(picks_path, index=False)
-    eval_df.to_csv(eval_path, index=False)
-    summary.to_csv(summary_path, index=False)
+    eval_traded.to_csv(eval_traded_path, index=False)
+    summary_traded.to_csv(summary_traded_path, index=False)
+    summary_daily0.to_csv(summary_daily0_path, index=False)
     skip_path.write_text(pd.Series(skip_stats).to_json(), encoding="utf-8")
 
+    if args.shadow_on_skip and eval_shadow is not None and summary_shadow is not None:
+        eval_shadow_path = SIGNAL_DIR / f"eval_shadow_{tag}_ks.csv"
+        summary_shadow_path = SIGNAL_DIR / f"summary_shadow_{tag}_ks.csv"
+        eval_shadow.to_csv(eval_shadow_path, index=False)
+        summary_shadow.to_csv(summary_shadow_path, index=False)
+        print("Saved:", eval_shadow_path)
+        print("Saved:", summary_shadow_path)
+
     print("Saved:", picks_path)
-    print("Saved:", eval_path)
-    print("Saved:", summary_path)
+    print("Saved:", eval_traded_path)
+    print("Saved:", summary_traded_path)
+    print("Saved:", summary_daily0_path)
     print("Saved:", skip_path)
+
     print("\nSkip stats:", skip_stats)
-    print("\n" + summary.to_string(index=False))
+    print("\n=== Traded-only summary ===")
+    print(summary_traded.to_string(index=False))
+    print("\n=== Daily( skip=0 ) summary ===")
+    print(summary_daily0.to_string(index=False))
+    if args.shadow_on_skip and summary_shadow is not None:
+        print("\n=== Shadow( ret_only on skips ) summary ===")
+        print(summary_shadow.to_string(index=False))
 
 
 if __name__ == "__main__":
