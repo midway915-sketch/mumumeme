@@ -24,6 +24,15 @@ META_JSON = FEATURE_DIR / "features_model_meta.json"
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def _dt_ns(x: pd.Series) -> pd.Series:
+    # merge_asof dtype 단위까지 같아야 해서 ns로 통일
+    s = pd.to_datetime(x, errors="coerce")
+    # 혹시 timezone이 섞였으면 제거
+    try:
+        s = s.dt.tz_localize(None)
+    except Exception:
+        pass
+    return s.astype("datetime64[ns]")
 
 def load_features() -> pd.DataFrame:
     if FEATURES_PARQUET.exists():
@@ -86,43 +95,44 @@ def compute_event_ev(events: pd.DataFrame, win_events: int) -> pd.DataFrame:
 
 
 def merge_ev_to_daily(features: pd.DataFrame, ev_events: pd.DataFrame) -> pd.DataFrame:
-    """
-    Date별로 '이전(<= Date-1)'의 마지막 EV 상태를 붙이기 위해 merge_asof 사용.
-    """
-    out = []
+    # 🔥 핵심: merge_asof는 datetime 단위까지 같아야 함 (us vs ms면 터짐)
+    # 아래에서 ns로 강제 통일
+    features = features.copy()
+    ev_events = ev_events.copy()
 
-    for t, f_t in features.groupby("Ticker", sort=False):
-        f_t = f_t.sort_values("Date").reset_index(drop=True)
+    # 네 코드에서 merge_asof에 쓰는 키 컬럼명이 뭔지에 따라 수정 필요
+    # 보통: features["Date"] 와 ev_events["EventDate"] 또는 ["ExitDate"]
+    if "Date" in features.columns:
+        features["Date"] = _dt_ns(features["Date"])
 
-        e_t = ev_events[ev_events["Ticker"] == t].sort_values("ExitDate").reset_index(drop=True)
-        if e_t.empty:
-            # EV 컬럼 NaN으로
-            for c in ev_events.columns:
-                if c.startswith("EV_"):
-                    f_t[c] = np.nan
-            out.append(f_t)
-            continue
+    # 여기 컬럼명은 네 ev_events 실제 컬럼에 맞춰 하나만 남겨
+    if "EventDate" in ev_events.columns:
+        ev_events["EventDate"] = _dt_ns(ev_events["EventDate"])
+        right_key = "EventDate"
+    elif "ExitDate" in ev_events.columns:
+        ev_events["ExitDate"] = _dt_ns(ev_events["ExitDate"])
+        right_key = "ExitDate"
+    elif "Date" in ev_events.columns:
+        ev_events["Date"] = _dt_ns(ev_events["Date"])
+        right_key = "Date"
+    else:
+        raise ValueError(f"ev_events has no datetime key column. cols={list(ev_events.columns)}")
 
-        # merge_asof: Date에 대해 "가장 최근 ExitDate <= Date-1"를 붙임
-        # (ExitDate 당일은 결과를 알 수 있다고 가정하면 <= Date로 바꿔도 됨. 여기선 보수적으로 Date-1.)
-        f_key = f_t[["Date"]].copy()
-        f_key["KeyDate"] = f_key["Date"] - pd.Timedelta(days=1)
+    # NaT 제거 (asof는 NaT 있으면 또 난리남)
+    features = features.dropna(subset=["Date"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    ev_events = ev_events.dropna(subset=[right_key]).sort_values(["Ticker", right_key]).reset_index(drop=True)
 
-        merged = pd.merge_asof(
-            left=f_key.sort_values("KeyDate"),
-            right=e_t.rename(columns={"ExitDate": "KeyDate"}).sort_values("KeyDate"),
-            on="KeyDate",
-            direction="backward",
-        )
-
-        # EV 컬럼만 붙이기
-        ev_cols = [c for c in merged.columns if c.startswith("EV_")]
-        for c in ev_cols:
-            f_t[c] = merged[c].to_numpy()
-
-        out.append(f_t)
-
-    return pd.concat(out, ignore_index=True).sort_values(["Date", "Ticker"]).reset_index(drop=True)
+    # ✅ merge_asof (by=Tcker 기준, 과거 이벤트를 현재 날짜에 붙임)
+    merged = pd.merge_asof(
+        features,
+        ev_events,
+        left_on="Date",
+        right_on=right_key,
+        by="Ticker",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    return merged
 
 
 def add_cross_sectional_ranks(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
