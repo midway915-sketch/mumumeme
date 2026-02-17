@@ -55,7 +55,6 @@ def _pick_feature_cols(model, fallback: list[str], df_cols: list[str]) -> list[s
 
 
 def _load_tau_cuts(tag: str, max_days: int) -> tuple[int, int, int]:
-    # prefer report json
     report = Path(f"data/meta/train_tau_report_{tag}.json")
     if report.exists():
         try:
@@ -69,6 +68,19 @@ def _load_tau_cuts(tag: str, max_days: int) -> tuple[int, int, int]:
         except Exception:
             pass
     return _make_tau_cutoffs(int(max_days))
+
+
+def _require_files(spec: str | None) -> None:
+    """
+    spec: comma-separated file paths.
+    If any missing -> raise FileNotFoundError.
+    """
+    if not spec:
+        return
+    paths = [p.strip() for p in str(spec).split(",") if p.strip()]
+    missing = [p for p in paths if not Path(p).exists()]
+    if missing:
+        raise FileNotFoundError(f"[require-files] Missing: {missing}")
 
 
 def main() -> None:
@@ -90,7 +102,19 @@ def main() -> None:
     ap.add_argument("--utility-quantile", required=True, type=float)
     ap.add_argument("--rank-by", required=True, type=str, choices=["utility", "ret_score", "p_success"])
     ap.add_argument("--lambda-tail", required=True, type=float)
+
+    # ✅ added: keep yml/shell compatible
+    ap.add_argument(
+        "--require-files",
+        default="",
+        type=str,
+        help="comma-separated paths that must exist before running (used by workflow)",
+    )
+
     args = ap.parse_args()
+
+    # ✅ enforce required files if passed
+    _require_files(args.require_files)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -158,7 +182,7 @@ def main() -> None:
     mid1 = max(1.0, cut1 * 0.7)
     mid2 = (cut1 + cut2) / 2.0
     mid3 = (cut2 + cut3) / 2.0
-    mid4 = cut3 + max(5.0, (cut3 - cut2) / 2.0)  # beyond max_days bucket
+    mid4 = cut3 + max(5.0, (cut3 - cut2) / 2.0)
     tau_exp = (mid1 * p1) + (mid2 * p2) + (mid3 * p3) + (mid4 * p4)
 
     out = feats[["Date", "Ticker"]].copy()
