@@ -127,6 +127,65 @@ jobs:
           # build_features.py는 네 repo의 CLI에 맞게 동작한다고 가정
           python scripts/build_features.py
 
+      - name: Normalize features filename (ensure features_model.* exists)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/features
+
+          if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
+            echo "[OK] features_model already exists"
+            ls -la data/features | head -n 200 || true
+            exit 0
+          fi
+
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          d = Path("data/features")
+          # 후보: parquet 우선, 없으면 csv
+          cand_parq = sorted([p for p in d.glob("*.parquet") if "features" in p.name.lower()])
+          cand_csv  = sorted([p for p in d.glob("*.csv") if "features" in p.name.lower()])
+
+          def pick_best(paths):
+              # features_model/ model / 가장 긴(보통 feature가 많음) 파일명을 우선
+              if not paths:
+                  return None
+              score = []
+              for p in paths:
+                  name = p.name.lower()
+                  s = 0
+                  if "model" in name: s += 50
+                  if "features_model" in name: s += 100
+                  if "daily" in name: s += 10
+                  if "all" in name: s += 5
+                  # 파일 크기 가산
+                  try:
+                      s += int(p.stat().st_size / 1024)
+                  except:
+                      pass
+                  score.append((s, p))
+              score.sort(key=lambda x: x[0], reverse=True)
+              return score[0][1]
+
+          src = pick_best(cand_parq) or pick_best(cand_csv)
+          if src is None:
+              raise SystemExit("[ERROR] No features*.parquet/csv found under data/features. build_features.py output missing?")
+
+          # 복사해서 표준명 생성
+          if src.suffix == ".parquet":
+              dst = d / "features_model.parquet"
+          else:
+              dst = d / "features_model.csv"
+
+          shutil.copy2(src, dst)
+          print(f"[DONE] normalized features: {src} -> {dst}")
+          PY
+
+          echo "[INFO] data/features listing:"
+          ls -la data/features | head -n 200 || true
+
       # =========================
       # 1차 넓은 그리드
       # =========================
