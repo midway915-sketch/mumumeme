@@ -41,6 +41,7 @@ on:
         default: "false"
 
   schedule:
+    # 매일 한국시간 08:10 (UTC 23:10)
     - cron: "10 23 * * *"
 
 jobs:
@@ -75,14 +76,15 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      - name: Set LABEL_SPEC env
+      - name: Set LABEL envs (safe for cache keys)
         shell: bash
         run: |
           set -euo pipefail
-          # 사람 읽기용(그대로 유지)
+
+          # 사람 읽기용 (콤마 포함 OK — 캐시 키에는 절대 쓰지 말기)
           echo "LABEL_SPEC=pt=${{ inputs.profit_target }},h=${{ inputs.max_days }},sl=${{ inputs.stop_level }},ex=${{ inputs.max_extend_days }}" >> $GITHUB_ENV
 
-          # 캐시 키용(콤마/등호 없는 안전 tag)
+          # 캐시 키/태그용 (콤마/공백 없음)
           PT_INT="$(python - <<'PY'
 pt=float("${{ inputs.profit_target }}")
 print(int(round(pt*100)))
@@ -95,7 +97,9 @@ PY
 )"
           echo "LABEL_TAG=pt${PT_INT}_h${{ inputs.max_days }}_sl${SL_INT}_ex${{ inputs.max_extend_days }}" >> $GITHUB_ENV
 
-      # ---- PRICES cache
+      # ----------------------------
+      # Cache: PRICES (유니버스/패치 바뀌면 무효)
+      # ----------------------------
       - name: Restore cache (PRICES)
         uses: actions/cache@v4
         with:
@@ -103,28 +107,29 @@ PY
             data/raw/prices.parquet
             data/raw/prices.csv
             data/raw/prices_meta.json
-          key: >
-            mumumeme-prices-v2-${{ runner.os }}-
-            ${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
+          key: mumumeme-prices-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
           restore-keys: |
-            mumumeme-prices-v2-${{ runner.os }}-
+            mumumeme-prices-v3-${{ runner.os }}-
 
-      # ---- FEATURES cache
+      # ----------------------------
+      # Cache: FEATURES (prices/features 코드 바뀌면 무효)
+      # - PT/H/SL과 무관하게 재사용
+      # ----------------------------
       - name: Restore cache (FEATURES_MODEL)
         uses: actions/cache@v4
         with:
           path: |
             data/features/features_model.parquet
             data/features/features_model.csv
-          key: >
-            mumumeme-features-v2-${{ runner.os }}-
-            ${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py',
-                          'scripts/build_features.py','scripts/build_ev_features.py','scripts/merge_incremental_table.py') }}
+          key: mumumeme-features-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py','scripts/build_features.py','scripts/build_ev_features.py','scripts/merge_incremental_table.py') }}
           restore-keys: |
-            mumumeme-features-v2-${{ runner.os }}-
+            mumumeme-features-v3-${{ runner.os }}-
 
-      # ---- MODEL cache
-      - name: Restore cache (MODEL)
+      # ----------------------------
+      # Cache: LABELS+MODEL (LABEL_TAG에만 종속)
+      # - PT/H/SL 바뀌면 여기만 새로 만들게 됨
+      # ----------------------------
+      - name: Restore cache (LABELS_MODEL_AND_SUCCESS_MODEL)
         uses: actions/cache@v4
         with:
           path: |
@@ -134,13 +139,10 @@ PY
             app/scaler.pkl
             data/meta/build_fingerprint.json
             data/meta/model_train_meta.json
-          key: >
-            mumumeme-model-v2-${{ runner.os }}-
-            ${{ env.LABEL_TAG }}-
-            ${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/check_rebuild.py','scripts/merge_incremental_table.py') }}
+          key: mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_TAG }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/check_rebuild.py','scripts/merge_incremental_table.py') }}
           restore-keys: |
-            mumumeme-model-v2-${{ runner.os }}-${{ env.LABEL_TAG }}-
-            mumumeme-model-v2-${{ runner.os }}-
+            mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_TAG }}-
+            mumumeme-model-v3-${{ runner.os }}-
 
       - name: Fingerprint check (partial rebuild flags)
         shell: bash
@@ -152,12 +154,12 @@ PY
             --features-files "scripts/build_features.py,scripts/build_ev_features.py,scripts/merge_incremental_table.py" \
             --labels-files "scripts/build_labels.py,scripts/train_model.py,scripts/merge_incremental_table.py" \
             --universe-files "scripts/universe.py,data/universe.csv" \
-            --strategy-files "scripts/predict_gate.py,scripts/simulate_single_position_engine.py,scripts/gate_grid_lib.sh,scripts/run_grid_workflow.sh,scripts/summarize_sim_trades.py,scripts/aggregate_gate_grid.py" \
+            --strategy-files "scripts/predict_gate.py,scripts/simulate_single_position_engine.py,scripts/run_grid_workflow.sh,scripts/summarize_sim_trades.py,scripts/aggregate_gate_grid.py" \
           )"
           echo "$out"
           echo "$out" | tail -n 4 >> $GITHUB_ENV
 
-      - name: Prepare required files (daily incremental)
+      - name: Prepare required files (reuse when possible)
         shell: bash
         env:
           REBUILD_ALL: ${{ inputs.rebuild_all }}
@@ -176,24 +178,26 @@ PY
             REBUILD_PRICES="1"; REBUILD_FEATURES="1"; REBUILD_MODEL="1"; CLEAR_SIGNALS="1"
           fi
 
-          if [ "$CLEAR_SIGNALS" = "1" ]; then
+          if [ "${CLEAR_SIGNALS:-0}" = "1" ]; then
             rm -rf data/signals/* || true
           fi
 
-          if [ "$REBUILD_PRICES" = "1" ]; then
+          # upstream 삭제(필요할 때만)
+          if [ "${REBUILD_PRICES:-0}" = "1" ]; then
             rm -f data/raw/prices.parquet data/raw/prices.csv data/raw/prices_meta.json || true
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
             rm -f app/model.pkl app/scaler.pkl || true
-          elif [ "$REBUILD_FEATURES" = "1" ]; then
+          elif [ "${REBUILD_FEATURES:-0}" = "1" ]; then
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
             rm -f app/model.pkl app/scaler.pkl || true
-          elif [ "$REBUILD_MODEL" = "1" ]; then
+          elif [ "${REBUILD_MODEL:-0}" = "1" ]; then
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
             rm -f app/model.pkl app/scaler.pkl || true
           fi
 
+          # 1) prices: 있으면 증분, 없으면 풀
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full
@@ -201,6 +205,7 @@ PY
             python scripts/fetch_prices.py --include-extra --lookback-days 10
           fi
 
+          # 2) START_DATE 자동 산출(있으면 최근 n일만 재생성 -> merge)
           RECOMPUTE_DAYS=20
           START_DATE=""
           if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
@@ -229,6 +234,7 @@ PY
           fi
           echo "[INFO] START_DATE=$START_DATE"
 
+          # 3) features (PT/H/SL 무관) -> 재사용 핵심
           if [ -n "$START_DATE" ] && { [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; }; then
             rm -rf data/_backup/features || true
             mkdir -p data/_backup/features
@@ -254,6 +260,7 @@ PY
             python scripts/build_features.py
           fi
 
+          # 4) labels (PT/H/SL에 종속) -> 여기만 갈아끼우게 됨
           if [ -n "$START_DATE" ] && { [ -f data/labels/labels_model.parquet ] || [ -f data/labels/labels_model.csv ]; }; then
             rm -rf data/_backup/labels || true
             mkdir -p data/_backup/labels
@@ -287,7 +294,7 @@ PY
               --stop-level "$STOP_LEVEL"
           fi
 
-          # model: labels 업데이트되면 재학습
+          # 5) model: labels 날짜가 바뀌면 재학습 (PT/H/SL 바꿔도 자동)
           LABELS_MAX_DATE="$(python - <<'PY'
 import pandas as pd
 from pathlib import Path
@@ -355,7 +362,6 @@ PY
           UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
           RANK_METRICS: ${{ inputs.rank_metrics }}
           LAMBDA_TAIL: ${{ inputs.lambda_tail }}
-          TAU_GAMMA: "0.0"
           GATE_MODES: "none,tail,utility,tail_utility"
           MAX_LEVERAGE_PCT: "1.0"
           LEV_PENALTY_K: "1.0"
