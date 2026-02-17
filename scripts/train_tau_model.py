@@ -44,7 +44,7 @@ def choose_features(df: pd.DataFrame, requested: list[str]) -> list[str]:
     cols = set(df.columns)
     feats = [c for c in requested if c in cols]
     if len(feats) < 4:
-        banned = {"TauDays", "TauLE10", "TauLE20", "TauLE40", "Date", "Ticker"}
+        banned = {"TauDays","TauLE1","TauLE2","TauLE3","TauCut1","TauCut2","TauCut3","TauHorizon","Date","Ticker"}
         numeric = [c for c in df.columns if c not in banned and pd.api.types.is_numeric_dtype(df[c])]
         feats = feats + [c for c in numeric if c not in feats][:12]
     out, seen = [], set()
@@ -91,21 +91,27 @@ def main() -> None:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.sort_values("Date")
 
-    for col in ["TauLE10", "TauLE20", "TauLE40"]:
+    # dynamic labels should exist
+    required = ["TauLE1", "TauLE2", "TauLE3"]
+    for col in required:
         if col not in df.columns:
             raise ValueError(f"labels_tau missing {col}")
+
+    # read cutoffs (just to store)
+    cut1 = int(pd.to_numeric(df.get("TauCut1", 10), errors="coerce").dropna().iloc[0]) if "TauCut1" in df.columns else 10
+    cut2 = int(pd.to_numeric(df.get("TauCut2", 20), errors="coerce").dropna().iloc[0]) if "TauCut2" in df.columns else 20
+    cut3 = int(pd.to_numeric(df.get("TauCut3", args.max_days), errors="coerce").dropna().iloc[0]) if "TauCut3" in df.columns else int(args.max_days)
 
     requested = [x.strip() for x in args.features.split(",") if x.strip()]
     feature_cols = choose_features(df, requested)
 
-    use = df.dropna(subset=feature_cols + ["TauLE10", "TauLE20", "TauLE40"]).copy()
+    use = df.dropna(subset=feature_cols + required).copy()
     if len(use) < 1000:
-        # fallback: fill features with 0
+        # inference-safe fallback
         use = df.copy()
         for c in feature_cols:
-            if c in use.columns:
-                use[c] = pd.to_numeric(use[c], errors="coerce").fillna(0.0)
-        for col in ["TauLE10", "TauLE20", "TauLE40"]:
+            use[c] = pd.to_numeric(use[c], errors="coerce").fillna(0.0)
+        for col in required:
             use[col] = pd.to_numeric(use[col], errors="coerce").fillna(0).astype(int)
 
     X = use[feature_cols]
@@ -120,7 +126,7 @@ def main() -> None:
     models = {}
     aucs = {}
 
-    for label in ["TauLE10", "TauLE20", "TauLE40"]:
+    for label in required:
         y = use[label].astype(int)
         y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
         clf = _fit_one(X_train_s, y_train, n_splits=int(args.n_splits), max_iter=int(args.max_iter))
@@ -138,6 +144,7 @@ def main() -> None:
 
     report = {
         "tag": tag,
+        "cuts": {"cut1": cut1, "cut2": cut2, "cut3": cut3},
         "rows_total": int(len(df)),
         "rows_used": int(len(use)),
         "train_rows": int(len(X_train)),
@@ -155,6 +162,7 @@ def main() -> None:
     print("=" * 60)
     print("[DONE] train_tau_model.py")
     print("tag:", tag)
+    print("cuts:", report["cuts"])
     print("AUCs:", report["aucs"])
     print("features:", feature_cols)
     print("=" * 60)
