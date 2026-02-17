@@ -72,21 +72,64 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals app scripts
 
-      # (선택) rebuild_all=true면 너의 파이프라인 실행
-      # 네 레포에 있는 실제 스크립트 이름/옵션에 맞게 유지해서 사용
-      - name: Rebuild pipeline (optional)
-        if: ${{ inputs.rebuild_all == 'true' }}
+      # ✅ 핵심: "없으면 만들고, 있으면 재사용" + rebuild_all=true면 강제 재생성
+      - name: Prepare required files (reuse if possible)
         shell: bash
+        env:
+          REBUILD_ALL: ${{ inputs.rebuild_all }}
         run: |
           set -euo pipefail
-          echo "[INFO] rebuild_all=true"
-          # 예시: 네 레포 실제 스크립트들에 맞게 수정 가능
-          # python scripts/universe.py
-          # python scripts/fetch_prices.py --include-extra --reset --force-full
-          # python scripts/build_features.py
-          # python scripts/build_labels.py
-          # python scripts/train_model.py
-          echo "[INFO] (skip) add your rebuild commands here if needed"
+
+          prices_ok="false"
+          feat_ok="false"
+          model_ok="false"
+
+          if [ -f data/raw/prices.parquet ] || [ -f data/raw/prices.csv ]; then prices_ok="true"; fi
+          if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then feat_ok="true"; fi
+          if [ -f app/model.pkl ] && [ -f app/scaler.pkl ]; then model_ok="true"; fi
+
+          echo "[INFO] existing: prices_ok=$prices_ok feat_ok=$feat_ok model_ok=$model_ok"
+          echo "[INFO] rebuild_all=$REBUILD_ALL"
+
+          if [ "$REBUILD_ALL" = "true" ]; then
+            echo "[INFO] rebuild_all=true -> force rebuild everything"
+            rm -f data/raw/prices.parquet data/raw/prices.csv data/raw/prices_meta.json || true
+            rm -f data/features/features_model.parquet data/features/features_model.csv || true
+            rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
+            rm -f app/model.pkl app/scaler.pkl || true
+            prices_ok="false"; feat_ok="false"; model_ok="false"
+          fi
+
+          # 1) prices
+          if [ "$prices_ok" != "true" ]; then
+            echo "[INFO] building prices..."
+            python scripts/universe.py
+            python scripts/fetch_prices.py --include-extra --reset --force-full
+          else
+            echo "[INFO] prices reuse"
+          fi
+
+          # 2) features_model
+          if [ "$feat_ok" != "true" ]; then
+            echo "[INFO] building features_model..."
+            python scripts/build_features.py
+          else
+            echo "[INFO] features_model reuse"
+          fi
+
+          # 3) model.pkl/scaler.pkl (gate에서 p_success 쓰면 필수)
+          if [ "$model_ok" != "true" ]; then
+            echo "[INFO] building labels + training model..."
+            python scripts/build_labels.py
+            python scripts/train_model.py
+          else
+            echo "[INFO] model reuse"
+          fi
+
+          echo "[INFO] final check:"
+          ls -la data/raw | sed -n '1,200p' || true
+          ls -la data/features | sed -n '1,200p' || true
+          ls -la app | sed -n '1,200p' || true
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
@@ -103,6 +146,10 @@ jobs:
           GATE_MODES: "none,tail,utility,tail_utility"
         run: |
           set -euo pipefail
+          if [ ! -f scripts/run_grid_workflow.sh ]; then
+            echo "[ERROR] scripts/run_grid_workflow.sh not found"
+            exit 1
+          fi
           chmod +x scripts/run_grid_workflow.sh || true
           bash scripts/run_grid_workflow.sh
 
@@ -117,17 +164,19 @@ jobs:
             --pattern "gate_summary_*.csv" \
             --topn 30
 
-      - name: Debug signals
+      - name: Sanity check (counts)
         shell: bash
         run: |
           set -euo pipefail
-          echo "[DEBUG] gate_summary count:"
+          echo "[CHECK] gate_summary count:"
           ls -1 data/signals/gate_summary_*.csv 2>/dev/null | wc -l || true
-          echo "[DEBUG] trades parquet count:"
+          echo "[CHECK] picks count:"
+          ls -1 data/signals/picks_*.csv 2>/dev/null | wc -l || true
+          echo "[CHECK] trades parquet count:"
           ls -1 data/signals/sim_engine_trades_*.parquet 2>/dev/null | wc -l || true
-          echo "[DEBUG] curve parquet count:"
+          echo "[CHECK] curve parquet count:"
           ls -1 data/signals/sim_engine_curve_*.parquet 2>/dev/null | wc -l || true
-          echo "[DEBUG] signals dir:"
+          echo "[CHECK] signals dir (first 200):"
           ls -la data/signals | sed -n '1,200p' || true
 
       - name: Upload artifacts (signals)
