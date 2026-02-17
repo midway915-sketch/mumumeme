@@ -10,7 +10,6 @@ FEATURES_PARQ = Path("data/features/features_model.parquet")
 FEATURES_CSV = Path("data/features/features_model.csv")
 PRICES_PARQ = Path("data/raw/prices.parquet")
 PRICES_CSV = Path("data/raw/prices.csv")
-OUT_DIR = Path("data/labels")
 
 
 def read_table(parq: Path, csv: Path) -> pd.DataFrame:
@@ -25,12 +24,42 @@ def _to_dt(x):
     return pd.to_datetime(x, errors="coerce")
 
 
+def _make_tau_cutoffs(max_days: int) -> tuple[int, int, int]:
+    """
+    Default: (10, 20, max_days)
+    but ensure strictly increasing: c1 < c2 < c3
+    """
+    c3 = int(max_days)
+    c1 = min(10, c3)
+    c2 = min(20, c3)
+
+    # enforce strict increase
+    if c1 >= c3:
+        c1 = max(1, c3 - 2)
+    if c2 <= c1:
+        # try set c2 between c1 and c3
+        mid = (c1 + c3) // 2
+        c2 = mid if mid > c1 else min(c3 - 1, c1 + 1)
+    if c2 >= c3:
+        c2 = max(c1 + 1, c3 - 1)
+
+    # final guard
+    if not (c1 < c2 < c3):
+        # fallback proportional split
+        c1 = max(1, int(round(c3 * 0.33)))
+        c2 = max(c1 + 1, int(round(c3 * 0.66)))
+        c2 = min(c2, c3 - 1)
+
+    return int(c1), int(c2), int(c3)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--profit-target", required=True, type=float)
     ap.add_argument("--max-days", required=True, type=int)
-    ap.add_argument("--stop-level", required=True, type=float)  # unused here but keep symmetry
+    ap.add_argument("--stop-level", required=True, type=float)  # kept for symmetry
     ap.add_argument("--max-extend-days", required=True, type=int)
+
     ap.add_argument("--start-date", default=None, type=str)
     ap.add_argument("--buffer-days", default=0, type=int)
     ap.add_argument("--out-dir", default="data/labels", type=str)
@@ -66,18 +95,17 @@ def main() -> None:
             start = start - pd.Timedelta(days=int(args.buffer_days))
         feats = feats.loc[feats["Date"] >= start].copy()
 
+    # tau search horizon: max_days + extend
     H = int(args.max_days + args.max_extend_days)
     pt = float(args.profit_target)
 
-    # Build forward "first hit" of profit target using High relative to entry Close.
-    # For each ticker, we will compute for every day t: minimal k in [1..H] such that High[t+k] >= Close[t]*(1+pt).
+    cut1, cut2, cut3 = _make_tau_cutoffs(int(args.max_days))
+    # cut3 is essentially max_days (strictly)
+    # We'll label success-time within horizon H (but classify <= cut1/2/3 windows)
+    # i.e., τ is computed as first day k where High[t+k] >= EntryClose*(1+pt), k in [1..H]
+
     prices = prices.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-    # We'll align by (Ticker, Date): entry_close and future highs.
-    entry = prices[["Ticker", "Date", "Close"]].rename(columns={"Close": "EntryClose"})
-    entry["EntryClose"] = pd.to_numeric(entry["EntryClose"], errors="coerce")
-
-    # Precompute future highs matrix in a rolling way (efficient enough for your universe size)
     def compute_tau_for_ticker(g: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values("Date").reset_index(drop=True)
         entry_close = g["Close"].to_numpy(dtype=float)
@@ -86,7 +114,6 @@ def main() -> None:
         n = len(g)
         tau = np.full(n, np.nan, dtype=float)
 
-        # brute horizon scan per row but horizon <= ~70 and tickers small => OK on GH Actions
         for i in range(n):
             ec = entry_close[i]
             if not np.isfinite(ec) or ec <= 0:
@@ -95,7 +122,7 @@ def main() -> None:
             jmax = min(n - 1, i + H)
             hit = np.where(future_high[i + 1 : jmax + 1] >= thr)[0]
             if hit.size:
-                tau[i] = float(hit[0] + 1)  # +1 because start from next day
+                tau[i] = float(hit[0] + 1)  # days to first hit
         out = g[["Ticker", "Date"]].copy()
         out["TauDays"] = tau
         return out
@@ -103,15 +130,20 @@ def main() -> None:
     tau_df = prices.groupby("Ticker", sort=False, group_keys=False).apply(compute_tau_for_ticker)
     tau_df = tau_df.sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
-    # merge onto features rows (only keep those dates/tickers present in feats)
     m = feats.merge(tau_df, on=["Date", "Ticker"], how="left")
+    tau_num = pd.to_numeric(m["TauDays"], errors="coerce")
 
-    # CDF targets
-    m["TauLE10"] = (pd.to_numeric(m["TauDays"], errors="coerce") <= 10).astype(int)
-    m["TauLE20"] = (pd.to_numeric(m["TauDays"], errors="coerce") <= 20).astype(int)
-    m["TauLE40"] = (pd.to_numeric(m["TauDays"], errors="coerce") <= 40).astype(int)
+    # Dynamic CDF targets
+    m["TauLE1"] = (tau_num <= cut1).astype(int)
+    m["TauLE2"] = (tau_num <= cut2).astype(int)
+    m["TauLE3"] = (tau_num <= cut3).astype(int)
 
-    # Keep tidy
+    # store cutoffs for downstream clarity/debugging
+    m["TauCut1"] = cut1
+    m["TauCut2"] = cut2
+    m["TauCut3"] = cut3
+    m["TauHorizon"] = H
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_parq = out_dir / f"labels_tau_{tag}.parquet"
@@ -126,7 +158,10 @@ def main() -> None:
     if not out_csv.exists():
         m.to_csv(out_csv, index=False)
 
-    print(f"[DONE] labels_tau built: tag={tag} rows={len(m)} horizon={H} -> {out_parq} / {out_csv}")
+    print(
+        f"[DONE] labels_tau built: tag={tag} rows={len(m)} "
+        f"horizon={H} cuts=({cut1},{cut2},{cut3}) -> {out_parq} / {out_csv}"
+    )
 
 
 if __name__ == "__main__":
