@@ -1,4 +1,3 @@
-# scripts/merge_sim_summaries.py
 from __future__ import annotations
 
 import argparse
@@ -7,7 +6,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
 import pyarrow.parquet as pq
 
 
@@ -15,9 +13,7 @@ SIGNALS_DIR = Path("data/signals")
 
 
 def read_parquet_any(path: str) -> pd.DataFrame:
-    # pandas.read_parquet이 환경에 따라 애매하게 깨질 때가 있어서 pyarrow로 고정
-    tbl = pq.read_table(path)
-    return tbl.to_pandas()
+    return pq.read_table(path).to_pandas()
 
 
 def max_drawdown(equity: np.ndarray) -> float:
@@ -28,123 +24,131 @@ def max_drawdown(equity: np.ndarray) -> float:
     return float(np.min(dd))
 
 
-def busday_gap(prev_exit: pd.Timestamp, next_entry: pd.Timestamp) -> int:
-    # (prev_exit 다음날) ~ (next_entry 전날) 사이의 "평일" 갯수 근사
-    # US holiday까지 완벽하진 않지만, 대략적인 skipped day로 충분히 쓸 수 있음
-    start = (prev_exit + pd.Timedelta(days=1)).date()
-    end = next_entry.date()  # end는 미포함
-    if start >= end:
-        return 0
-    return int(np.busday_count(start, end))
+def infer_variant_from_path(path: str) -> str:
+    p = path.upper()
+    if "_BASE" in p:
+        return "BASE"
+    if "_A" in p:
+        return "A"
+    if "_B" in p:
+        return "B"
+    return "BASE"
 
 
 def summarize_one_method(
     tag: str,
     method: str,
+    variant: str,
     curve: pd.DataFrame | None,
     trades: pd.DataFrame | None,
     max_days: int,
     recent_years: int,
 ) -> dict:
-    out: dict = {"label": method, "tag": tag}
+    out: dict = {"tag": tag, "label": method, "variant": variant}
 
-    # ---- trades 기반 (사이클/승률/레버리지 등)
+    # ---- trades 기반
     if trades is not None and not trades.empty:
-        t = trades[trades["Method"] == method].copy()
+        t = trades.copy()
+        t = t[t["Method"].astype(str) == str(method)]
+        if "Variant" in t.columns:
+            t = t[t["Variant"].astype(str) == str(variant)]
         t = t.sort_values("EntryDate")
+
         cycle_cnt = int(len(t))
         out["Cycle_Count_Closed"] = cycle_cnt
         out["Success_Rate_Closed"] = float((t["CycleReturn"] > 0).mean()) if cycle_cnt > 0 else 0.0
-        out["Avg_LeveragePct_Closed"] = float(t["LeveragePctMax"].mean()) if cycle_cnt > 0 else float("nan")
-        out["Max_LeveragePct_Closed"] = float(t["LeveragePctMax"].max()) if cycle_cnt > 0 else float("nan")
 
-        # Skipped days(근사): 사이클 간 갭의 평일 수 합
-        skipped = 0
-        if cycle_cnt >= 2:
-            prev_exits = t["ExitDate"].iloc[:-1].tolist()
-            next_entries = t["EntryDate"].iloc[1:].tolist()
-            for pe, ne in zip(prev_exits, next_entries):
-                skipped += busday_gap(pd.to_datetime(pe), pd.to_datetime(ne))
-        out["Skipped_Days"] = int(skipped)
+        if "LeveragePctMax" in t.columns and cycle_cnt > 0:
+            out["Max_LeveragePct_Closed"] = float(pd.to_numeric(t["LeveragePctMax"], errors="coerce").max())
+            out["Avg_LeveragePct_Closed"] = float(pd.to_numeric(t["LeveragePctMax"], errors="coerce").mean())
+        else:
+            out["Max_LeveragePct_Closed"] = float("nan")
+            out["Avg_LeveragePct_Closed"] = float("nan")
+
+        # max holding (닫힌 사이클 기준)
+        max_hold = 0
+        if "HoldingDays" in t.columns and cycle_cnt > 0:
+            hd = pd.to_numeric(t["HoldingDays"], errors="coerce").max()
+            if pd.notna(hd):
+                max_hold = int(hd)
+        out["Max_HoldingDays_Closed"] = int(max_hold)
 
     else:
         out["Cycle_Count_Closed"] = 0
         out["Success_Rate_Closed"] = 0.0
-        out["Avg_LeveragePct_Closed"] = float("nan")
         out["Max_LeveragePct_Closed"] = float("nan")
-        out["Skipped_Days"] = 0
+        out["Avg_LeveragePct_Closed"] = float("nan")
+        out["Max_HoldingDays_Closed"] = 0
 
-    # ---- curve 기반 (시드배수/최근10년/드로우다운/홀딩 등)
+    # ---- curve 기반
     if curve is not None and not curve.empty:
-        c = curve[curve["Method"] == method].copy()
+        c = curve.copy()
+        c = c[c["Method"].astype(str) == str(method)]
+        if "Variant" in c.columns:
+            c = c[c["Variant"].astype(str) == str(variant)]
         c = c.sort_values("Date")
 
         last_date = pd.to_datetime(c["Date"].iloc[-1]).normalize()
         out["last_date"] = str(last_date.date())
 
-        eq = c["Equity"].to_numpy(dtype=float)
-        final_eq = float(eq[-1])
-        start_eq = float(eq[0])
+        eq = pd.to_numeric(c["Equity"], errors="coerce").fillna(method="ffill").fillna(0).to_numpy(dtype=float)
+        start_eq = float(eq[0]) if eq.size else float("nan")
+        final_eq = float(eq[-1]) if eq.size else float("nan")
         out["Final_Equity"] = final_eq
-        out["Seed_Multiple_All"] = float(final_eq / start_eq) if start_eq != 0 else float("nan")
+        out["Seed_Multiple_All"] = float(final_eq / start_eq) if start_eq not in (0.0, float("nan")) else float("nan")
         out["Max_Drawdown"] = max_drawdown(eq)
 
-        # 최대 홀딩일 (curve에 없거나 NaN이면 trades로 보강)
-        max_hold = 0
-
+        # max holding days (curve에 HoldingDays 있으면 사용, 없으면 trades closed로 fallback)
+        max_hold_curve = 0
         if "HoldingDays" in c.columns:
-            hd_series = pd.to_numeric(c["HoldingDays"], errors="coerce")
-            hd_max = hd_series.max()
-            if pd.notna(hd_max):
-                max_hold = int(hd_max)
+            hd = pd.to_numeric(c["HoldingDays"], errors="coerce").max()
+            if pd.notna(hd):
+                max_hold_curve = int(hd)
 
-        # curve에서 못 구하면 trades에서 보강
-        if (max_hold == 0) and (trades is not None) and (not trades.empty):
-            t2 = trades[trades["Method"] == method].copy()
-            if "HoldingDays" in t2.columns:
-                hd2 = pd.to_numeric(t2["HoldingDays"], errors="coerce").max()
-                if pd.notna(hd2):
-                    max_hold = int(hd2)
-
-        out["max_holding_days"] = int(max_hold)
-
-        # max_days 초과분(=연장 최대치) - HoldingDays가 없거나 NaN이면 0
-        if max_days > 0:
-            if "HoldingDays" in c.columns:
-                hd = pd.to_numeric(c["HoldingDays"], errors="coerce").fillna(0).to_numpy(dtype=float)
-                exceed = np.maximum(hd - max_days, 0)
-                out["max_extend_days_over_maxday"] = int(np.nanmax(exceed)) if exceed.size else 0
-            else:
-                out["max_extend_days_over_maxday"] = 0
+        if max_hold_curve == 0:
+            out["Max_HoldingDays_All"] = int(out.get("Max_HoldingDays_Closed", 0))
         else:
-            out["max_extend_days_over_maxday"] = 0
+            out["Max_HoldingDays_All"] = int(max_hold_curve)
+
+        # extend 최대치(= HoldingDays - max_days)
+        if max_days > 0 and "HoldingDays" in c.columns:
+            hd_arr = pd.to_numeric(c["HoldingDays"], errors="coerce").fillna(0).to_numpy(dtype=float)
+            exceed = np.maximum(hd_arr - max_days, 0)
+            out["Max_Extend_Over_MaxDays"] = int(np.nanmax(exceed)) if exceed.size else 0
+        else:
+            out["Max_Extend_Over_MaxDays"] = 0
 
         # 최근 N년 배수
         start_date = last_date - pd.DateOffset(years=recent_years)
-        out["recent10y_start_date"] = str(start_date.date())
+        out["recent_start_date"] = str(start_date.date())
 
-        # start_date 이상 첫 번째 시점의 equity를 기준으로
-        idx = int(np.searchsorted(c["Date"].to_numpy(), np.datetime64(start_date)))
+        dates = pd.to_datetime(c["Date"]).to_numpy()
+        idx = int(np.searchsorted(dates, np.datetime64(start_date)))
         if idx >= len(c):
             idx = 0
-        base_eq = float(c["Equity"].iloc[idx])
-        out["recent10y_seed_multiple"] = float(final_eq / base_eq) if base_eq != 0 else float("nan")
-
-        # Entered_Days(근사): 닫힌 사이클 수 + (마지막에 포지션 살아있으면 1)
-        open_pos = float(c["PosValue"].iloc[-1]) > 0
-        out["Entered_Days"] = int(out["Cycle_Count_Closed"] + (1 if open_pos else 0))
+        base_eq = float(pd.to_numeric(c["Equity"].iloc[idx], errors="coerce"))
+        out["recent_seed_multiple"] = float(final_eq / base_eq) if base_eq else float("nan")
 
     else:
-        # curve가 없으면 최소한 trades 기반으로만이라도 값 채움
         out["last_date"] = ""
-        out["recent10y_start_date"] = ""
+        out["recent_start_date"] = ""
         out["Final_Equity"] = float("nan")
         out["Seed_Multiple_All"] = float("nan")
         out["Max_Drawdown"] = float("nan")
-        out["max_holding_days"] = int(0)
-        out["max_extend_days_over_maxday"] = int(0)
-        out["recent10y_seed_multiple"] = float("nan")
-        out["Entered_Days"] = int(out["Cycle_Count_Closed"])
+        out["Max_HoldingDays_All"] = int(out.get("Max_HoldingDays_Closed", 0))
+        out["Max_Extend_Over_MaxDays"] = 0
+        out["recent_seed_multiple"] = float("nan")
+
+    # 레버 교정 지표(너가 원한 “수익률 우선 + 레버 고려”)
+    lev = out.get("Max_LeveragePct_Closed", float("nan"))
+    mult = out.get("recent_seed_multiple", float("nan"))
+
+    if isinstance(lev, (int, float)) and isinstance(mult, (int, float)) and np.isfinite(lev) and np.isfinite(mult):
+        out["adj_recent_multiple_linear"] = float(mult / (1.0 + lev / 100.0))
+        out["adj_recent_multiple_sq"] = float(mult / (1.0 + lev / 100.0) ** 2)
+    else:
+        out["adj_recent_multiple_linear"] = float("nan")
+        out["adj_recent_multiple_sq"] = float("nan")
 
     return out
 
@@ -152,7 +156,7 @@ def summarize_one_method(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
-    ap.add_argument("--max-days", type=int, default=0)
+    ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--recent-years", type=int, default=10)
     args = ap.parse_args()
 
@@ -160,7 +164,6 @@ def main() -> None:
     max_days = int(args.max_days)
     recent_years = int(args.recent_years)
 
-    # parquet 찾기 (파일명이 method가 2번 붙든 말든 tag만 포함하면 OK)
     curve_paths = sorted(glob.glob(f"{SIGNALS_DIR}/sim_engine_curve_*{tag}*.parquet"))
     trade_paths = sorted(glob.glob(f"{SIGNALS_DIR}/sim_engine_trades_*{tag}*.parquet"))
 
@@ -172,45 +175,56 @@ def main() -> None:
 
     if curve_paths:
         curve_df = pd.concat([read_parquet_any(p) for p in curve_paths], ignore_index=True)
+        if "Variant" not in curve_df.columns:
+            # 파일명에서 variant 추정해 넣기(혹시 엔진이 컬럼 안 넣었을 때 대비)
+            # 단, 여러 파일 concat이므로 path별 처리 위해 최소한 method별/파일별로는 정확하지 않을 수 있음.
+            curve_df["Variant"] = "BASE"
+
     if trade_paths:
         trades_df = pd.concat([read_parquet_any(p) for p in trade_paths], ignore_index=True)
+        if "Variant" not in trades_df.columns:
+            trades_df["Variant"] = "BASE"
 
-    # method 목록
+    if "Method" not in curve_df.columns and "Method" not in trades_df.columns:
+        raise SystemExit(f"[ERROR] No Method column found in curve/trades parquet for tag={tag}")
+
     methods = set()
     if not curve_df.empty and "Method" in curve_df.columns:
         methods |= set(curve_df["Method"].dropna().astype(str).unique().tolist())
     if not trades_df.empty and "Method" in trades_df.columns:
         methods |= set(trades_df["Method"].dropna().astype(str).unique().tolist())
 
-    if not methods:
-        raise SystemExit(f"[ERROR] No Method column found in curve/trades parquet for tag={tag}")
+    # variants는 parquet 컬럼이 있으면 그 기준, 없으면 BASE
+    variants = set()
+    if not curve_df.empty and "Variant" in curve_df.columns:
+        variants |= set(curve_df["Variant"].dropna().astype(str).unique().tolist())
+    if not trades_df.empty and "Variant" in trades_df.columns:
+        variants |= set(trades_df["Variant"].dropna().astype(str).unique().tolist())
+    if not variants:
+        variants = {"BASE"}
 
     rows = []
     for m in sorted(methods):
-        rows.append(
-            summarize_one_method(
-                tag=tag,
-                method=m,
-                curve=curve_df if not curve_df.empty else None,
-                trades=trades_df if not trades_df.empty else None,
-                max_days=max_days,
-                recent_years=recent_years,
+        for v in sorted(variants):
+            rows.append(
+                summarize_one_method(
+                    tag=tag,
+                    method=m,
+                    variant=v,
+                    curve=curve_df if not curve_df.empty else None,
+                    trades=trades_df if not trades_df.empty else None,
+                    max_days=max_days,
+                    recent_years=recent_years,
+                )
             )
-        )
 
     out = pd.DataFrame(rows)
-
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1) "summary" 이름으로도 저장 (워크플로 호환)
-    summary_path = SIGNALS_DIR / f"sim_engine_summary_{tag}_GATES_ALL.csv"
-    out.to_csv(summary_path, index=False)
-
-    # 2) gate_summary도 같이 저장 (Artifacts로 받기 편한 최종표)
     gate_path = SIGNALS_DIR / f"gate_summary_{tag}.csv"
     out.to_csv(gate_path, index=False)
 
-    print(f"[DONE] wrote:\n  - {summary_path}\n  - {gate_path}\nrows={len(out)}")
+    print(f"[DONE] wrote {gate_path} rows={len(out)}")
 
 
 if __name__ == "__main__":
