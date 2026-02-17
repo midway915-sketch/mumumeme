@@ -390,6 +390,7 @@ jobs:
           path: |
             data/meta/build_fingerprint.json
             data/meta/model_train_meta.json
+            data/meta/train_model_report.json
             data/signals/gate_summary_*.csv
             data/signals/gate_grid_aggregate.csv
             data/signals/gate_grid_top_by_recent10y.csv
@@ -397,3 +398,4 @@ jobs:
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
           if-no-files-found: error
+
