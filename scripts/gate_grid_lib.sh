@@ -1,198 +1,101 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-gg_trim() { echo "$1" | xargs; }
-gg_safe() { echo "$1" | sed 's/\./p/g' | sed 's/-/m/g'; }
+# -------------------------
+# Helpers
+# -------------------------
+trim() { awk '{$1=$1;print}'; }
 
-gg_find_one() {
-  local name="$1"
-  find . -maxdepth 8 -type f -iname "${name}" | head -n 1 || true
+split_csv() {
+  # usage: split_csv "0.1,0.2, 0.3"
+  echo "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF>0{print}'
 }
 
-gg_require_env() {
-  local v
-  for v in TAG PROFIT_TARGET HOLDING_DAYS STOP_LEVEL MAX_EXTEND_DAYS TAIL_MAX_LIST U_QUANTILE_LIST RANK_BY_LIST LAMBDA_TAIL; do
-    if [ -z "${!v:-}" ]; then
-      echo "[ERROR] missing env: ${v}"
-      exit 1
-    fi
-  done
-  # tau gamma는 옵션(없으면 기본 0.05만 사용)
-  if [ -z "${TAU_GAMMA_LIST:-}" ]; then
-    export TAU_GAMMA_LIST="0.05"
-  fi
+tok() {
+  # float -> token (0.75 -> 0p75, -0.10 -> m0p10)
+  python - <<'PY' "$1"
+import sys
+x=float(sys.argv[1])
+s=f"{x:.4f}".rstrip("0").rstrip(".")
+s=s.replace(".","p").replace("-","m")
+print(s)
+PY
 }
 
-gg_run_one() {
-  local MODE="$1" TMAX="$2" UQ="$3" RANK="$4" GAMMA="$5" PRED="$6" SIM="$7"
+build_tag() {
+  # profit_target max_days stop_level max_extend_days
+  python - <<'PY' "$1" "$2" "$3" "$4"
+import sys
+pt=float(sys.argv[1])
+h=int(float(sys.argv[2]))
+sl=float(sys.argv[3])
+ex=int(float(sys.argv[4]))
+pt_i=int(round(pt*100))
+sl_i=int(round(abs(sl)*100))
+print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
+PY
+}
 
-  local TMAX_T UQ_T RANK_T GAMMA_T SUFFIX
-  TMAX_T="$(gg_safe "$(gg_trim "$TMAX")")"
-  UQ_T="$(gg_safe "$(gg_trim "$UQ")")"
-  RANK_T="$(gg_trim "$RANK")"
-  GAMMA_T="$(gg_safe "$(gg_trim "$GAMMA")")"
+# -------------------------
+# Core runner: one gate config
+# -------------------------
+run_one_gate() {
+  # args:
+  #   pt h sl ex mode tail_max u_quantile rank_by lambda_tail tau_gamma
+  local pt="$1"; local h="$2"; local sl="$3"; local ex="$4"
+  local mode="$5"; local tail_max="$6"; local u_q="$7"; local rank_by="$8"
+  local lambda_tail="$9"; local tau_gamma="${10}"
 
-  if [ "${RANK_T}" = "utility_time" ]; then
-    SUFFIX="${MODE}_t${TMAX_T}_q${UQ_T}_r${RANK_T}_g${GAMMA_T}"
-  else
-    SUFFIX="${MODE}_t${TMAX_T}_q${UQ_T}_r${RANK_T}"
-  fi
+  local tag; tag="$(build_tag "$pt" "$h" "$sl" "$ex")"
 
-  echo ""
+  # ✅ 다운스트림이 찾는 suffix 규칙을 "고정"한다 (gamma 같은 거 파일명에 절대 안 넣음)
+  local suffix="${mode}_t$(tok "$tail_max")_q$(tok "$u_q")_r${rank_by}"
+
+  # ✅ 파일명도 downstream 기대값으로 강제
+  local picks="data/signals/picks_${tag}_gate_${suffix}.csv"
+
   echo "=============================="
-  echo "[RUN] TAG=${TAG} mode=${MODE} tail_max=${TMAX} u_q=${UQ} rank_by=${RANK_T} gamma=${GAMMA} suffix=${SUFFIX}"
+  echo "[RUN] tag=${tag}"
+  echo "[RUN] mode=${mode} tail_max=${tail_max} u_q=${u_q} rank_by=${rank_by} lambda=${lambda_tail} tau_gamma=${tau_gamma}"
+  echo "[RUN] suffix=${suffix}"
+  echo "[RUN] picks=${picks}"
   echo "=============================="
 
-  python "${PRED}" \
-    --profit-target "${PROFIT_TARGET}" \
-    --max-days "${HOLDING_DAYS}" \
-    --stop-level "${STOP_LEVEL}" \
-    --max-extend-days "${MAX_EXTEND_DAYS}" \
-    --gate-mode "${MODE}" \
-    --tail-max "$(gg_trim "$TMAX")" \
-    --u-quantile "$(gg_trim "$UQ")" \
-    --rank-by "${RANK_T}" \
-    --lambda-tail "${LAMBDA_TAIL}" \
-    --tau-gamma "$(gg_trim "$GAMMA")" \
-    --out-suffix "${SUFFIX}"
+  mkdir -p data/signals
 
-  local PICKS="data/signals/picks_${TAG}_gate_${SUFFIX}.csv"
+  # ---- predict_gate: 반드시 picks 파일을 기대 이름으로 생성하게 강제 ----
+  python scripts/predict_gate.py \
+    --profit-target "$pt" \
+    --max-days "$h" \
+    --stop-level "$sl" \
+    --max-extend-days "$ex" \
+    --mode "$mode" \
+    --tail-threshold "$tail_max" \
+    --utility-quantile "$u_q" \
+    --rank-by "$rank_by" \
+    --lambda-tail "$lambda_tail" \
+    --tau-gamma "$tau_gamma" \
+    --suffix "$suffix" \
+    --out-csv "$picks"
 
-  # --- BASE
-  python "${SIM}" \
-    --profit-target "${PROFIT_TARGET}" \
-    --max-days "${HOLDING_DAYS}" \
-    --stop-level "${STOP_LEVEL}" \
-    --max-extend-days "${MAX_EXTEND_DAYS}" \
-    --method custom \
-    --pick-col pick_custom \
-    --picks-path "${PICKS}" \
-    --label "${SUFFIX}" \
-    --out-suffix "${SUFFIX}" \
-    --variant "BASE" \
-    --initial-seed 40000000
-
-  # --- A: extend soft brake
-  python "${SIM}" \
-    --profit-target "${PROFIT_TARGET}" \
-    --max-days "${HOLDING_DAYS}" \
-    --stop-level "${STOP_LEVEL}" \
-    --max-extend-days "${MAX_EXTEND_DAYS}" \
-    --method custom \
-    --pick-col pick_custom \
-    --picks-path "${PICKS}" \
-    --label "${SUFFIX}" \
-    --out-suffix "${SUFFIX}" \
-    --variant "A" \
-    --extend-lev-cap 0.80 \
-    --extend-min-buy-frac 0.10 \
-    --extend-buy-every 1 \
-    --initial-seed 40000000
-
-  # --- B: extend buy every 2 days
-  python "${SIM}" \
-    --profit-target "${PROFIT_TARGET}" \
-    --max-days "${HOLDING_DAYS}" \
-    --stop-level "${STOP_LEVEL}" \
-    --max-extend-days "${MAX_EXTEND_DAYS}" \
-    --method custom \
-    --pick-col pick_custom \
-    --picks-path "${PICKS}" \
-    --label "${SUFFIX}" \
-    --out-suffix "${SUFFIX}" \
-    --variant "B" \
-    --extend-lev-cap 1.00 \
-    --extend-min-buy-frac 0.25 \
-    --extend-buy-every 2 \
-    --initial-seed 40000000
-}
-
-run_gate_grid() {
-  gg_require_env
-  cd "${GITHUB_WORKSPACE:-.}" || true
-
-  local PRED SIM
-  PRED="$(gg_find_one "predict_gate.py")"
-  SIM="$(gg_find_one "simulate_single_position_engine.py")"
-
-  echo "[INFO] PRED=${PRED}"
-  echo "[INFO] SIM=${SIM}"
-
-  if [ -z "${PRED}" ]; then
-    echo "[ERROR] predict_gate.py not found"
-    git ls-files | grep -i "predict_gate.py" || true
-    exit 1
-  fi
-  if [ -z "${SIM}" ]; then
-    echo "[ERROR] simulate_single_position_engine.py not found"
-    git ls-files | grep -i "simulate_single_position_engine.py" || true
+  # ---- hard check (여기서 없으면 predict_gate 저장이 안 된 것) ----
+  if [ ! -f "$picks" ]; then
+    echo "[ERROR] predict_gate did not create picks: $picks"
+    echo "[DEBUG] list data/signals (picks*):"
+    ls -la data/signals | sed -n '1,200p' || true
     exit 1
   fi
 
-  IFS=',' read -ra TAILS <<< "${TAIL_MAX_LIST}"
-  IFS=',' read -ra UQS   <<< "${U_QUANTILE_LIST}"
-  IFS=',' read -ra RANKS <<< "${RANK_BY_LIST}"
-  IFS=',' read -ra GAMS  <<< "${TAU_GAMMA_LIST}"
+  # ---- simulate (너 repo의 simulate CLI에 맞게 호출) ----
+  # 아래는 '일반적인' 형태고, 네 simulate 파일의 인자명과 다르면 여기만 맞추면 됨.
+  python scripts/simulate_single_position_engine.py \
+    --profit-target "$pt" \
+    --max-days "$h" \
+    --stop-level "$sl" \
+    --max-extend-days "$ex" \
+    --picks-csv "$picks" \
+    --suffix "$suffix" \
+    --tag "$tag"
 
-  local BASE_T BASE_Q
-  BASE_T="$(gg_trim "${TAILS[0]}")"
-  BASE_Q="$(gg_trim "${UQS[0]}")"
-
-  for R in "${RANKS[@]}"; do
-    R="$(gg_trim "$R")"
-    if [ "${R}" = "utility_time" ]; then
-      for G in "${GAMS[@]}"; do
-        gg_run_one "none" "${BASE_T}" "${BASE_Q}" "${R}" "${G}" "${PRED}" "${SIM}"
-      done
-    else
-      gg_run_one "none" "${BASE_T}" "${BASE_Q}" "${R}" "${GAMS[0]}" "${PRED}" "${SIM}"
-    fi
-  done
-
-  if [ "${TAIL_OK:-0}" = "1" ]; then
-    for T in "${TAILS[@]}"; do
-      for R in "${RANKS[@]}"; do
-        R="$(gg_trim "$R")"
-        if [ "${R}" = "utility_time" ]; then
-          for G in "${GAMS[@]}"; do
-            gg_run_one "tail" "${T}" "${BASE_Q}" "${R}" "${G}" "${PRED}" "${SIM}"
-          done
-        else
-          gg_run_one "tail" "${T}" "${BASE_Q}" "${R}" "${GAMS[0]}" "${PRED}" "${SIM}"
-        fi
-      done
-    done
-  fi
-
-  for Q in "${UQS[@]}"; do
-    for R in "${RANKS[@]}"; do
-      R="$(gg_trim "$R")"
-      if [ "${R}" = "utility_time" ]; then
-        for G in "${GAMS[@]}"; do
-          gg_run_one "utility" "${BASE_T}" "${Q}" "${R}" "${G}" "${PRED}" "${SIM}"
-        done
-      else
-        gg_run_one "utility" "${BASE_T}" "${Q}" "${R}" "${GAMS[0]}" "${PRED}" "${SIM}"
-      fi
-    done
-  done
-
-  if [ "${TAIL_OK:-0}" = "1" ]; then
-    for T in "${TAILS[@]}"; do
-      for Q in "${UQS[@]}"; do
-        for R in "${RANKS[@]}"; do
-          R="$(gg_trim "$R")"
-          if [ "${R}" = "utility_time" ]; then
-            for G in "${GAMS[@]}"; do
-              gg_run_one "tail_utility" "${T}" "${Q}" "${R}" "${G}" "${PRED}" "${SIM}"
-            done
-          else
-            gg_run_one "tail_utility" "${T}" "${Q}" "${R}" "${GAMS[0]}" "${PRED}" "${SIM}"
-          fi
-        done
-      done
-    done
-  fi
-
-  echo "[DONE] gate grid finished for TAG=${TAG}"
+  echo "[OK] finished: ${tag} ${suffix}"
 }
