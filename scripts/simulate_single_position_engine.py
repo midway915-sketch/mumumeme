@@ -30,7 +30,6 @@ def read_prices() -> pd.DataFrame:
     prices["Date"] = pd.to_datetime(prices["Date"], errors="coerce")
     prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
 
-    # 기본 OHLCV 기대
     for c in ["Open", "High", "Low", "Close"]:
         if c not in prices.columns:
             raise ValueError(f"prices missing column: {c}")
@@ -49,7 +48,7 @@ def read_picks(path: Path) -> pd.DataFrame:
         raise ValueError(f"picks must have Date, Ticker. cols={list(picks.columns)}")
 
     picks = picks.copy()
-    picks["Date"] = pd.to_datetime(picks["Date"], errors="coerce")  # ✅ 핵심 fix
+    picks["Date"] = pd.to_datetime(picks["Date"], errors="coerce")  # 중요
     picks["Ticker"] = picks["Ticker"].astype(str).str.upper().str.strip()
     if "Skipped" not in picks.columns:
         picks["Skipped"] = 0
@@ -65,7 +64,6 @@ def safe_to_parquet(df: pd.DataFrame, path: Path) -> str:
         df.to_parquet(path, index=False)
         return f"parquet:{path}"
     except Exception as e:
-        # parquet 엔진(pyarrow) 없으면 csv로라도 저장
         csv_path = path.with_suffix(".csv")
         df.to_csv(csv_path, index=False)
         return f"csv:{csv_path} (parquet failed: {e})"
@@ -82,16 +80,20 @@ def derive_tag_and_label(picks: pd.DataFrame) -> tuple[str, str]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Single-position DCA engine (infinite extend allowed).")
+    ap = argparse.ArgumentParser(description="Single-position DCA engine (unlimited extend).")
     ap.add_argument("--picks-path", required=True, type=str)
 
-    # 전략 파라미터(워크플로우 입력으로 들어오는 값들)
-    ap.add_argument("--profit-target", required=True, type=float)   # e.g. 0.10
-    ap.add_argument("--max-days", required=True, type=int)          # e.g. 40
-    ap.add_argument("--stop-level", required=True, type=float)      # e.g. -0.10
-    ap.add_argument("--max-extend-days", required=True, type=int)   # 현재 엔진에서는 "제한 없음"이 기본. 기록/라벨용.
+    ap.add_argument("--profit-target", required=True, type=float)
+    ap.add_argument("--max-days", required=True, type=int)
+    ap.add_argument("--stop-level", required=True, type=float)
+    ap.add_argument("--max-extend-days", required=True, type=int)
 
     ap.add_argument("--initial-seed", type=float, default=40_000_000.0)
+
+    # ✅ NEW: force output naming per grid run
+    ap.add_argument("--tag", type=str, default=None)
+    ap.add_argument("--suffix", type=str, default=None)
+
     args = ap.parse_args()
 
     picks_path = Path(args.picks_path)
@@ -99,13 +101,15 @@ def main() -> None:
     prices = read_prices()
     picks = read_picks(picks_path)
 
-    tag, label = derive_tag_and_label(picks)
+    auto_tag, auto_label = derive_tag_and_label(picks)
+    tag = args.tag or auto_tag
+    suffix = args.suffix or auto_label  # ✅ suffix 우선
 
-    # ✅ 게이트별로 파일명 분리 (덮어쓰기 방지)
-    trades_out = SIGNALS_DIR / f"sim_engine_trades_{tag}_gate_{label}.parquet"
-    curve_out = SIGNALS_DIR / f"sim_engine_curve_{tag}_gate_{label}.parquet"
+    SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 날짜 단위로 1개 종목 pick (Skipped=0인 것만)
+    trades_out = SIGNALS_DIR / f"sim_engine_trades_{tag}_gate_{suffix}.parquet"
+    curve_out = SIGNALS_DIR / f"sim_engine_curve_{tag}_gate_{suffix}.parquet"
+
     picks_day = (
         picks[picks["Skipped"].fillna(0).astype(int) == 0]
         .groupby("Date", as_index=False)
@@ -127,62 +131,45 @@ def main() -> None:
     shares = 0.0
     invested = 0.0
     holding_day = 0
-
-    # 레버리지(대출) 최대치 기록: seed가 음수로 내려간 최저점 기준
     min_seed_during_cycle = seed
 
     trades = []
     curve = []
-
-    # “청산 당일 재진입 불가” 구현용
     sold_today = False
 
     for date, day in grouped:
-        date = pd.to_datetime(date).to_pydatetime()
+        date = pd.to_datetime(date)
         sold_today = False
 
         day = day.set_index("Ticker")
 
-        # 오늘 pick이 있으면 후보 티커
         pick_ticker = None
-        if pd.Timestamp(date) in picks_day.index:
-            pick_ticker = str(picks_day.loc[pd.Timestamp(date), "Ticker"]).upper().strip()
+        if date in picks_day.index:
+            pick_ticker = str(picks_day.loc[date, "Ticker"]).upper().strip()
 
-        # -------------------------
-        # 1) 진입 전
-        # -------------------------
+        # ---- entry ----
         if (not in_pos) and (not sold_today):
             if pick_ticker is not None and pick_ticker in day.index:
-                # 진입
                 in_pos = True
                 extending = False
                 ticker = pick_ticker
-                entry_date = pd.Timestamp(date)
+                entry_date = date
                 entry_seed = seed
 
                 holding_day = 1
-
-                # ✅ “진입 시 시드 기준”으로 daily unit 재계산
                 cycle_unit = float(entry_seed) / float(args.max_days)
 
-                # ✅ 진입일 매수도 daily unit
                 px = float(day.loc[ticker, "Close"])
                 buy = cycle_unit
                 shares += buy / px
                 invested += buy
                 seed -= buy
-
                 min_seed_during_cycle = min(min_seed_during_cycle, seed)
 
-            # curve 기록(포지션 없으면 value=0)
-            pos_value = 0.0
-            equity = seed + pos_value
-            curve.append({"Date": pd.Timestamp(date), "Equity": equity, "Cash": seed, "PositionValue": pos_value})
+            curve.append({"Date": date, "Equity": seed, "Cash": seed, "PositionValue": 0.0})
             continue
 
-        # -------------------------
-        # 2) 보유 중
-        # -------------------------
+        # ---- holding ----
         pos_value = 0.0
         if in_pos and ticker in day.index:
             close_px = float(day.loc[ticker, "Close"])
@@ -191,7 +178,6 @@ def main() -> None:
             pos_value = shares * close_px
             avg_px = invested / shares if shares > 0 else close_px
 
-            # ✅ 매일 매수 (진입 시 seed 기준 unit 고정, 연장에도 동일)
             cycle_unit = float(entry_seed) / float(args.max_days)
             buy = cycle_unit
             shares += buy / close_px
@@ -201,21 +187,20 @@ def main() -> None:
 
             holding_day += 1
 
-            # ---- 일반 구간: 수익 실현 ----
+            # PT sell
             if not extending:
                 if high_px >= avg_px * (1.0 + args.profit_target):
                     sell_px = avg_px * (1.0 + args.profit_target)
                     proceeds = shares * sell_px
                     ret = (proceeds - invested) / invested if invested > 0 else 0.0
 
-                    # 레버리지% = (최대 대출액 / 진입시 시드) * 100
                     max_borrow = max(0.0, -min_seed_during_cycle)
                     lev_pct = (max_borrow / entry_seed * 100.0) if entry_seed and entry_seed > 0 else np.nan
 
                     seed += proceeds
                     trades.append({
                         "EntryDate": entry_date,
-                        "ExitDate": pd.Timestamp(date),
+                        "ExitDate": date,
                         "Ticker": ticker,
                         "HoldingDays": holding_day,
                         "CycleReturn": ret,
@@ -225,7 +210,6 @@ def main() -> None:
                         "ExitType": "PT",
                     })
 
-                    # reset
                     in_pos = False
                     extending = False
                     ticker = None
@@ -237,11 +221,9 @@ def main() -> None:
                     min_seed_during_cycle = seed
                     sold_today = True
 
-            # ---- max_days 도달 시 분기 ----
+            # max_days branch
             if in_pos and (not extending) and holding_day >= args.max_days:
                 cur_ret = (close_px - avg_px) / avg_px if avg_px != 0 else 0.0
-
-                # 손실이 stop_level 이상(덜 나쁨)이면 종가 청산
                 if cur_ret >= args.stop_level:
                     sell_px = close_px
                     proceeds = shares * sell_px
@@ -253,7 +235,7 @@ def main() -> None:
                     seed += proceeds
                     trades.append({
                         "EntryDate": entry_date,
-                        "ExitDate": pd.Timestamp(date),
+                        "ExitDate": date,
                         "Ticker": ticker,
                         "HoldingDays": holding_day,
                         "CycleReturn": ret,
@@ -276,9 +258,8 @@ def main() -> None:
                 else:
                     extending = True
 
-            # ---- 연장 구간: stop_level 만큼 회복하면 손절가로 청산 ----
+            # extend sell
             if in_pos and extending:
-                # “손절가”는 평균단가*(1+stop_level) (stop_level이 음수면 avg보다 아래)
                 trigger_px = avg_px * (1.0 + args.stop_level)
                 if high_px >= trigger_px:
                     sell_px = trigger_px
@@ -291,7 +272,7 @@ def main() -> None:
                     seed += proceeds
                     trades.append({
                         "EntryDate": entry_date,
-                        "ExitDate": pd.Timestamp(date),
+                        "ExitDate": date,
                         "Ticker": ticker,
                         "HoldingDays": holding_day,
                         "CycleReturn": ret,
@@ -313,7 +294,7 @@ def main() -> None:
                     sold_today = True
 
         equity = seed + pos_value
-        curve.append({"Date": pd.Timestamp(date), "Equity": equity, "Cash": seed, "PositionValue": pos_value})
+        curve.append({"Date": date, "Equity": equity, "Cash": seed, "PositionValue": pos_value})
 
     trades_df = pd.DataFrame(trades)
     curve_df = pd.DataFrame(curve)
@@ -322,7 +303,7 @@ def main() -> None:
     saved_curve = safe_to_parquet(curve_df, curve_out)
 
     print("=" * 60)
-    print(f"[DONE] tag={tag} label={label}")
+    print(f"[DONE] tag={tag} suffix={suffix}")
     print(f"[DONE] trades_saved={saved_trades}")
     print(f"[DONE] curve_saved={saved_curve}")
     print(f"[DONE] trades_rows={len(trades_df)} curve_rows={len(curve_df)}")
