@@ -2,27 +2,25 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit
 
 
-DATA_DIR = Path("data")
-LABEL_DIR = DATA_DIR / "labels"
-IN_PARQ = LABEL_DIR / "tau_labels.parquet"
-IN_CSV = LABEL_DIR / "tau_labels.csv"
+LABELS_DIR = Path("data/labels")
+APP_DIR = Path("app")
+META_DIR = Path("data/meta")
 
-MODEL_PATH = Path("app/tau_model.pkl")
-SCALER_PATH = Path("app/tau_scaler.pkl")
-
-FEATURES = [
+DEFAULT_FEATURES = [
     "Drawdown_252",
     "Drawdown_60",
     "ATR_ratio",
@@ -33,73 +31,133 @@ FEATURES = [
     "Market_ATR_ratio",
 ]
 
-def read_table() -> pd.DataFrame:
-    if IN_PARQ.exists():
-        return pd.read_parquet(IN_PARQ)
-    if IN_CSV.exists():
-        return pd.read_csv(IN_CSV)
-    raise FileNotFoundError(f"Missing tau labels: {IN_PARQ} (or {IN_CSV})")
+
+def read_table(parq: Path, csv: Path) -> pd.DataFrame:
+    if parq.exists():
+        return pd.read_parquet(parq)
+    if csv.exists():
+        return pd.read_csv(csv)
+    raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
+
+
+def choose_features(df: pd.DataFrame, requested: list[str]) -> list[str]:
+    cols = set(df.columns)
+    feats = [c for c in requested if c in cols]
+    if len(feats) < 4:
+        banned = {"TauDays", "TauLE10", "TauLE20", "TauLE40", "Date", "Ticker"}
+        numeric = [c for c in df.columns if c not in banned and pd.api.types.is_numeric_dtype(df[c])]
+        feats = feats + [c for c in numeric if c not in feats][:12]
+    out, seen = [], set()
+    for c in feats:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _fit_one(X_train, y_train, n_splits: int, max_iter: int):
+    base = LogisticRegression(max_iter=max_iter)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    try:
+        clf = CalibratedClassifierCV(estimator=base, method="isotonic", cv=tscv)
+    except TypeError:
+        clf = CalibratedClassifierCV(base_estimator=base, method="isotonic", cv=tscv)
+    clf.fit(X_train, y_train)
+    return clf
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n-splits", type=int, default=3)
-    ap.add_argument("--max-tau", type=int, default=365,
-                    help="clip Tau_Days to reduce outlier impact (success-only)")
+    ap.add_argument("--profit-target", required=True, type=float)
+    ap.add_argument("--max-days", required=True, type=int)
+    ap.add_argument("--stop-level", required=True, type=float)
+    ap.add_argument("--max-extend-days", required=True, type=int)
+
+    ap.add_argument("--features", default=",".join(DEFAULT_FEATURES), type=str)
+    ap.add_argument("--train-ratio", default=0.8, type=float)
+    ap.add_argument("--n-splits", default=3, type=int)
+    ap.add_argument("--max-iter", default=500, type=int)
     args = ap.parse_args()
 
-    df = read_table()
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date").reset_index(drop=True)
+    pt_tag = int(round(args.profit_target * 100))
+    sl_tag = int(round(abs(args.stop_level) * 100))
+    tag = f"pt{pt_tag}_h{args.max_days}_sl{sl_tag}_ex{args.max_extend_days}"
 
-    # success-only regression target
-    df = df[df["Success"] == 1].copy()
-    df = df.dropna(subset=FEATURES + ["Tau_Days"])
+    parq = LABELS_DIR / f"labels_tau_{tag}.parquet"
+    csv = LABELS_DIR / f"labels_tau_{tag}.csv"
+    df = read_table(parq, csv).copy()
 
-    if df.empty:
-        raise RuntimeError("No success samples for tau model. Check label build / profit target / horizon.")
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.sort_values("Date")
 
-    X = df[FEATURES].astype(float)
-    y = pd.to_numeric(df["Tau_Days"], errors="coerce").astype(float)
-    y = y.clip(lower=1, upper=float(args.max_tau))
+    for col in ["TauLE10", "TauLE20", "TauLE40"]:
+        if col not in df.columns:
+            raise ValueError(f"labels_tau missing {col}")
 
-    # split by time 80/20 (latest as test)
-    split_idx = int(len(df) * 0.8)
+    requested = [x.strip() for x in args.features.split(",") if x.strip()]
+    feature_cols = choose_features(df, requested)
+
+    use = df.dropna(subset=feature_cols + ["TauLE10", "TauLE20", "TauLE40"]).copy()
+    if len(use) < 1000:
+        # fallback: fill features with 0
+        use = df.copy()
+        for c in feature_cols:
+            if c in use.columns:
+                use[c] = pd.to_numeric(use[c], errors="coerce").fillna(0.0)
+        for col in ["TauLE10", "TauLE20", "TauLE40"]:
+            use[col] = pd.to_numeric(use[col], errors="coerce").fillna(0).astype(int)
+
+    X = use[feature_cols]
+    split_idx = int(len(use) * float(args.train_ratio))
+    split_idx = max(1, min(split_idx, len(use) - 1))
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    # HGBR works well, no heavy deps, fast for Actions
-    base = HistGradientBoostingRegressor(
-        max_depth=6,
-        learning_rate=0.05,
-        max_iter=400,
-        random_state=42,
-        loss="absolute_error",  # robust MAE
-    )
+    models = {}
+    aucs = {}
 
-    # time-series CV fit: train on expanding windows
-    tscv = TimeSeriesSplit(n_splits=int(args.n_splits))
-    # 간단히 전체 train에 fit (CV는 지표만 보고 튜닝 없이 진행)
-    base.fit(X_train_s, y_train)
+    for label in ["TauLE10", "TauLE20", "TauLE40"]:
+        y = use[label].astype(int)
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+        clf = _fit_one(X_train_s, y_train, n_splits=int(args.n_splits), max_iter=int(args.max_iter))
+        models[label] = clf
 
-    pred = base.predict(X_test_s)
-    mae = mean_absolute_error(y_test, pred)
+        probs = clf.predict_proba(X_test_s)[:, 1]
+        auc = float(roc_auc_score(y_test, probs)) if len(np.unique(y_test)) > 1 else float("nan")
+        aucs[label] = auc
+
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    META_DIR.mkdir(parents=True, exist_ok=True)
+
+    joblib.dump(models, APP_DIR / "tau_cdf_models.pkl")
+    joblib.dump(scaler, APP_DIR / "tau_scaler.pkl")
+
+    report = {
+        "tag": tag,
+        "rows_total": int(len(df)),
+        "rows_used": int(len(use)),
+        "train_rows": int(len(X_train)),
+        "test_rows": int(len(X_test)),
+        "feature_cols": feature_cols,
+        "aucs": {k: (round(v, 6) if np.isfinite(v) else None) for k, v in aucs.items()},
+        "paths": {
+            "labels": str(parq if parq.exists() else csv),
+            "models": str(APP_DIR / "tau_cdf_models.pkl"),
+            "scaler": str(APP_DIR / "tau_scaler.pkl"),
+        },
+    }
+    (META_DIR / f"train_tau_report_{tag}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print("=" * 60)
-    print("TAU MODEL (success-only regression)")
-    print("Test MAE (days):", round(mae, 3))
-    print("y_test mean:", round(float(np.mean(y_test)), 3))
-    print("pred mean:", round(float(np.mean(pred)), 3))
+    print("[DONE] train_tau_model.py")
+    print("tag:", tag)
+    print("AUCs:", report["aucs"])
+    print("features:", feature_cols)
     print("=" * 60)
-
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(base, MODEL_PATH)
-    joblib.dump(scaler, SCALER_PATH)
-    print(f"[DONE] wrote {MODEL_PATH} / {SCALER_PATH}")
 
 
 if __name__ == "__main__":
