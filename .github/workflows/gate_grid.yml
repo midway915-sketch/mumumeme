@@ -220,6 +220,17 @@ jobs:
           set -euo pipefail
           bash scripts/run_grid_workflow.sh
 
+      - name: Debug signals outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[DEBUG] data/signals list:"
+          ls -la data/signals | sed -n '1,200p' || true
+          echo "[DEBUG] gate_summary files:"
+          ls -la data/signals/gate_summary_*.csv 2>/dev/null || true
+          echo "[DEBUG] sim_engine_trades files:"
+          find data -type f -name "sim_engine_trades*.parquet" | sed -n '1,200p' || true
+
       - name: Aggregate gate grid (Round-1)
         shell: bash
         run: |
