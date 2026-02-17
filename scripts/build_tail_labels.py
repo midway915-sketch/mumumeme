@@ -29,7 +29,6 @@ def _to_dt(x):
 
 
 def forward_min(s: pd.Series, window: int) -> pd.Series:
-    # forward-looking min over [t .. t+window-1]
     return s.iloc[::-1].rolling(window, min_periods=window).min().iloc[::-1]
 
 
@@ -41,6 +40,83 @@ def make_tag(profit_target: float, max_days: int, stop_level: float, max_extend_
     pt_tag = int(round(profit_target * 100))
     sl_tag = int(round(abs(stop_level) * 100))
     return f"pt{pt_tag}_h{max_days}_sl{sl_tag}_ex{max_extend_days}"
+
+
+def normalize_prices_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure prices has: Date, Ticker, High, Low, Close
+    Accepts variants: date/Datetime, ticker, AdjClose/Adj Close, close, high, low
+    """
+    df = df.copy()
+
+    # flatten multiindex cols
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Date
+    if "Date" not in df.columns:
+        if "Datetime" in df.columns:
+            df = df.rename(columns={"Datetime": "Date"})
+        elif "date" in df.columns:
+            df = df.rename(columns={"date": "Date"})
+        elif isinstance(df.index, pd.DatetimeIndex) or df.index.name in ("Date", "Datetime"):
+            idx_name = df.index.name or "Date"
+            df = df.reset_index().rename(columns={idx_name: "Date"})
+
+    # Ticker
+    if "Ticker" not in df.columns:
+        if "ticker" in df.columns:
+            df = df.rename(columns={"ticker": "Ticker"})
+
+    # Common OHLC renames
+    rename_map = {}
+    for c in df.columns:
+        cl = c.lower()
+        if cl == "high":
+            rename_map[c] = "High"
+        elif cl == "low":
+            rename_map[c] = "Low"
+        elif cl == "close":
+            rename_map[c] = "Close"
+        elif cl in ("adj close", "adjclose", "adj_close"):
+            rename_map[c] = "AdjClose"
+        elif cl == "open":
+            rename_map[c] = "Open"
+        elif cl == "volume":
+            rename_map[c] = "Volume"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # If Close missing but AdjClose exists, use AdjClose as Close (strategy uses Close)
+    if "Close" not in df.columns and "AdjClose" in df.columns:
+        df["Close"] = df["AdjClose"]
+
+    # If still missing, hard fail with diagnostic
+    needed = {"Date", "Ticker", "High", "Low", "Close"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"prices missing columns: {sorted(missing)}; cols={list(df.columns)[:40]}")
+
+    df["Date"] = _to_dt(df["Date"])
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+
+    # numeric coercion
+    for c in ["High", "Low", "Close"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df
+
+
+def normalize_features_schema(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if "Date" not in df.columns or "Ticker" not in df.columns:
+        raise ValueError("features_model must contain Date and Ticker")
+    df["Date"] = _to_dt(df["Date"])
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    return df
 
 
 def main() -> None:
@@ -73,55 +149,30 @@ def main() -> None:
 
     tag = make_tag(profit_target, max_days, stop_level, int(args.max_extend_days))
 
-    prices = read_table(Path(args.prices_parq), Path(args.prices_csv)).copy()
-    feats = read_table(Path(args.features_parq), Path(args.features_csv)).copy()
-
-    if "Date" not in prices.columns or "Ticker" not in prices.columns:
-        raise ValueError("prices must contain Date and Ticker")
-    if "Date" not in feats.columns or "Ticker" not in feats.columns:
-        raise ValueError("features_model must contain Date and Ticker")
-
-    prices["Date"] = _to_dt(prices["Date"])
-    feats["Date"] = _to_dt(feats["Date"])
-
-    prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
-    feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
-
-    # ensure OHLC columns
-    for col in ["Close", "High", "Low"]:
-        if col not in prices.columns:
-            raise ValueError(f"prices missing column: {col}")
+    prices = normalize_prices_schema(read_table(Path(args.prices_parq), Path(args.prices_csv)))
+    feats = normalize_features_schema(read_table(Path(args.features_parq), Path(args.features_csv)))
 
     prices = prices.sort_values(["Ticker", "Date"]).reset_index(drop=True)
     feats = feats.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-    # optional incremental build window
+    # incremental window (optional)
     if args.start_date:
         start = pd.to_datetime(args.start_date)
-        if args.buffer_days and args.buffer_days > 0:
+        if int(args.buffer_days) > 0:
             start = start - pd.Timedelta(days=int(args.buffer_days))
         prices = prices.loc[prices["Date"] >= start].copy()
         feats = feats.loc[feats["Date"] >= start].copy()
 
-    # merge to align rows (Date/Ticker base = features)
-    px = prices[["Date", "Ticker", "Close", "High", "Low"]].copy()
-    base = feats.merge(px, on=["Date", "Ticker"], how="left")
-
-    # We need future windows -> compute per ticker on FULL price history,
-    # then merge forward stats back to base.
-    g = prices.groupby("Ticker", sort=False)
-
+    # forward stats computed on full price (per ticker)
     forward_stats = []
-    for t, df_t in g:
+    for t, df_t in prices.groupby("Ticker", sort=False):
         df_t = df_t.sort_values("Date").reset_index(drop=True)
-        close = pd.to_numeric(df_t["Close"], errors="coerce")
-        high = pd.to_numeric(df_t["High"], errors="coerce")
-        low = pd.to_numeric(df_t["Low"], errors="coerce")
 
-        # success horizon uses max_days (PT hit quickly)
+        close = df_t["Close"]
+        high = df_t["High"]
+        low = df_t["Low"]
+
         max_high_h = forward_max(high, max_days)
-
-        # tail horizon uses tail_h (default=max_days; strategy-aligned)
         min_low_tail = forward_min(low, tail_h)
 
         out = pd.DataFrame({
@@ -136,16 +187,8 @@ def main() -> None:
     fwd = pd.concat(forward_stats, ignore_index=True)
     fwd = fwd.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-    base = base.merge(
-        fwd,
-        on=["Date", "Ticker"],
-        how="left",
-        validate="1:1",
-    )
+    base = feats.merge(fwd, on=["Date", "Ticker"], how="left", validate="1:1")
 
-    # compute Success / TailHit / TailTarget
-    # Success: within max_days, High >= Close*(1+profit_target)
-    # TailHit: within tail_h (default=max_days), Low <= Close*(1+stop_level)  (stop_level negative)
     entry = pd.to_numeric(base["ENTRY_CLOSE"], errors="coerce")
 
     succ_thr = entry * (1.0 + profit_target)
@@ -156,15 +199,11 @@ def main() -> None:
 
     base["Success"] = ((fwd_max_high >= succ_thr) & np.isfinite(fwd_max_high) & np.isfinite(succ_thr)).astype(int)
     base["TailHit"] = ((fwd_min_low <= tail_thr) & np.isfinite(fwd_min_low) & np.isfinite(tail_thr)).astype(int)
-
-    # Strategy-aligned: "bad tail path" = tail hit AND not success (within max_days)
     base["TailTarget"] = ((base["TailHit"] == 1) & (base["Success"] == 0)).astype(int)
 
-    # drop rows where forward windows not fully available
-    # (rolling min/max needs full window)
+    # drop rows without full forward windows
     base = base.loc[np.isfinite(fwd_max_high) & np.isfinite(fwd_min_low) & np.isfinite(entry)].copy()
 
-    # Keep features + label columns (avoid leaking future stats into model inputs)
     keep_cols = [c for c in feats.columns] + ["Success", "TailHit", "TailTarget"]
     out_df = base[keep_cols].copy()
 
@@ -174,12 +213,11 @@ def main() -> None:
     out_parq = Path(args.out_parq) if args.out_parq else (LABEL_DIR / f"labels_tail_{tag}.parquet")
     out_csv = Path(args.out_csv) if args.out_csv else (LABEL_DIR / f"labels_tail_{tag}.csv")
 
-    # write
+    saved_parq = None
     try:
         out_df.to_parquet(out_parq, index=False)
         saved_parq = str(out_parq)
     except Exception as e:
-        saved_parq = None
         print(f"[WARN] parquet write failed: {e}")
 
     out_df.to_csv(out_csv, index=False)
