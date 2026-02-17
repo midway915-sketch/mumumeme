@@ -86,15 +86,15 @@ jobs:
 
           # 캐시 키/태그용 (콤마/공백 없음)
           PT_INT="$(python - <<'PY'
-pt=float("${{ inputs.profit_target }}")
-print(int(round(pt*100)))
-PY
-)"
+          pt=float("${{ inputs.profit_target }}")
+          print(int(round(pt*100)))
+          PY
+          )"
           SL_INT="$(python - <<'PY'
-sl=float("${{ inputs.stop_level }}")
-print(int(round(abs(sl)*100)))
-PY
-)"
+          sl=float("${{ inputs.stop_level }}")
+          print(int(round(abs(sl)*100)))
+          PY
+          )"
           echo "LABEL_TAG=pt${PT_INT}_h${{ inputs.max_days }}_sl${SL_INT}_ex${{ inputs.max_extend_days }}" >> $GITHUB_ENV
 
       # ----------------------------
@@ -210,29 +210,29 @@ PY
           START_DATE=""
           if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
             START_DATE="$(python - <<'PY'
-import pandas as pd
-from pathlib import Path
-p=Path("data/features/features_model.parquet")
-c=Path("data/features/features_model.csv")
-df=None
-if p.exists():
-  df=pd.read_parquet(p)
-elif c.exists():
-  df=pd.read_csv(c)
-if df is None or len(df)==0 or "Date" not in df.columns:
-  print("")
-else:
-  d=pd.to_datetime(df["Date"], errors="coerce").dropna()
-  if len(d)==0:
-    print("")
-  else:
-    last=d.max()
-    start=last - pd.Timedelta(days=20)
-    print(start.strftime("%Y-%m-%d"))
-PY
-)"
-          fi
-          echo "[INFO] START_DATE=$START_DATE"
+          import pandas as pd
+          from pathlib import Path
+          p=Path("data/features/features_model.parquet")
+          c=Path("data/features/features_model.csv")
+          df=None
+          if p.exists():
+            df=pd.read_parquet(p)
+          elif c.exists():
+            df=pd.read_csv(c)
+          if df is None or len(df)==0 or "Date" not in df.columns:
+            print("")
+          else:
+            d=pd.to_datetime(df["Date"], errors="coerce").dropna()
+            if len(d)==0:
+              print("")
+            else:
+              last=d.max()
+              start=last - pd.Timedelta(days=20)
+              print(start.strftime("%Y-%m-%d"))
+          PY
+          )"
+                    fi
+                    echo "[INFO] START_DATE=$START_DATE"
 
           # 3) features (PT/H/SL 무관) -> 재사용 핵심
           if [ -n "$START_DATE" ] && { [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; }; then
@@ -296,60 +296,60 @@ PY
 
           # 5) model: labels 날짜가 바뀌면 재학습 (PT/H/SL 바꿔도 자동)
           LABELS_MAX_DATE="$(python - <<'PY'
-import pandas as pd
-from pathlib import Path
-p=Path("data/labels/labels_model.parquet")
-c=Path("data/labels/labels_model.csv")
-df=None
-if p.exists():
-  df=pd.read_parquet(p)
-elif c.exists():
-  df=pd.read_csv(c)
-if df is None or len(df)==0 or "Date" not in df.columns:
-  print("")
-else:
-  d=pd.to_datetime(df["Date"], errors="coerce").dropna()
-  print("" if len(d)==0 else d.max().strftime("%Y-%m-%d"))
-PY
-)"
-          mkdir -p data/meta
-          META_PATH="data/meta/model_train_meta.json"
-
-          PREV_LABELS_MAX_DATE=""
-          if [ -f "${META_PATH}" ]; then
-            PREV_LABELS_MAX_DATE="$(python - <<'PY'
-import json
-from pathlib import Path
-p=Path("data/meta/model_train_meta.json")
-try:
-  obj=json.loads(p.read_text(encoding="utf-8"))
-  print(obj.get("labels_max_date",""))
-except Exception:
-  print("")
-PY
-)"
-          fi
-
-          NEED_TRAIN="0"
-          if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
-            NEED_TRAIN="1"
-          elif [ -n "${LABELS_MAX_DATE}" ] && [ "${LABELS_MAX_DATE}" != "${PREV_LABELS_MAX_DATE}" ]; then
-            NEED_TRAIN="1"
-          fi
-
-          if [ "${NEED_TRAIN}" = "1" ]; then
-            python scripts/train_model.py
-            python - <<PY
-import json
-from pathlib import Path
-Path("data/meta").mkdir(parents=True, exist_ok=True)
-obj={"labels_max_date":"${LABELS_MAX_DATE}"}
-Path("data/meta/model_train_meta.json").write_text(json.dumps(obj, indent=2), encoding="utf-8")
-print("[DONE] wrote data/meta/model_train_meta.json", obj)
-PY
-          else
-            echo "[INFO] model up-to-date -> reuse"
-          fi
+          import pandas as pd
+          from pathlib import Path
+          p=Path("data/labels/labels_model.parquet")
+          c=Path("data/labels/labels_model.csv")
+          df=None
+          if p.exists():
+            df=pd.read_parquet(p)
+          elif c.exists():
+            df=pd.read_csv(c)
+          if df is None or len(df)==0 or "Date" not in df.columns:
+            print("")
+          else:
+            d=pd.to_datetime(df["Date"], errors="coerce").dropna()
+            print("" if len(d)==0 else d.max().strftime("%Y-%m-%d"))
+          PY
+          )"
+                    mkdir -p data/meta
+                    META_PATH="data/meta/model_train_meta.json"
+          
+                    PREV_LABELS_MAX_DATE=""
+                    if [ -f "${META_PATH}" ]; then
+                      PREV_LABELS_MAX_DATE="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("data/meta/model_train_meta.json")
+          try:
+            obj=json.loads(p.read_text(encoding="utf-8"))
+            print(obj.get("labels_max_date",""))
+          except Exception:
+            print("")
+          PY
+          )"
+                    fi
+          
+                    NEED_TRAIN="0"
+                    if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
+                      NEED_TRAIN="1"
+                    elif [ -n "${LABELS_MAX_DATE}" ] && [ "${LABELS_MAX_DATE}" != "${PREV_LABELS_MAX_DATE}" ]; then
+                      NEED_TRAIN="1"
+                    fi
+          
+                    if [ "${NEED_TRAIN}" = "1" ]; then
+                      python scripts/train_model.py
+                      python - <<PY
+          import json
+          from pathlib import Path
+          Path("data/meta").mkdir(parents=True, exist_ok=True)
+          obj={"labels_max_date":"${LABELS_MAX_DATE}"}
+          Path("data/meta/model_train_meta.json").write_text(json.dumps(obj, indent=2), encoding="utf-8")
+          print("[DONE] wrote data/meta/model_train_meta.json", obj)
+          PY
+                    else
+                      echo "[INFO] model up-to-date -> reuse"
+                    fi
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
