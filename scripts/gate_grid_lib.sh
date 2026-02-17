@@ -17,20 +17,30 @@ gg_require_env() {
       exit 1
     fi
   done
+  # tau gamma는 옵션(없으면 기본 0.05만 사용)
+  if [ -z "${TAU_GAMMA_LIST:-}" ]; then
+    export TAU_GAMMA_LIST="0.05"
+  fi
 }
 
 gg_run_one() {
-  local MODE="$1" TMAX="$2" UQ="$3" RANK="$4" PRED="$5" SIM="$6"
+  local MODE="$1" TMAX="$2" UQ="$3" RANK="$4" GAMMA="$5" PRED="$6" SIM="$7"
 
-  local TMAX_T UQ_T RANK_T SUFFIX
+  local TMAX_T UQ_T RANK_T GAMMA_T SUFFIX
   TMAX_T="$(gg_safe "$(gg_trim "$TMAX")")"
   UQ_T="$(gg_safe "$(gg_trim "$UQ")")"
   RANK_T="$(gg_trim "$RANK")"
-  SUFFIX="${MODE}_t${TMAX_T}_q${UQ_T}_r${RANK_T}"
+  GAMMA_T="$(gg_safe "$(gg_trim "$GAMMA")")"
+
+  if [ "${RANK_T}" = "utility_time" ]; then
+    SUFFIX="${MODE}_t${TMAX_T}_q${UQ_T}_r${RANK_T}_g${GAMMA_T}"
+  else
+    SUFFIX="${MODE}_t${TMAX_T}_q${UQ_T}_r${RANK_T}"
+  fi
 
   echo ""
   echo "=============================="
-  echo "[RUN] TAG=${TAG} mode=${MODE} tail_max=${TMAX} u_q=${UQ} rank_by=${RANK_T} suffix=${SUFFIX}"
+  echo "[RUN] TAG=${TAG} mode=${MODE} tail_max=${TMAX} u_q=${UQ} rank_by=${RANK_T} gamma=${GAMMA} suffix=${SUFFIX}"
   echo "=============================="
 
   python "${PRED}" \
@@ -43,6 +53,7 @@ gg_run_one() {
     --u-quantile "$(gg_trim "$UQ")" \
     --rank-by "${RANK_T}" \
     --lambda-tail "${LAMBDA_TAIL}" \
+    --tau-gamma "$(gg_trim "$GAMMA")" \
     --out-suffix "${SUFFIX}"
 
   local PICKS="data/signals/picks_${TAG}_gate_${SUFFIX}.csv"
@@ -121,45 +132,66 @@ run_gate_grid() {
   IFS=',' read -ra TAILS <<< "${TAIL_MAX_LIST}"
   IFS=',' read -ra UQS   <<< "${U_QUANTILE_LIST}"
   IFS=',' read -ra RANKS <<< "${RANK_BY_LIST}"
+  IFS=',' read -ra GAMS  <<< "${TAU_GAMMA_LIST}"
 
   local BASE_T BASE_Q
   BASE_T="$(gg_trim "${TAILS[0]}")"
   BASE_Q="$(gg_trim "${UQS[0]}")"
 
-  # 1) none
   for R in "${RANKS[@]}"; do
-    gg_run_one "none" "${BASE_T}" "${BASE_Q}" "${R}" "${PRED}" "${SIM}"
+    R="$(gg_trim "$R")"
+    if [ "${R}" = "utility_time" ]; then
+      for G in "${GAMS[@]}"; do
+        gg_run_one "none" "${BASE_T}" "${BASE_Q}" "${R}" "${G}" "${PRED}" "${SIM}"
+      done
+    else
+      gg_run_one "none" "${BASE_T}" "${BASE_Q}" "${R}" "${GAMS[0]}" "${PRED}" "${SIM}"
+    fi
   done
 
-  # 2) tail
   if [ "${TAIL_OK:-0}" = "1" ]; then
     for T in "${TAILS[@]}"; do
       for R in "${RANKS[@]}"; do
-        gg_run_one "tail" "${T}" "${BASE_Q}" "${R}" "${PRED}" "${SIM}"
+        R="$(gg_trim "$R")"
+        if [ "${R}" = "utility_time" ]; then
+          for G in "${GAMS[@]}"; do
+            gg_run_one "tail" "${T}" "${BASE_Q}" "${R}" "${G}" "${PRED}" "${SIM}"
+          done
+        else
+          gg_run_one "tail" "${T}" "${BASE_Q}" "${R}" "${GAMS[0]}" "${PRED}" "${SIM}"
+        fi
       done
     done
-  else
-    echo "[SKIP] tail gates skipped (TAIL_OK=0)"
   fi
 
-  # 3) utility
   for Q in "${UQS[@]}"; do
     for R in "${RANKS[@]}"; do
-      gg_run_one "utility" "${BASE_T}" "${Q}" "${R}" "${PRED}" "${SIM}"
+      R="$(gg_trim "$R")"
+      if [ "${R}" = "utility_time" ]; then
+        for G in "${GAMS[@]}"; do
+          gg_run_one "utility" "${BASE_T}" "${Q}" "${R}" "${G}" "${PRED}" "${SIM}"
+        done
+      else
+        gg_run_one "utility" "${BASE_T}" "${Q}" "${R}" "${GAMS[0]}" "${PRED}" "${SIM}"
+      fi
     done
   done
 
-  # 4) tail_utility
   if [ "${TAIL_OK:-0}" = "1" ]; then
     for T in "${TAILS[@]}"; do
       for Q in "${UQS[@]}"; do
         for R in "${RANKS[@]}"; do
-          gg_run_one "tail_utility" "${T}" "${Q}" "${R}" "${PRED}" "${SIM}"
+          R="$(gg_trim "$R")"
+          if [ "${R}" = "utility_time" ]; then
+            for G in "${GAMS[@]}"; do
+              gg_run_one "tail_utility" "${T}" "${Q}" "${R}" "${G}" "${PRED}" "${SIM}"
+            done
+          else
+            gg_run_one "tail_utility" "${T}" "${Q}" "${R}" "${GAMS[0]}" "${PRED}" "${SIM}"
+          fi
         done
       done
     done
-  else
-    echo "[SKIP] tail_utility gates skipped (TAIL_OK=0)"
   fi
 
   echo "[DONE] gate grid finished for TAG=${TAG}"
