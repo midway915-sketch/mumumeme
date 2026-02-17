@@ -140,6 +140,11 @@ def per_date_quantile_threshold(x: pd.Series, q: float) -> float:
     return float(x.quantile(q))
 
 
+def tok(x: float) -> str:
+    s = f"{x:.4f}".rstrip("0").rstrip(".")
+    return s.replace(".", "p").replace("-", "m")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Gate picks by p_tail/utility then rank; outputs daily picks CSV.")
     ap.add_argument("--profit-target", type=float, required=True)
@@ -152,29 +157,27 @@ def main() -> None:
     ap.add_argument("--utility-quantile", dest="u_quantile", type=float, default=0.75)
     ap.add_argument("--rank-by", type=str, default="utility", choices=["utility", "ret_score", "p_success", "utility_time"])
     ap.add_argument("--lambda-tail", type=float, default=0.05)
-    ap.add_argument("--tau-gamma", type=float, default=0.05)
+    ap.add_argument("--tau-gamma", type=float, default=0.05)  # ✅ 스코어에만 사용, 파일명엔 미포함
     ap.add_argument("--topk", type=int, default=1)
     ap.add_argument("--market-ticker", type=str, default="SPY")
+
+    # ✅ 다운스트림이 기대하는 suffix를 그대로 쓰기 위해: 기본 suffix에서 gamma 제거
     ap.add_argument("--suffix", type=str, default="")
     ap.add_argument("--out-csv", type=str, default="")
 
-    # run_grid_workflow.sh가 추가 인자를 줘도 안 깨지게
     args, _unknown = ap.parse_known_args()
 
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 
     tag = build_tag(args.profit_target, args.max_days, args.stop_level, args.max_extend_days)
 
-    def tok(x: float) -> str:
-        s = f"{x:.4f}".rstrip("0").rstrip(".")
-        return s.replace(".", "p").replace("-", "m")
-
+    # ✅ 기본 suffix는 다운스트림 기대 규칙 그대로: {mode}_t..._q..._r...
     suffix = args.suffix.strip()
     if not suffix:
-        suffix = f"{args.mode}_t{tok(args.tail_max)}_q{tok(args.u_quantile)}_r{args.rank_by}_g{tok(args.tau_gamma)}"
+        suffix = f"{args.mode}_t{tok(args.tail_max)}_q{tok(args.u_quantile)}_r{args.rank_by}"
 
     print("=" * 30)
-    print(f"[RUN] tag={tag} mode={args.mode} tail_max={args.tail_max} u_q={args.u_quantile} rank_by={args.rank_by} gamma={args.tau_gamma}")
+    print(f"[RUN] tag={tag} mode={args.mode} tail_max={args.tail_max} u_q={args.u_quantile} rank_by={args.rank_by} tau_gamma={args.tau_gamma}")
     print(f"[RUN] suffix={suffix}")
     print("=" * 30)
 
@@ -305,7 +308,7 @@ def main() -> None:
 
     out = pd.DataFrame(out_rows).sort_values("Date").reset_index(drop=True)
 
-    # ✅ 저장 경로 결정: 기본은 picks_{tag}_gate_{suffix}.csv
+    # ✅ 저장: 다운스트림 기대 파일명 고정
     if args.out_csv.strip():
         out_path = Path(args.out_csv)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -315,7 +318,7 @@ def main() -> None:
     out.to_csv(out_path, index=False)
     print(f"[DONE] wrote picks: {out_path} rows={len(out)} skipped_days={int(out['Skipped'].sum())}")
 
-    # (옵션) 구버전 이름으로도 하나 더 저장해두면 디버깅/호환에 도움됨
+    # ✅ 혹시 다른 스크립트가 구버전도 찾으면 대비
     if not args.out_csv.strip():
         alt = SIGNALS_DIR / f"picks_{tag}_{suffix}.csv"
         try:
