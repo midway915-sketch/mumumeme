@@ -175,9 +175,6 @@ jobs:
 
           ls -la data/features | head -n 200 || true
 
-      # =========================
-      # 1차 넓은 그리드
-      # =========================
       - name: Run grid (Round-1 broad)
         shell: bash
         env:
@@ -204,9 +201,6 @@ jobs:
           echo "[INFO] Round-1 outputs:"
           ls -la data/signals | tail -n 200 || true
 
-      # =========================
-      # 2차 미세그리드: Pareto Top30 기반 자동 축소
-      # =========================
       - name: Derive refine grid from Pareto Top30
         shell: bash
         run: |
