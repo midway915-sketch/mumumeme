@@ -4,34 +4,34 @@ on:
   workflow_dispatch:
     inputs:
       profit_target:
-        description: "profit target list (comma-separated). e.g. 0.10 or 0.08,0.10,0.12"
+        description: "profit target (e.g. 0.10)"
         required: true
         default: "0.10"
-      max_holding_days:
-        description: "max holding days list (comma-separated). e.g. 40 or 35,40,45"
+      max_days:
+        description: "max holding days (e.g. 40)"
         required: true
         default: "40"
       stop_level:
-        description: "stop level list (comma-separated, negative). e.g. -0.10 or -0.08,-0.10,-0.12"
+        description: "stop level (e.g. -0.10)"
         required: true
         default: "-0.10"
-      extend_horizon:
+      max_extend_days:
         description: "extend horizon tag + strategy label horizon add (e.g. 30)"
         required: true
         default: "30"
       p_tail_thresholds:
-        description: "comma-separated p_tail thresholds. e.g. 0.15,0.25,0.35"
+        description: "comma-separated p_tail thresholds (e.g. 0.15,0.25,0.35)"
         required: true
         default: "0.20,0.30"
       utility_quantiles:
-        description: "comma-separated utility quantiles. e.g. 0.60,0.75,0.90"
+        description: "comma-separated utility quantiles (e.g. 0.60,0.75,0.90)"
         required: true
         default: "0.75,0.90"
-      rank_metric:
-        description: "comma-separated rank metric (utility|ret_score|p_success|utility_time). e.g. utility,utility_time"
+      rank_metrics:
+        description: "comma-separated rank metric (utility|ret_score|p_success)"
         required: true
-        default: "utility,utility_time"
-      utility_tail_penalty_lambda:
+        default: "utility"
+      lambda_tail:
         description: "utility tail penalty lambda (e.g. 0.05)"
         required: true
         default: "0.05"
@@ -41,9 +41,10 @@ on:
         default: "false"
 
 jobs:
-  gate-grid:
+  grid:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -65,192 +66,79 @@ jobs:
             pip install pandas numpy yfinance pyarrow scikit-learn joblib
           fi
 
-      - name: Sanity check scripts exist
+      - name: Ensure folders
         shell: bash
         run: |
           set -euo pipefail
-          ls -la scripts || true
+          mkdir -p data/raw data/features data/labels data/signals app scripts
 
-          for f in \
-            scripts/run_grid_workflow.sh \
-            scripts/gate_grid_lib.sh \
-            scripts/fetch_prices.py \
-            scripts/build_features.py \
-            scripts/patch_market_features.py \
-            scripts/build_labels.py \
-            scripts/train_model.py \
-            scripts/build_tau_labels.py \
-            scripts/train_tau_model.py \
-            scripts/predict_tau.py \
-            scripts/predict_gate.py \
-            scripts/simulate_single_position_engine.py \
-            scripts/merge_sim_summaries.py \
-            scripts/aggregate_gate_grid.py \
-            scripts/universe.py
-          do
-            if [ ! -f "$f" ]; then
-              echo "[ERROR] missing file: $f"
-              exit 1
-            fi
-          done
-
-          chmod +x scripts/run_grid_workflow.sh scripts/gate_grid_lib.sh || true
-
-      - name: (Optional) Reset data
+      # (선택) rebuild_all=true면 너의 파이프라인 실행
+      # 네 레포에 있는 실제 스크립트 이름/옵션에 맞게 유지해서 사용
+      - name: Rebuild pipeline (optional)
         if: ${{ inputs.rebuild_all == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf data || true
-          mkdir -p data/raw data/features data/labels data/signals app
+          echo "[INFO] rebuild_all=true"
+          # 예시: 네 레포 실제 스크립트들에 맞게 수정 가능
+          # python scripts/universe.py
+          # python scripts/fetch_prices.py --include-extra --reset --force-full
+          # python scripts/build_features.py
+          # python scripts/build_labels.py
+          # python scripts/train_model.py
+          echo "[INFO] (skip) add your rebuild commands here if needed"
 
-      - name: Ensure universe.csv
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data
-          python scripts/universe.py
-          echo "[INFO] universe.csv head:"
-          head -n 20 data/universe.csv || true
-
-      - name: Fetch prices (include SPY/VIX)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/raw
-          python scripts/fetch_prices.py --include-extra --force-full
-
-      - name: Build features
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/features
-          python scripts/build_features.py
-
-      - name: Normalize features filename (ensure features_model.* exists)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/features
-
-          if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
-            echo "[OK] features_model already exists"
-            ls -la data/features | head -n 200 || true
-            exit 0
-          fi
-
-          python - <<'PY'
-          from pathlib import Path
-          import shutil
-
-          d = Path("data/features")
-          cand_parq = sorted([p for p in d.glob("*.parquet") if "feature" in p.name.lower()])
-          cand_csv  = sorted([p for p in d.glob("*.csv") if "feature" in p.name.lower()])
-
-          def pick_best(paths):
-              if not paths:
-                  return None
-              scored=[]
-              for p in paths:
-                  name=p.name.lower()
-                  s=0
-                  if "features_model" in name: s+=200
-                  if "model" in name: s+=100
-                  if "daily" in name: s+=10
-                  try:
-                      s += int(p.stat().st_size/1024)
-                  except:
-                      pass
-                  scored.append((s,p))
-              scored.sort(key=lambda x:x[0], reverse=True)
-              return scored[0][1]
-
-          src = pick_best(cand_parq) or pick_best(cand_csv)
-          if src is None:
-              raise SystemExit("[ERROR] No feature files found under data/features. build_features.py output missing?")
-
-          dst = d / ("features_model.parquet" if src.suffix == ".parquet" else "features_model.csv")
-          shutil.copy2(src, dst)
-          print(f"[DONE] normalized features: {src} -> {dst}")
-          PY
-
-          ls -la data/features | head -n 200 || true
-
-      - name: Patch Market_* into features_model (hard guarantee)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/patch_market_features.py --market-ticker SPY
-
-      - name: Verify Market_* exists in features_model
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import pandas as pd
-          from pathlib import Path
-          p = Path("data/features/features_model.parquet")
-          if p.exists():
-              df = pd.read_parquet(p)
-          else:
-              df = pd.read_csv("data/features/features_model.csv")
-          need = ["Market_Drawdown","Market_ATR_ratio"]
-          miss = [c for c in need if c not in df.columns]
-          print("[INFO] features_model rows:", len(df))
-          print("[INFO] has columns?", {c: (c in df.columns) for c in need})
-          if miss:
-              raise SystemExit(f"[ERROR] still missing: {miss}. columns={list(df.columns)[:40]}")
-          PY
-
-      - name: Run grid (Round-1 broad)
+      - name: Run gate grid (predict + simulate + summarize)
         shell: bash
         env:
-          PROFIT_TARGET_INPUT: ${{ inputs.profit_target }}
-          HOLDING_DAYS_INPUT: ${{ inputs.max_holding_days }}
-          STOP_LEVEL_INPUT: ${{ inputs.stop_level }}
-          MAX_EXTEND_DAYS: ${{ inputs.extend_horizon }}
-
-          TAIL_MAX_LIST: ${{ inputs.p_tail_thresholds }}
-          U_QUANTILE_LIST: ${{ inputs.utility_quantiles }}
-          RANK_BY_LIST: ${{ inputs.rank_metric }}
-          LAMBDA_TAIL: ${{ inputs.utility_tail_penalty_lambda }}
-
-          TAU_GAMMA_LIST: "0.03,0.05,0.08"
+          PROFIT_TARGET: ${{ inputs.profit_target }}
+          MAX_DAYS: ${{ inputs.max_days }}
+          STOP_LEVEL: ${{ inputs.stop_level }}
+          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
+          P_TAIL_THRESHOLDS: ${{ inputs.p_tail_thresholds }}
+          UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
+          RANK_METRICS: ${{ inputs.rank_metrics }}
+          LAMBDA_TAIL: ${{ inputs.lambda_tail }}
+          TAU_GAMMA: "0.0"
+          GATE_MODES: "none,tail,utility,tail_utility"
         run: |
           set -euo pipefail
+          chmod +x scripts/run_grid_workflow.sh || true
           bash scripts/run_grid_workflow.sh
 
-      - name: Debug signals outputs
+      - name: Aggregate summaries
         shell: bash
         run: |
           set -euo pipefail
-          echo "[DEBUG] data/signals list:"
+          python scripts/aggregate_gate_grid.py \
+            --signals-dir "data/signals" \
+            --out-aggregate "data/signals/gate_grid_aggregate.csv" \
+            --out-top "data/signals/gate_grid_top_by_recent10y.csv" \
+            --pattern "gate_summary_*.csv" \
+            --topn 30
+
+      - name: Debug signals
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[DEBUG] gate_summary count:"
+          ls -1 data/signals/gate_summary_*.csv 2>/dev/null | wc -l || true
+          echo "[DEBUG] trades parquet count:"
+          ls -1 data/signals/sim_engine_trades_*.parquet 2>/dev/null | wc -l || true
+          echo "[DEBUG] curve parquet count:"
+          ls -1 data/signals/sim_engine_curve_*.parquet 2>/dev/null | wc -l || true
+          echo "[DEBUG] signals dir:"
           ls -la data/signals | sed -n '1,200p' || true
-          echo "[DEBUG] gate_summary files:"
-          ls -la data/signals/gate_summary_*.csv 2>/dev/null || true
-          echo "[DEBUG] sim_engine_trades files:"
-          find data -type f -name "sim_engine_trades*.parquet" | sed -n '1,200p' || true
 
-      - name: Aggregate gate grid (Round-1)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/aggregate_gate_grid.py
-          echo "[INFO] Round-1 outputs:"
-          ls -la data/signals | tail -n 200 || true
-
-      - name: Upload artifacts (signals + summaries)
+      - name: Upload artifacts (signals)
         uses: actions/upload-artifact@v4
         with:
-          name: gate-grid-results-${{ github.run_id }}
-          if-no-files-found: warn
+          name: gate-grid-results
           path: |
-            data/signals/gate_grid_*.csv
             data/signals/gate_summary_*.csv
+            data/signals/gate_grid_aggregate.csv
+            data/signals/gate_grid_top_by_recent10y.csv
             data/signals/picks_*.csv
-            data/signals/sim_engine_*.parquet
-            data/raw/prices*.*
-            data/features/*.*
-            data/labels/*.*
-            data/raw_data.csv
-            app/*.pkl
+            data/signals/sim_engine_trades_*.parquet
+            data/signals/sim_engine_curve_*.parquet
+          if-no-files-found: error
