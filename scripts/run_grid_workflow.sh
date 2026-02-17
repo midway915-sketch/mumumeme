@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# inputs are passed via env by workflow:
+# required env:
 # PROFIT_TARGET, MAX_DAYS, STOP_LEVEL, MAX_EXTEND_DAYS
 # P_TAIL_THRESHOLDS, UTILITY_QUANTILES, RANK_METRICS
 # LAMBDA_TAIL, TAU_GAMMA
-# GATE_MODES (optional) e.g. "none,tail,utility,tail_utility"
+# optional: GATE_MODES (default none,tail,utility,tail_utility)
 
 PT="${PROFIT_TARGET}"
 H="${MAX_DAYS}"
@@ -40,7 +40,8 @@ echo "[INFO] RANKS=$RANKS"
 echo "[INFO] LAMBDA=$LAMBDA TAU_GAMMA=$TAU_GAMMA"
 echo "=============================="
 
-# ✅ 핵심: 여기서 조합 루프 + run_one_gate(= predict + simulate + summarize) 실행
+mkdir -p data/signals
+
 for mode in $(split_csv "$MODES"); do
   for tail in $(split_csv "$TAILS"); do
     for uq in $(split_csv "$UQS"); do
@@ -52,6 +53,6 @@ for mode in $(split_csv "$MODES"); do
 done
 
 echo "=============================="
-echo "[INFO] produced files (signals):"
+echo "[INFO] signals outputs:"
 ls -la data/signals | sed -n '1,200p' || true
 echo "=============================="
