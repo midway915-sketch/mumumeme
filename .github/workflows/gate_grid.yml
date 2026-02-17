@@ -20,7 +20,6 @@ on:
         required: true
         default: "30"
 
-      # ✅ 추천 기본값
       p_tail_thresholds:
         description: "comma-separated p_tail thresholds (e.g. 0.15,0.25,0.35)"
         required: true
@@ -83,26 +82,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           TAG="pt$(python - <<'PY'
-          pt=float("${{ inputs.profit_target }}")
-          print(int(round(pt*100)))
-          PY
-          )_h${{ inputs.max_days }}_sl$(python - <<'PY'
-          sl=float("${{ inputs.stop_level }}")
-          print(int(round(abs(sl)*100)))
-          PY
-          )_ex${{ inputs.max_extend_days }}"
+pt=float("${{ inputs.profit_target }}")
+print(int(round(pt*100)))
+PY
+)_h${{ inputs.max_days }}_sl$(python - <<'PY'
+sl=float("${{ inputs.stop_level }}")
+print(int(round(abs(sl)*100)))
+PY
+)_ex${{ inputs.max_extend_days }}"
+
           echo "TAG=$TAG" >> $GITHUB_ENV
 
-          # human-readable spec (can include commas)
+          # human-readable (may include commas)
           echo "LABEL_SPEC=pt=${{ inputs.profit_target }},h=${{ inputs.max_days }},sl=${{ inputs.stop_level }},ex=${{ inputs.max_extend_days }}" >> $GITHUB_ENV
 
-          # ✅ cache key safe spec (no commas)
+          # cache-safe (no commas)
           LABEL_SPEC_KEY="pt=${{ inputs.profit_target }}_h=${{ inputs.max_days }}_sl=${{ inputs.stop_level }}_ex=${{ inputs.max_extend_days }}"
           LABEL_SPEC_KEY="${LABEL_SPEC_KEY//,/_}"
           echo "LABEL_SPEC_KEY=$LABEL_SPEC_KEY" >> $GITHUB_ENV
 
-      # ---- PRICES cache
+      # -------------------------
+      # Cache: PRICES
+      # -------------------------
       - name: Restore cache (PRICES)
         uses: actions/cache@v4
         with:
@@ -110,23 +113,27 @@ jobs:
             data/raw/prices.parquet
             data/raw/prices.csv
             data/raw/prices_meta.json
-          key: mumumeme-prices-v2-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
+          key: mumumeme-prices-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
           restore-keys: |
-            mumumeme-prices-v2-${{ runner.os }}-
+            mumumeme-prices-v3-${{ runner.os }}-
 
-      # ---- FEATURES cache
+      # -------------------------
+      # Cache: FEATURES
+      # -------------------------
       - name: Restore cache (FEATURES_MODEL)
         uses: actions/cache@v4
         with:
           path: |
             data/features/features_model.parquet
             data/features/features_model.csv
-          key: mumumeme-features-v2-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py','scripts/build_features.py','scripts/build_ev_features.py','scripts/merge_incremental_table.py') }}
+          key: mumumeme-features-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py','scripts/build_features.py','scripts/build_ev_features.py','scripts/merge_incremental_table.py') }}
           restore-keys: |
-            mumumeme-features-v2-${{ runner.os }}-
+            mumumeme-features-v3-${{ runner.os }}-
 
-      # ---- LABELS + MODEL cache (tag-specific)
-      - name: Restore cache (MODEL)
+      # -------------------------
+      # Cache: LABELS + SUCCESS MODEL (tag-specific)
+      # -------------------------
+      - name: Restore cache (LABELS + SUCCESS MODEL)
         uses: actions/cache@v4
         with:
           path: |
@@ -135,9 +142,24 @@ jobs:
             app/model_${{ env.TAG }}.pkl
             app/scaler_${{ env.TAG }}.pkl
             data/meta/build_fingerprint.json
-          key: mumumeme-model-v2-${{ runner.os }}-${{ env.LABEL_SPEC_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/check_rebuild.py','scripts/merge_incremental_table.py') }}
+          key: mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_SPEC_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/check_rebuild.py','scripts/merge_incremental_table.py') }}
           restore-keys: |
-            mumumeme-model-v2-${{ runner.os }}-
+            mumumeme-model-v3-${{ runner.os }}-
+
+      # -------------------------
+      # Optional cache: TAIL MODEL (tag-specific, if you have it)
+      # -------------------------
+      - name: Restore cache (TAIL MODEL optional)
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/tail_model_${{ env.TAG }}.pkl
+            app/tail_scaler_${{ env.TAG }}.pkl
+            app/tail_model.pkl
+            app/tail_scaler.pkl
+          key: mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_SPEC_KEY }}-${{ hashFiles('scripts/build_tail_labels.py','scripts/train_tail_model.py','scripts/check_rebuild.py') }}
+          restore-keys: |
+            mumumeme-tail-v3-${{ runner.os }}-
 
       - name: Fingerprint check (partial rebuild flags)
         shell: bash
@@ -149,12 +171,12 @@ jobs:
             --features-files "scripts/build_features.py,scripts/build_ev_features.py,scripts/merge_incremental_table.py" \
             --labels-files "scripts/build_labels.py,scripts/train_model.py,scripts/merge_incremental_table.py" \
             --universe-files "scripts/universe.py,data/universe.csv" \
-            --strategy-files "scripts/predict_gate.py,scripts/simulate_single_position_engine.py,scripts/gate_grid_lib.sh,scripts/run_grid_workflow.sh,scripts/summarize_sim_trades.py,scripts/aggregate_gate_grid.py" \
+            --strategy-files "scripts/predict_gate.py,scripts/simulate_single_position_engine.py,scripts/run_grid_workflow.sh,scripts/summarize_sim_trades.py,scripts/aggregate_gate_grid.py" \
           )"
           echo "$out"
           echo "$out" | tail -n 4 >> $GITHUB_ENV
 
-      - name: Prepare required files (daily incremental)
+      - name: Prepare required files (incremental rebuild)
         shell: bash
         env:
           REBUILD_ALL: ${{ inputs.rebuild_all }}
@@ -167,6 +189,7 @@ jobs:
           MAX_DAYS: ${{ inputs.max_days }}
           STOP_LEVEL: ${{ inputs.stop_level }}
 
+          TAG: ${{ env.TAG }}
         run: |
           set -euo pipefail
 
@@ -178,7 +201,7 @@ jobs:
             rm -rf data/signals/* || true
           fi
 
-          # upstream 삭제
+          # upstream 삭제 (의존성 순서대로)
           if [ "${REBUILD_PRICES:-0}" = "1" ]; then
             rm -f data/raw/prices.parquet data/raw/prices.csv data/raw/prices_meta.json || true
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
@@ -193,7 +216,7 @@ jobs:
             rm -f app/model_${TAG}.pkl app/scaler_${TAG}.pkl || true
           fi
 
-          # 1) prices: 매일 증분 갱신
+          # 1) prices
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full
@@ -201,36 +224,35 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10
           fi
 
-          # 2) START_DATE 자동 산출 (features 마지막 날짜 기준)
-          RECOMPUTE_DAYS=20
+          # 2) START_DATE from existing features (for incremental)
           START_DATE=""
           if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
             START_DATE="$(python - <<'PY'
-          import pandas as pd
-          from pathlib import Path
-          p=Path("data/features/features_model.parquet")
-          c=Path("data/features/features_model.csv")
-          df=None
-          if p.exists():
-            df=pd.read_parquet(p)
-          elif c.exists():
-            df=pd.read_csv(c)
-          if df is None or len(df)==0 or "Date" not in df.columns:
-            print("")
-          else:
-            d=pd.to_datetime(df["Date"], errors="coerce").dropna()
-            if len(d)==0:
-              print("")
-            else:
-              last=d.max()
-              start=last - pd.Timedelta(days=20)
-              print(start.strftime("%Y-%m-%d"))
-          PY
-          )"
+import pandas as pd
+from pathlib import Path
+p=Path("data/features/features_model.parquet")
+c=Path("data/features/features_model.csv")
+df=None
+if p.exists():
+  df=pd.read_parquet(p)
+elif c.exists():
+  df=pd.read_csv(c)
+if df is None or len(df)==0 or "Date" not in df.columns:
+  print("")
+else:
+  d=pd.to_datetime(df["Date"], errors="coerce").dropna()
+  if len(d)==0:
+    print("")
+  else:
+    last=d.max()
+    start=last - pd.Timedelta(days=20)
+    print(start.strftime("%Y-%m-%d"))
+PY
+)"
           fi
           echo "[INFO] START_DATE=$START_DATE"
 
-          # 3) features: backup -> build recent -> merge
+          # 3) features build (ensure features_model exists no matter what)
           if [ -n "$START_DATE" ] && ( [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ] ); then
             rm -rf data/_backup/features || true
             mkdir -p data/_backup/features
@@ -256,7 +278,13 @@ jobs:
             python scripts/build_features.py
           fi
 
-          # 4) labels: backup -> build recent -> merge
+          # hard check: features must exist now
+          if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
+            echo "[ERROR] features_model not produced."
+            exit 1
+          fi
+
+          # 4) labels build
           if [ -n "$START_DATE" ] && ( [ -f data/labels/labels_model.parquet ] || [ -f data/labels/labels_model.csv ] ); then
             rm -rf data/_backup/labels || true
             mkdir -p data/_backup/labels
@@ -290,7 +318,7 @@ jobs:
               --stop-level "$STOP_LEVEL"
           fi
 
-          # 5) ✅ p_success 모델: PT/H/SL 바뀔 때마다 tag별로 필요하면 학습
+          # 5) train success model (tagged)
           if [ ! -f "app/model_${TAG}.pkl" ] || [ ! -f "app/scaler_${TAG}.pkl" ]; then
             python scripts/train_model.py --tag "$TAG"
           else
@@ -308,7 +336,8 @@ jobs:
           UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
           RANK_METRICS: ${{ inputs.rank_metrics }}
           LAMBDA_TAIL: ${{ inputs.lambda_tail }}
-          TAU_GAMMA: "0.0"
+
+          # modes list (tail 모델 없으면 run_grid_workflow.sh가 스킵)
           GATE_MODES: "none,tail,utility,tail_utility"
         run: |
           set -euo pipefail
@@ -324,12 +353,15 @@ jobs:
             --out-aggregate "data/signals/gate_grid_aggregate.csv" \
             --out-top "data/signals/gate_grid_top_by_recent10y.csv" \
             --pattern "gate_summary_*.csv" \
-            --topn 30
+            --topn 50
 
-      - name: Upload artifacts (signals + meta)
+      # -------------------------
+      # Upload artifacts: REQUIRED (signals)
+      # -------------------------
+      - name: Upload artifacts (signals required)
         uses: actions/upload-artifact@v4
         with:
-          name: gate-grid-results
+          name: gate-grid-signals
           path: |
             data/meta/build_fingerprint.json
             data/signals/gate_summary_*.csv
@@ -340,3 +372,28 @@ jobs:
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
           if-no-files-found: error
+
+      # -------------------------
+      # Upload artifacts: OPTIONAL (models + raw)
+      # -------------------------
+      - name: Upload artifacts (models optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-grid-models-and-raw
+          path: |
+            app/model_*.pkl
+            app/scaler_*.pkl
+            app/tail_model_*.pkl
+            app/tail_scaler_*.pkl
+            app/model.pkl
+            app/scaler.pkl
+            app/tail_model.pkl
+            app/tail_scaler.pkl
+            data/raw/prices.parquet
+            data/raw/prices.csv
+            data/raw/prices_meta.json
+            data/features/features_model.parquet
+            data/features/features_model.csv
+            data/labels/labels_model.parquet
+            data/labels/labels_model.csv
+          if-no-files-found: warn
