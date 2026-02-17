@@ -28,11 +28,22 @@ print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
 PY
 }
 
-find_latest_trades_parquet() {
+list_trades_parquets() {
   python - <<'PY'
 import glob, os
 paths = glob.glob("data/**/sim_engine_trades*.parquet", recursive=True)
 paths = [p for p in paths if os.path.isfile(p)]
+paths.sort()
+for p in paths:
+    print(p)
+PY
+}
+
+pick_newest_from_set() {
+  # stdin: file paths, pick newest mtime
+  python - <<'PY'
+import sys, os
+paths=[line.strip() for line in sys.stdin if line.strip()]
 if not paths:
     raise SystemExit("")
 paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -78,6 +89,12 @@ run_one_gate() {
     exit 1
   fi
 
+  # ✅ BEFORE list
+  local before_list
+  before_list="$(mktemp)"
+  list_trades_parquets > "$before_list" || true
+
+  # simulate
   python scripts/simulate_single_position_engine.py \
     --profit-target "$pt" \
     --max-days "$h" \
@@ -85,37 +102,48 @@ run_one_gate() {
     --max-extend-days "$ex" \
     --picks-path "$picks"
 
-  local latest_trades
-  latest_trades="$(find_latest_trades_parquet || true)"
-  if [ -z "${latest_trades}" ]; then
-    echo "[ERROR] No sim_engine_trades parquet found under data/** after simulate."
-    find data -maxdepth 4 -type f | sed -n '1,200p' || true
+  # ✅ AFTER list
+  local after_list
+  after_list="$(mktemp)"
+  list_trades_parquets > "$after_list" || true
+
+  # ✅ DIFF = files that appear only after
+  local new_list
+  new_list="$(mktemp)"
+  comm -13 <(sort "$before_list") <(sort "$after_list") > "$new_list" || true
+
+  local trades_path=""
+  trades_path="$(cat "$new_list" | pick_newest_from_set || true)"
+
+  if [ -z "$trades_path" ]; then
+    echo "[ERROR] No NEW sim_engine_trades parquet produced by simulate for this run."
+    echo "[DEBUG] before:"
+    sed -n '1,200p' "$before_list" || true
+    echo "[DEBUG] after:"
+    sed -n '1,200p' "$after_list" || true
+    echo "[DEBUG] if simulate overwrites same filename, we must detect by mtime instead."
+    # fallback: choose newest matching this tag
+    trades_path="$(python - <<'PY' "$tag"
+import sys, glob, os
+tag=sys.argv[1]
+paths=glob.glob(f"data/**/sim_engine_trades*{tag}*.parquet", recursive=True)
+paths=[p for p in paths if os.path.isfile(p)]
+paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+print(paths[0] if paths else "")
+PY
+)"
+  fi
+
+  if [ -z "$trades_path" ]; then
+    echo "[ERROR] Could not find trades parquet for tag=${tag}"
+    find data -type f -name "sim_engine_trades*.parquet" | sed -n '1,200p' || true
     exit 1
   fi
 
-  # =========================
-  # ✅ HARD DEBUG (원인 추적용)
-  # =========================
-  echo "------------------------------"
-  echo "[DEBUG] summarize_sim_trades.py head:"
-  python - <<'PY'
-from pathlib import Path
-p = Path("scripts/summarize_sim_trades.py")
-print("exists:", p.exists(), "path:", p.resolve())
-if p.exists():
-    lines = p.read_text(encoding="utf-8").splitlines()
-    for i in range(min(40, len(lines))):
-        print(f"{i+1:04d}: {lines[i]}")
-PY
+  echo "[INFO] using trades parquet: $trades_path"
 
-  echo "------------------------------"
-  echo "[DEBUG] grep fillna in scripts/:"
-  grep -R --line-number "fillna(" scripts | sed -n '1,200p' || true
-  echo "------------------------------"
-
-  # summarize (faulthandler로 traceback 강제)
-  python -X faulthandler scripts/summarize_sim_trades.py \
-    --trades-path "${latest_trades}" \
+  python scripts/summarize_sim_trades.py \
+    --trades-path "${trades_path}" \
     --tag "${tag}" \
     --suffix "${suffix}" \
     --profit-target "$pt" \
