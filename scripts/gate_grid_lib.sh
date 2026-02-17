@@ -61,7 +61,7 @@ run_one_gate() {
     exit 1
   fi
 
-  # 2) ✅ 각 picks마다 시뮬(파일명은 suffix로 강제 분리)
+  # 2) ✅ 각 picks마다 시뮬(조합별 파일명 분리 강제)
   python scripts/simulate_single_position_engine.py \
     --profit-target "$pt" \
     --max-days "$h" \
@@ -71,7 +71,6 @@ run_one_gate() {
     --tag "$tag" \
     --suffix "$suffix"
 
-  # 3) ✅ 시뮬 결과 파일 존재 강제
   if [ ! -f "$trades" ]; then
     echo "[ERROR] trades parquet not created: $trades"
     echo "[DEBUG] signals dir:"
@@ -79,7 +78,7 @@ run_one_gate() {
     exit 1
   fi
 
-  # 4) 요약(요약기는 trades-path만 받으면 curve는 자동 추론)
+  # 3) ✅ trades→curve 자동추론해서 요약 생성
   python scripts/summarize_sim_trades.py \
     --trades-path "$trades" \
     --tag "$tag" \
