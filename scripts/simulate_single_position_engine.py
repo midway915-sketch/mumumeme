@@ -2,111 +2,63 @@
 from __future__ import annotations
 
 import argparse
-import json
-import time
-from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
+import pyarrow as pa
 
 
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
-SIGNAL_DIR = DATA_DIR / "signals"
+SIGNALS_DIR = DATA_DIR / "signals"
+SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 
-PRICES_PARQUET = RAW_DIR / "prices.parquet"
+PRICES_PARQ = RAW_DIR / "prices.parquet"
 PRICES_CSV = RAW_DIR / "prices.csv"
 
-DEFAULT_PICKS_KS_TEMPLATE = "picks_{tag}_ks.csv"  # 기존 multi-method picks
-# gate picks는 predict_gate.py가: picks_{tag}_gate_{suffix}.csv 형태로 저장
 
-METHOD_TO_PICKCOL = {
-    "ret_only": "pick_ret_only",
-    "p_only": "pick_p_only",
-    "gate_topk_then_ret": "pick_gate_ret",
-    "utility": "pick_utility",
-    "gate_topk_then_utility": "pick_gate_utility",
-    "blend_rank": "pick_blend",
-    "custom": "pick_custom",
-}
+def read_prices() -> pd.DataFrame:
+    if PRICES_PARQ.exists():
+        df = pd.read_parquet(PRICES_PARQ)
+    elif PRICES_CSV.exists():
+        df = pd.read_csv(PRICES_CSV)
+    else:
+        raise FileNotFoundError(f"Missing prices: {PRICES_PARQ} (or {PRICES_CSV})")
 
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def fmt_tag(pt: float, max_days: int, sl: float, max_ext: int) -> str:
-    pt_tag = int(round(pt * 100))
-    sl_tag = int(round(abs(sl) * 100))
-    return f"pt{pt_tag}_h{max_days}_sl{sl_tag}_ex{max_ext}"
-
-
-def normalize_prices(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Date"] = pd.to_datetime(df["Date"])
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-    needed = ["Date", "Ticker", "Open", "High", "Low", "Close"]
-    miss = [c for c in needed if c not in df.columns]
+    need = {"Date", "Ticker", "Open", "High", "Low", "Close"}
+    miss = need - set(df.columns)
     if miss:
         raise ValueError(f"prices missing columns: {miss}")
-    df = df.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
+    df = df.sort_values(["Date", "Ticker"]).reset_index(drop=True)
     return df
 
 
-def load_prices() -> pd.DataFrame:
-    if PRICES_PARQUET.exists():
-        df = pd.read_parquet(PRICES_PARQUET)
-        return normalize_prices(df)
-    if PRICES_CSV.exists():
-        df = pd.read_csv(PRICES_CSV)
-        return normalize_prices(df)
-    raise FileNotFoundError("No prices found. Run scripts/fetch_prices.py first.")
-
-
-def load_picks(picks_path: Optional[str], tag: str) -> pd.DataFrame:
-    if picks_path:
-        p = Path(picks_path)
-        if not p.exists():
-            raise FileNotFoundError(f"picks-path not found: {p}")
-        df = pd.read_csv(p)
-    else:
-        p = SIGNAL_DIR / DEFAULT_PICKS_KS_TEMPLATE.format(tag=tag)
-        if not p.exists():
-            raise FileNotFoundError(f"default picks not found: {p}")
-        df = pd.read_csv(p)
-
-    df = df.copy()
+def read_picks(path: str) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Missing picks file: {path}")
+    df = pd.read_csv(p)
     df["Date"] = pd.to_datetime(df["Date"])
     if "Skipped" not in df.columns:
-        df["Skipped"] = 0
+        df["Skipped"] = df[df.columns[1]].isna().astype(int)  # best-effort
     return df.sort_values("Date").reset_index(drop=True)
 
 
-def safe_save(df: pd.DataFrame, parq: Path, csv: Path) -> str:
-    parq.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        df.to_parquet(parq, index=False)
-        return str(parq)
-    except Exception as e:
-        # parquet 엔진이 없으면 CSV로라도 남김
-        df.to_csv(csv, index=False)
-        return str(csv)
+def make_tag(profit_target: float, max_days: int, stop_level: float, max_extend_days: int) -> str:
+    pt = int(round(profit_target * 100))
+    sl = int(round(abs(stop_level) * 100))
+    return f"pt{pt}_h{int(max_days)}_sl{sl}_ex{int(max_extend_days)}"
 
 
-@dataclass
-class TradeState:
-    entry_date: pd.Timestamp
-    ticker: str
-    cycle_unit: float
-    entry_seed: float
-    shares: float = 0.0
-    invested: float = 0.0
-    holding_days: int = 0
-    extending: bool = False
-    min_seed_in_cycle: float = 0.0
+def save_parquet(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, path)
 
 
 def main() -> None:
@@ -115,367 +67,299 @@ def main() -> None:
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
-    ap.add_argument("--max-extend-days", type=int, default=30)  # tag용(로직엔 미사용)
+    ap.add_argument("--max-extend-days", type=int, required=True)
 
-    ap.add_argument("--method", type=str, default="custom",
-                    help="ret_only|p_only|gate_topk_then_ret|utility|gate_topk_then_utility|blend_rank|custom")
-    ap.add_argument("--pick-col", type=str, default=None,
-                    help="picks 파일에서 사용할 컬럼명. 지정하면 method 매핑 대신 이걸 씀.")
-    ap.add_argument("--picks-path", type=str, default=None,
-                    help="기본 picks_{tag}_ks.csv 대신 이 파일을 읽음")
+    ap.add_argument("--initial-seed", type=float, default=40000000)
 
-    ap.add_argument("--initial-seed", type=float, default=40_000_000)
-    ap.add_argument("--daily-buy", type=float, default=None,
-                    help="매일 매수금액 고정 강제. 없으면 사이클 진입 시점 seed/max_days로 자동")
-    ap.add_argument("--shadow-on-skip", action="store_true")
+    ap.add_argument("--method", type=str, default="custom")
+    ap.add_argument("--pick-col", type=str, default="pick_custom")
+    ap.add_argument("--picks-path", type=str, required=True)
 
-    ap.add_argument("--label", type=str, default=None,
-                    help="summary에서 method 이름 대신 표시할 라벨(조합명 등)")
-    ap.add_argument("--out-suffix", type=str, default="",
-                    help="출력 파일명 구분자. 예: none_t025_q075")
+    ap.add_argument("--label", type=str, default="custom")
+    ap.add_argument("--out-suffix", type=str, default="custom")
+    ap.add_argument("--variant", type=str, default="BASE")
+
+    # A/B 옵션 (extend에만 적용)
+    ap.add_argument("--extend-lev-cap", type=float, default=None)
+    ap.add_argument("--extend-min-buy-frac", type=float, default=0.0)
+    ap.add_argument("--extend-buy-every", type=int, default=1)
 
     args = ap.parse_args()
 
-    pt = float(args.profit_target)
+    profit_target = float(args.profit_target)
     max_days = int(args.max_days)
-    sl = float(args.stop_level)
-    tag = fmt_tag(pt, max_days, sl, int(args.max_extend_days))
+    stop_level = float(args.stop_level)
+    max_extend_days = int(args.max_extend_days)  # 현재 엔진에서는 강제 종료는 안 하지만 tag/라벨용 유지
 
-    prices = load_prices()
-    picks = load_picks(args.picks_path, tag)
+    tag = make_tag(profit_target, max_days, stop_level, max_extend_days)
 
-    # 빠른 조회: (Date, Ticker) -> row
-    px = prices.set_index(["Date", "Ticker"], drop=False)
+    prices = read_prices()
+    picks = read_picks(args.picks_path)
 
-    def get_px(date: pd.Timestamp, ticker: str) -> Optional[pd.Series]:
-        key = (date, ticker)
-        if key in px.index:
-            return px.loc[key]
-        return None
+    # 날짜별로 빠르게 접근
+    day_groups = {d: g.set_index("Ticker") for d, g in prices.groupby("Date", sort=False)}
 
-    fixed_daily_buy = float(args.daily_buy) if args.daily_buy is not None else None
-
-    # pick column 결정
-    if args.pick_col:
-        pick_col = args.pick_col
-    else:
-        if args.method not in METHOD_TO_PICKCOL:
-            raise ValueError(f"Unknown method: {args.method}")
-        pick_col = METHOD_TO_PICKCOL[args.method]
-
-    method_key = args.label.strip() if args.label else args.method
-
-    # state
     seed = float(args.initial_seed)
-    peak_equity = seed
-    max_dd = 0.0
 
-    state: Optional[TradeState] = None
-    just_closed_date: Optional[pd.Timestamp] = None
+    in_position = False
+    extending = False
+    holding_day = 0
 
-    trades: List[dict] = []
-    curve: List[dict] = []
+    picked_ticker = None
+    total_shares = 0.0
+    total_invested = 0.0
+    cycle_start_seed = 0.0
+    cycle_unit = 0.0
 
-    skipped_days = 0
-    blocked_same_day = 0
-    missing_price_days = 0
-    entered = 0
-    closed = 0
+    # 레버 기록(진입시 시드 대비 대출 최대치)
+    cycle_min_seed = seed
+    cycle_max_leverage_pct = 0.0
 
-    def mark_equity(curr_date: pd.Timestamp) -> Tuple[float, float]:
-        if state is None:
-            return seed, 0.0
-        row = get_px(curr_date, state.ticker)
-        if row is None:
-            return seed, 0.0
-        val = float(state.shares) * float(row["Close"])
-        return seed + val, val
+    # 재진입 금지(청산 당일)
+    sold_today = False
 
-    for _, r in picks.iterrows():
-        date = r["Date"]
-        skipped = int(r.get("Skipped", 0))
+    curve_rows = []
+    trade_rows = []
 
-        # 포지션 보유 중
-        if state is not None:
-            row = get_px(date, state.ticker)
-            if row is None:
-                missing_price_days += 1
-                eq, val = mark_equity(date)
-                curve.append({
-                    "Date": date, "Method": method_key, "Action": "HOLD_NO_PX",
-                    "Ticker": state.ticker, "Seed": seed, "PosValue": val, "Equity": eq,
-                    "HoldingDays": int(state.holding_days), "Extending": int(state.extending),
-                })
-                peak_equity = max(peak_equity, eq)
-                dd = (eq - peak_equity) / peak_equity if peak_equity > 0 else 0.0
-                max_dd = min(max_dd, dd)
+    # picks의 날짜 범위만 돌리되, 가격이 있는 날에 대해서만 실행
+    sim_dates = sorted(set(picks["Date"].unique()).intersection(set(day_groups.keys())))
+
+    for date in sim_dates:
+        sold_today = False
+
+        day_prices = day_groups.get(date)
+        if day_prices is None or day_prices.empty:
+            continue
+
+        # 오늘 pick
+        today = picks[picks["Date"] == date]
+        pick = None
+        skipped = 1
+        if len(today) > 0:
+            skipped = int(today["Skipped"].iloc[0]) if "Skipped" in today.columns else 0
+            if skipped == 0 and args.pick_col in today.columns:
+                pick = today[args.pick_col].iloc[0]
+                if isinstance(pick, float) and np.isnan(pick):
+                    pick = None
+        if isinstance(pick, str):
+            pick = pick.upper().strip()
+
+        # ====== 보유 중 처리 ======
+        if in_position:
+            if picked_ticker not in day_prices.index:
+                # 가격 없으면 그냥 스킵(홀딩일은 증가시키지 않음: 데이터 누락은 엄격 처리 성격)
+                equity = seed
+                curve_rows.append(
+                    dict(Date=date, Equity=equity, Method=args.label, Variant=args.variant,
+                         InPosition=1, Ticker=picked_ticker, HoldingDays=holding_day)
+                )
                 continue
 
-            state.holding_days += 1
-            high = float(row["High"])
-            close = float(row["Close"])
+            row = day_prices.loc[picked_ticker]
+            close_price = float(row["Close"])
+            high_price = float(row["High"])
 
-            avg_price = (state.invested / state.shares) if state.shares > 0 else np.nan
+            holding_day += 1
 
-            sold = False
-            sell_price = None
-            sell_reason = None
+            # 레버 업데이트
+            cycle_min_seed = min(cycle_min_seed, seed)
+            if cycle_start_seed > 0 and cycle_min_seed < 0:
+                cycle_max_leverage_pct = max(cycle_max_leverage_pct, (-cycle_min_seed) / cycle_start_seed * 100.0)
 
-            # (A) 익절: extending 아닐 때만
-            if not state.extending:
-                tp_px = avg_price * (1.0 + pt)
-                if high >= tp_px:
-                    sold = True
-                    sell_price = tp_px
-                    sell_reason = "TP"
+            avg_price = total_invested / total_shares if total_shares > 0 else close_price
 
-            # (B) max_days 도달 시 분기
-            if (not sold) and (not state.extending) and (state.holding_days >= max_days):
-                cur_ret = (close - avg_price) / avg_price
-                if cur_ret >= sl:
-                    sold = True
-                    sell_price = close
-                    sell_reason = "TIME_EXIT"
+            # ---- max_days 도달 시 분기 ----
+            if (holding_day >= max_days) and (not extending):
+                current_return = (close_price - avg_price) / avg_price
+                if current_return >= stop_level:
+                    # 종가 청산
+                    sell_price = close_price
+                    proceeds = total_shares * sell_price
+                    cycle_return = (proceeds - total_invested) / total_invested if total_invested > 0 else 0.0
+
+                    seed += proceeds
+
+                    trade_rows.append(
+                        dict(
+                            EntryDate=entry_date,
+                            ExitDate=date,
+                            Ticker=picked_ticker,
+                            Invested=total_invested,
+                            Proceeds=proceeds,
+                            CycleReturn=cycle_return,
+                            HoldingDays=holding_day,
+                            LeveragePctMax=cycle_max_leverage_pct,
+                            Method=args.label,
+                            Variant=args.variant,
+                        )
+                    )
+
+                    # 리셋
+                    in_position = False
+                    extending = False
+                    sold_today = True
+                    picked_ticker = None
+                    total_shares = 0.0
+                    total_invested = 0.0
+                    holding_day = 0
+                    cycle_start_seed = 0.0
+                    cycle_unit = 0.0
+                    cycle_min_seed = seed
+                    cycle_max_leverage_pct = 0.0
                 else:
-                    state.extending = True  # 연장 무제한
+                    extending = True
 
-            # (C) 연장 회복 매도: -10%까지 회복하면 매도
-            if (not sold) and state.extending:
-                recover_px = avg_price * (1.0 + sl)  # sl=-0.10 -> 0.9*avg
-                if high >= recover_px:
-                    sold = True
-                    sell_price = recover_px
-                    sell_reason = "RECOVER_EXIT"
+            # ---- extending: 회복하면 손해보고라도(avg*(1+stop_level)) 청산 ----
+            if in_position and extending:
+                trigger = avg_price * (1.0 + stop_level)
+                if high_price >= trigger:
+                    sell_price = trigger
+                    proceeds = total_shares * sell_price
+                    cycle_return = (proceeds - total_invested) / total_invested if total_invested > 0 else 0.0
 
-            if sold:
-                proceeds = float(state.shares) * float(sell_price)
-                seed += proceeds
+                    seed += proceeds
 
-                cycle_ret = (proceeds - state.invested) / state.invested if state.invested > 0 else 0.0
+                    trade_rows.append(
+                        dict(
+                            EntryDate=entry_date,
+                            ExitDate=date,
+                            Ticker=picked_ticker,
+                            Invested=total_invested,
+                            Proceeds=proceeds,
+                            CycleReturn=cycle_return,
+                            HoldingDays=holding_day,
+                            LeveragePctMax=cycle_max_leverage_pct,
+                            Method=args.label,
+                            Variant=args.variant,
+                        )
+                    )
 
-                min_seed = float(state.min_seed_in_cycle)
-                max_loan = max(0.0, -min_seed)
-                lev_pct = (max_loan / state.entry_seed) * 100.0 if state.entry_seed > 0 else np.nan
+                    # 리셋
+                    in_position = False
+                    extending = False
+                    sold_today = True
+                    picked_ticker = None
+                    total_shares = 0.0
+                    total_invested = 0.0
+                    holding_day = 0
+                    cycle_start_seed = 0.0
+                    cycle_unit = 0.0
+                    cycle_min_seed = seed
+                    cycle_max_leverage_pct = 0.0
 
-                trades.append({
-                    "Method": method_key,
-                    "EntryDate": state.entry_date,
-                    "ExitDate": date,
-                    "Ticker": state.ticker,
-                    "SellReason": sell_reason,
-                    "HoldingDays": int(state.holding_days),
-                    "ExtendingExit": int(state.extending),
-                    "CycleUnit": float(state.cycle_unit),
-                    "Invested": float(state.invested),
-                    "Proceeds": float(proceeds),
-                    "CycleReturn": float(cycle_ret),
-                    "EntrySeed": float(state.entry_seed),
-                    "MinSeedInCycle": float(min_seed),
-                    "MaxLoan": float(max_loan),
-                    "LeveragePctMax": float(lev_pct) if np.isfinite(lev_pct) else np.nan,
-                    "SeedAfter": float(seed),
-                })
+            # ---- 매수 로직(하루 1회) ----
+            if in_position:
+                daily_buy_done = False
 
-                curve.append({
-                    "Date": date, "Method": method_key, "Action": f"SELL_{sell_reason}",
-                    "Ticker": state.ticker, "Seed": seed, "PosValue": 0.0, "Equity": seed,
-                    "HoldingDays": int(state.holding_days), "Extending": int(state.extending),
-                    "SellPrice": float(sell_price),
-                })
+                # extend면 옵션 적용, 아니면 기본 규칙(기존: 가격에 따라 full/half/0)
+                invest = 0.0
+                if extending:
+                    every = max(1, int(args.extend_buy_every))
+                    allow_today = (holding_day % every == 0)
 
-                eq = seed
-                peak_equity = max(peak_equity, eq)
-                dd = (eq - peak_equity) / peak_equity if peak_equity > 0 else 0.0
-                max_dd = min(max_dd, dd)
+                    invest = cycle_unit
 
-                state = None
-                just_closed_date = date
-                closed += 1
-                continue  # ✅ 당일 재진입 금지
+                    # 레버 기반 soft brake (extend에만)
+                    if args.extend_lev_cap is not None and float(args.extend_lev_cap) > 0:
+                        lev_cap = float(args.extend_lev_cap)
+                        min_frac = float(args.extend_min_buy_frac)
+                        lev = 0.0
+                        if cycle_start_seed > 0 and seed < 0:
+                            lev = (-seed) / cycle_start_seed  # 0.. (ratio)
+                        scale = 1.0 - (lev / lev_cap)
+                        if scale < min_frac:
+                            scale = min_frac
+                        if scale < 0.0:
+                            scale = 0.0
+                        invest = cycle_unit * scale
 
-            # ✅ 매도 안 했으면: 매일 매수(연장 포함 동일)
-            buy_amt = float(state.cycle_unit)
-            buy_px = close
-            add_sh = buy_amt / buy_px
+                    if allow_today and invest > 0:
+                        shares = invest / close_price
+                        total_shares += shares
+                        total_invested += invest
+                        seed -= invest
+                        daily_buy_done = True
+                else:
+                    # 일반 구간: 기존 규칙
+                    if close_price <= avg_price:
+                        invest = cycle_unit
+                    elif close_price <= avg_price * 1.05:
+                        invest = cycle_unit / 2.0
+                    else:
+                        invest = 0.0
 
-            state.shares += add_sh
-            state.invested += buy_amt
-            seed -= buy_amt
-            state.min_seed_in_cycle = min(state.min_seed_in_cycle, seed)
+                    if invest > 0 and not daily_buy_done:
+                        shares = invest / close_price
+                        total_shares += shares
+                        total_invested += invest
+                        seed -= invest
+                        daily_buy_done = True
 
-            eq, val = mark_equity(date)
-            peak_equity = max(peak_equity, eq)
-            dd = (eq - peak_equity) / peak_equity if peak_equity > 0 else 0.0
-            max_dd = min(max_dd, dd)
+            # curve 기록
+            current_value = total_shares * close_price if in_position else 0.0
+            equity = seed + current_value
+            curve_rows.append(
+                dict(Date=date, Equity=equity, Method=args.label, Variant=args.variant,
+                     InPosition=int(in_position), Ticker=picked_ticker, HoldingDays=holding_day)
+            )
+            continue  # 보유 중이면 오늘 진입은 없음
 
-            curve.append({
-                "Date": date, "Method": method_key, "Action": "HOLD_BUY",
-                "Ticker": state.ticker, "Seed": seed, "PosValue": val, "Equity": eq,
-                "HoldingDays": int(state.holding_days), "Extending": int(state.extending),
-                "AvgPrice": float(state.invested / state.shares) if state.shares > 0 else np.nan,
-                "BuyAmt": buy_amt,
-                "BuyPx": buy_px,
-            })
-            continue
+        # ====== 미보유(진입 전) ======
+        # 청산 당일 재진입 불가 (sold_today True면 skip)
+        if (not in_position) and (not sold_today):
+            if pick is not None and skipped == 0 and pick in day_prices.index:
+                # 진입
+                row = day_prices.loc[pick]
+                entry_price = float(row["Close"])
 
-        # 포지션 없음: 당일 재진입 금지 체크
-        if just_closed_date is not None and date == just_closed_date:
-            blocked_same_day += 1
-            curve.append({
-                "Date": date, "Method": method_key, "Action": "NO_REENTRY_SAME_DAY",
-                "Ticker": "", "Seed": seed, "PosValue": 0.0, "Equity": seed
-            })
-            continue
+                cycle_start_seed = seed  # 진입 시점 기준
+                cycle_unit = cycle_start_seed / max_days if max_days > 0 else 0.0
 
-        # skip
-        if skipped == 1 and not args.shadow_on_skip:
-            skipped_days += 1
-            curve.append({
-                "Date": date, "Method": method_key, "Action": "SKIP",
-                "Ticker": "", "Seed": seed, "PosValue": 0.0, "Equity": seed
-            })
-            peak_equity = max(peak_equity, seed)
-            dd = (seed - peak_equity) / peak_equity if peak_equity > 0 else 0.0
-            max_dd = min(max_dd, dd)
-            continue
+                invest = cycle_unit
+                shares = invest / entry_price
 
-        # pick ticker
-        ticker_pick = r.get(pick_col, None)
-        if ticker_pick is None or (isinstance(ticker_pick, float) and np.isnan(ticker_pick)) or str(ticker_pick).strip() == "":
-            curve.append({
-                "Date": date, "Method": method_key, "Action": "NO_PICK",
-                "Ticker": "", "Seed": seed, "PosValue": 0.0, "Equity": seed
-            })
-            continue
+                total_shares = shares
+                total_invested = invest
+                seed -= invest
 
-        ticker = str(ticker_pick).upper().strip()
-        row = get_px(date, ticker)
-        if row is None:
-            missing_price_days += 1
-            curve.append({
-                "Date": date, "Method": method_key, "Action": "ENTER_FAIL_NO_PX",
-                "Ticker": ticker, "Seed": seed, "PosValue": 0.0, "Equity": seed
-            })
-            continue
+                in_position = True
+                extending = False
+                holding_day = 1
+                picked_ticker = pick
+                entry_date = date
 
-        # ✅ 진입: 진입 시점 seed로 cycle_unit 재계산 (옵션 있으면 고정)
-        entry_seed = seed
-        if fixed_daily_buy is not None:
-            cycle_unit = fixed_daily_buy
-            cycle_unit_mode = "fixed"
-        else:
-            base = entry_seed if entry_seed > 0 else float(args.initial_seed)
-            cycle_unit = base / max_days
-            cycle_unit_mode = "entry_seed_div_max_days"
+                cycle_min_seed = seed
+                cycle_max_leverage_pct = 0.0
+            else:
+                # 아무 것도 안 함
+                pass
 
-        buy_px = float(row["Close"])
-        buy_amt = float(cycle_unit)
-        sh = buy_amt / buy_px
-        seed -= buy_amt
-
-        state = TradeState(
-            entry_date=date,
-            ticker=ticker,
-            cycle_unit=float(cycle_unit),
-            entry_seed=float(entry_seed),
-            shares=float(sh),
-            invested=float(buy_amt),
-            holding_days=1,
-            extending=False,
-            min_seed_in_cycle=float(seed),
+        # curve 기록(미보유)
+        equity = seed
+        curve_rows.append(
+            dict(Date=date, Equity=equity, Method=args.label, Variant=args.variant,
+                 InPosition=0, Ticker=None, HoldingDays=0)
         )
 
-        eq = seed + state.shares * buy_px
-        peak_equity = max(peak_equity, eq)
-        dd = (eq - peak_equity) / peak_equity if peak_equity > 0 else 0.0
-        max_dd = min(max_dd, dd)
+    curve = pd.DataFrame(curve_rows)
+    trades = pd.DataFrame(trade_rows)
 
-        curve.append({
-            "Date": date, "Method": method_key, "Action": "ENTER_BUY",
-            "Ticker": ticker, "Seed": seed, "PosValue": state.shares * buy_px, "Equity": eq,
-            "HoldingDays": 1, "Extending": 0,
-            "BuyAmt": buy_amt, "BuyPx": buy_px,
-            "AvgPrice": float(state.invested / state.shares),
-            "CycleUnitMode": cycle_unit_mode,
-        })
-        entered += 1
+    # 저장
+    out_curve = SIGNALS_DIR / f"sim_engine_curve_{tag}_{args.label}_{args.variant}.parquet"
+    out_trades = SIGNALS_DIR / f"sim_engine_trades_{tag}_{args.label}_{args.variant}.parquet"
 
-    # 종료 시점 평가
-    final_equity = seed
-    open_note = None
+    save_parquet(curve, out_curve)
+    save_parquet(trades, out_trades)
 
-    if state is not None:
-        last_date = picks["Date"].max()
-        row = get_px(last_date, state.ticker)
-        if row is not None:
-            final_equity = seed + float(state.shares) * float(row["Close"])
-        else:
-            final_equity = seed
-        open_note = "OPEN_AT_END"
-
-    trades_df = pd.DataFrame(trades)
-    curve_df = pd.DataFrame(curve)
-
-    closed_trades = trades_df.copy()
-    n_closed = int(len(closed_trades))
-    win_rate = float((closed_trades["CycleReturn"] > 0).mean()) if n_closed > 0 else 0.0
-    avg_ret = float(closed_trades["CycleReturn"].mean()) if n_closed > 0 else 0.0
-    avg_hold = float(closed_trades["HoldingDays"].mean()) if n_closed > 0 else 0.0
-
-    avg_lev = float(closed_trades["LeveragePctMax"].replace([np.inf, -np.inf], np.nan).dropna().mean()) if n_closed > 0 else 0.0
-    max_lev = float(closed_trades["LeveragePctMax"].replace([np.inf, -np.inf], np.nan).dropna().max()) if n_closed > 0 else 0.0
-
-    avg_cycle_unit = float(closed_trades["CycleUnit"].mean()) if n_closed > 0 else 0.0
-    max_cycle_unit = float(closed_trades["CycleUnit"].max()) if n_closed > 0 else 0.0
-
-    summary = {
-        "updated_at_utc": now_utc_iso(),
-        "label": method_key,
-        "tag": tag,
-        "pick_col": pick_col,
-        "picks_path": args.picks_path,
-        "initial_seed": float(args.initial_seed),
-        "final_equity": float(final_equity),
-        "seed_multiple": float(final_equity / float(args.initial_seed)) if args.initial_seed != 0 else np.nan,
-        "total_return": float(final_equity / float(args.initial_seed) - 1.0) if args.initial_seed != 0 else np.nan,
-        "max_drawdown": float(max_dd),
-        "trades_closed": n_closed,
-        "win_rate_closed": win_rate,
-        "avg_cycle_return_closed": avg_ret,
-        "avg_holding_days_closed": avg_hold,
-        "avg_leverage_pct_closed": avg_lev,
-        "max_leverage_pct_closed": max_lev,
-        "cycle_unit_mode": ("fixed" if fixed_daily_buy is not None else "entry_seed_div_max_days"),
-        "fixed_daily_buy": float(fixed_daily_buy) if fixed_daily_buy is not None else None,
-        "avg_cycle_unit_closed": avg_cycle_unit,
-        "max_cycle_unit_closed": max_cycle_unit,
-        "entered_days": int(entered),
-        "closed_trades_count": int(closed),
-        "skipped_days": int(skipped_days),
-        "blocked_same_day_reentry": int(blocked_same_day),
-        "missing_price_days": int(missing_price_days),
-        "shadow_on_skip": bool(args.shadow_on_skip),
-        "open_note": open_note,
-    }
-
-    SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = f"_{args.out_suffix}" if str(args.out_suffix).strip() else ""
-
-    out_trades_parq = SIGNAL_DIR / f"sim_engine_trades_{tag}_{method_key}{suffix}.parquet"
-    out_trades_csv = SIGNAL_DIR / f"sim_engine_trades_{tag}_{method_key}{suffix}.csv"
-    out_curve_parq = SIGNAL_DIR / f"sim_engine_curve_{tag}_{method_key}{suffix}.parquet"
-    out_curve_csv = SIGNAL_DIR / f"sim_engine_curve_{tag}_{method_key}{suffix}.csv"
-    out_summary_json = SIGNAL_DIR / f"sim_engine_summary_{tag}_{method_key}{suffix}.json"
-
-    saved_trades = safe_save(trades_df, out_trades_parq, out_trades_csv)
-    saved_curve = safe_save(curve_df, out_curve_parq, out_curve_csv)
-    out_summary_json.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
-
-    print(f"[DONE] trades -> {saved_trades}")
-    print(f"[DONE] curve  -> {saved_curve}")
-    print(f"[DONE] summary-> {out_summary_json}")
-    print(f"[SUMMARY] final_equity={summary['final_equity']:.2f}  seed_multiple={summary['seed_multiple']:.4f}  "
-          f"maxDD={summary['max_drawdown']:.4f}  maxLev%={summary['max_leverage_pct_closed']:.2f}")
+    print("=" * 60)
+    print("[DONE] simulate_single_position_engine")
+    print("curve:", out_curve, "rows=", len(curve))
+    print("trades:", out_trades, "rows=", len(trades))
+    if len(trades) > 0:
+        print("final equity:", float(curve["Equity"].iloc[-1]))
+        print("seed multiple(all):", float(curve["Equity"].iloc[-1] / float(args.initial_seed)))
+        print("max leverage pct(closed):", float(pd.to_numeric(trades["LeveragePctMax"], errors="coerce").max()))
+    print("=" * 60)
 
 
 if __name__ == "__main__":
