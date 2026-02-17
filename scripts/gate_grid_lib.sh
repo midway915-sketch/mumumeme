@@ -5,11 +5,8 @@ gg_trim() { echo "$1" | xargs; }
 gg_safe() { echo "$1" | sed 's/\./p/g' | sed 's/-/m/g'; }
 
 gg_find_one() {
-  # usage: gg_find_one "predict_gate.py"
   local name="$1"
-  local found
-  found="$(find . -maxdepth 8 -type f -iname "${name}" | head -n 1 || true)"
-  echo "${found}"
+  find . -maxdepth 8 -type f -iname "${name}" | head -n 1 || true
 }
 
 gg_require_env() {
@@ -23,12 +20,7 @@ gg_require_env() {
 }
 
 gg_run_one() {
-  local MODE="$1"
-  local TMAX="$2"
-  local UQ="$3"
-  local RANK="$4"
-  local PRED="$5"
-  local SIM="$6"
+  local MODE="$1" TMAX="$2" UQ="$3" RANK="$4" PRED="$5" SIM="$6"
 
   local TMAX_T UQ_T RANK_T SUFFIX
   TMAX_T="$(gg_safe "$(gg_trim "$TMAX")")"
@@ -53,6 +45,9 @@ gg_run_one() {
     --lambda-tail "${LAMBDA_TAIL}" \
     --out-suffix "${SUFFIX}"
 
+  local PICKS="data/signals/picks_${TAG}_gate_${SUFFIX}.csv"
+
+  # --- BASE
   python "${SIM}" \
     --profit-target "${PROFIT_TARGET}" \
     --max-days "${HOLDING_DAYS}" \
@@ -60,20 +55,51 @@ gg_run_one() {
     --max-extend-days "${MAX_EXTEND_DAYS}" \
     --method custom \
     --pick-col pick_custom \
-    --picks-path "data/signals/picks_${TAG}_gate_${SUFFIX}.csv" \
+    --picks-path "${PICKS}" \
     --label "${SUFFIX}" \
     --out-suffix "${SUFFIX}" \
+    --variant "BASE" \
+    --initial-seed 40000000
+
+  # --- A: extend soft brake
+  python "${SIM}" \
+    --profit-target "${PROFIT_TARGET}" \
+    --max-days "${HOLDING_DAYS}" \
+    --stop-level "${STOP_LEVEL}" \
+    --max-extend-days "${MAX_EXTEND_DAYS}" \
+    --method custom \
+    --pick-col pick_custom \
+    --picks-path "${PICKS}" \
+    --label "${SUFFIX}" \
+    --out-suffix "${SUFFIX}" \
+    --variant "A" \
+    --extend-lev-cap 0.80 \
+    --extend-min-buy-frac 0.10 \
+    --extend-buy-every 1 \
+    --initial-seed 40000000
+
+  # --- B: extend buy every 2 days
+  python "${SIM}" \
+    --profit-target "${PROFIT_TARGET}" \
+    --max-days "${HOLDING_DAYS}" \
+    --stop-level "${STOP_LEVEL}" \
+    --max-extend-days "${MAX_EXTEND_DAYS}" \
+    --method custom \
+    --pick-col pick_custom \
+    --picks-path "${PICKS}" \
+    --label "${SUFFIX}" \
+    --out-suffix "${SUFFIX}" \
+    --variant "B" \
+    --extend-lev-cap 1.00 \
+    --extend-min-buy-frac 0.25 \
+    --extend-buy-every 2 \
     --initial-seed 40000000
 }
 
 run_gate_grid() {
   gg_require_env
-
-  # 워크스페이스 루트 기준 실행
   cd "${GITHUB_WORKSPACE:-.}" || true
 
-  echo "PWD=$(pwd)"
-  echo "=== find scripts ==="
   local PRED SIM
   PRED="$(gg_find_one "predict_gate.py")"
   SIM="$(gg_find_one "simulate_single_position_engine.py")"
@@ -82,17 +108,16 @@ run_gate_grid() {
   echo "[INFO] SIM=${SIM}"
 
   if [ -z "${PRED}" ]; then
-    echo "[ERROR] predict_gate.py not found anywhere."
+    echo "[ERROR] predict_gate.py not found"
     git ls-files | grep -i "predict_gate.py" || true
     exit 1
   fi
   if [ -z "${SIM}" ]; then
-    echo "[ERROR] simulate_single_position_engine.py not found anywhere."
+    echo "[ERROR] simulate_single_position_engine.py not found"
     git ls-files | grep -i "simulate_single_position_engine.py" || true
     exit 1
   fi
 
-  # 리스트 파싱
   IFS=',' read -ra TAILS <<< "${TAIL_MAX_LIST}"
   IFS=',' read -ra UQS   <<< "${U_QUANTILE_LIST}"
   IFS=',' read -ra RANKS <<< "${RANK_BY_LIST}"
@@ -101,15 +126,13 @@ run_gate_grid() {
   BASE_T="$(gg_trim "${TAILS[0]}")"
   BASE_Q="$(gg_trim "${UQS[0]}")"
 
-  local TAIL_OK_LOCAL="${TAIL_OK:-0}"
-
-  # 1) baseline: none (기준 없음)
+  # 1) none
   for R in "${RANKS[@]}"; do
     gg_run_one "none" "${BASE_T}" "${BASE_Q}" "${R}" "${PRED}" "${SIM}"
   done
 
-  # 2) tail gate (tail 모델 있을 때만)
-  if [ "${TAIL_OK_LOCAL}" = "1" ]; then
+  # 2) tail
+  if [ "${TAIL_OK:-0}" = "1" ]; then
     for T in "${TAILS[@]}"; do
       for R in "${RANKS[@]}"; do
         gg_run_one "tail" "${T}" "${BASE_Q}" "${R}" "${PRED}" "${SIM}"
@@ -119,15 +142,15 @@ run_gate_grid() {
     echo "[SKIP] tail gates skipped (TAIL_OK=0)"
   fi
 
-  # 3) utility gate
+  # 3) utility
   for Q in "${UQS[@]}"; do
     for R in "${RANKS[@]}"; do
       gg_run_one "utility" "${BASE_T}" "${Q}" "${R}" "${PRED}" "${SIM}"
     done
   done
 
-  # 4) tail + utility gate (tail 모델 있을 때만)
-  if [ "${TAIL_OK_LOCAL}" = "1" ]; then
+  # 4) tail_utility
+  if [ "${TAIL_OK:-0}" = "1" ]; then
     for T in "${TAILS[@]}"; do
       for Q in "${UQS[@]}"; do
         for R in "${RANKS[@]}"; do
@@ -139,7 +162,5 @@ run_gate_grid() {
     echo "[SKIP] tail_utility gates skipped (TAIL_OK=0)"
   fi
 
-  echo ""
   echo "[DONE] gate grid finished for TAG=${TAG}"
-  ls -la data/signals | tail -n 200 || true
 }
