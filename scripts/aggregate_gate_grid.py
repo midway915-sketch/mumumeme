@@ -2,143 +2,110 @@
 from __future__ import annotations
 
 import argparse
-import glob
 from pathlib import Path
-import pandas as pd
+import glob
 import numpy as np
+import pandas as pd
 
 
-def to_float(x, default: float = 0.0) -> float:
-    """
-    Robust scalar converter.
-    Accepts scalar, Series, list-like; returns float.
-    """
+def _safe_float(x, default=np.nan) -> float:
     try:
-        if x is None:
-            return float(default)
-        if isinstance(x, (int, float, np.number)):
-            v = float(x)
-            return v if np.isfinite(v) else float(default)
-        if isinstance(x, pd.Series):
-            v = pd.to_numeric(x, errors="coerce").dropna()
-            if len(v) == 0:
-                return float(default)
-            vv = float(v.iloc[-1])
-            return vv if np.isfinite(vv) else float(default)
-        # list/array
-        s = pd.Series(x)
-        v = pd.to_numeric(s, errors="coerce").dropna()
-        if len(v) == 0:
-            return float(default)
-        vv = float(v.iloc[-1])
-        return vv if np.isfinite(vv) else float(default)
+        v = float(x)
+        return v
     except Exception:
         return float(default)
 
 
-def read_csv_safe(path: str) -> pd.DataFrame:
-    return pd.read_csv(path)
-
-
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Aggregate gate_summary_*.csv into one table + top selection.")
-    ap.add_argument("--signals-dir", type=str, default="data/signals")
-    ap.add_argument("--out-aggregate", type=str, default="data/signals/gate_grid_aggregate.csv")
-    ap.add_argument("--out-top", type=str, default="data/signals/gate_grid_top_by_recent10y.csv")
-    ap.add_argument("--pattern", type=str, default="gate_summary_*.csv")
-    ap.add_argument("--topn", type=int, default=20)
-    ap.add_argument("--penalty-alpha", type=float, default=0.0, help="return_penalty = alpha * leverage_pct")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--signals-dir", default="data/signals", type=str)
+    ap.add_argument("--pattern", default="gate_summary_*.csv", type=str)
+    ap.add_argument("--out-aggregate", default="data/signals/gate_grid_aggregate.csv", type=str)
+    ap.add_argument("--out-top", default="data/signals/gate_grid_top_by_recent10y.csv", type=str)
+    ap.add_argument("--topn", default=30, type=int)
+
+    ap.add_argument("--lev-cap", default=1.0, type=float, help="Filter: Max_LeveragePct_Closed <= lev-cap (1.0=100%).")
+    ap.add_argument("--prefer-adjusted", default="true", type=str, help="true|false: rank by Adj_Recent10Y_SeedMultiple if present.")
     args = ap.parse_args()
 
     sig = Path(args.signals_dir)
-    paths = sorted(glob.glob(str(sig / args.pattern)))
+    paths = sorted(glob.glob(str(sig / "**" / args.pattern), recursive=True))
     if not paths:
-        raise SystemExit(f"[ERROR] no {args.pattern} found in {sig}")
+        raise SystemExit(f"[ERROR] no {args.pattern} found under {sig}")
 
-    rows = []
+    dfs = []
     for p in paths:
         try:
-            df = read_csv_safe(p)
-            if df.empty:
+            df = pd.read_csv(p)
+            if len(df) == 0:
                 continue
-            r = df.iloc[0].to_dict()
-            r["_path"] = p
-            rows.append(r)
+            df["__source__"] = str(p)
+            dfs.append(df)
         except Exception as e:
-            print(f"[WARN] failed reading {p}: {e}")
+            print(f"[WARN] skip {p}: {e}")
 
-    if not rows:
-        raise SystemExit("[ERROR] all gate_summary files unreadable/empty")
+    if not dfs:
+        raise SystemExit("[ERROR] summary csv files found but none readable.")
 
-    out = pd.DataFrame(rows)
+    out = pd.concat(dfs, ignore_index=True)
 
-    # --- normalize expected columns (if missing, create) ---
-    for c in [
-        "Recent10Y_SeedMultiple",
-        "SeedMultiple",
-        "MaxExtendDaysObserved",
-        "MaxHoldingDaysObserved",
-        "CycleCount",
-        "SuccessRate",
-        "MaxLeveragePct",
+    # normalize numeric cols
+    num_cols = [
+        "SeedMultiple", "Recent10Y_SeedMultiple",
+        "Adj_SeedMultiple", "Adj_Recent10Y_SeedMultiple",
+        "MaxHoldingDaysObserved", "Max_Extend_Over_MaxDays",
+        "SuccessRate", "CycleCount", "ClosedCycleCount",
         "Max_LeveragePct_Closed",
-        "Max_Extend_Over_MaxDays",
-    ]:
-        if c not in out.columns:
-            out[c] = np.nan
+        "ProfitTarget", "MaxHoldingDays", "StopLevel",
+    ]
+    for c in num_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    # Prefer new names from summarize_sim_trades.py if present
-    # We'll compute "effective" leverage/extend columns for scoring
-    lev_vals = []
-    ext_vals = []
-    succ_vals = []
-    cyc_vals = []
+    # leverage cap filter
+    lev_cap = float(args.lev_cap)
+    if "Max_LeveragePct_Closed" in out.columns:
+        lev = out["Max_LeveragePct_Closed"].fillna(0.0)
+        out = out.loc[lev <= lev_cap].copy()
+    else:
+        # if missing, keep all
+        pass
 
-    for _, row in out.iterrows():
-        # leverage
-        lev = to_float(row.get("MaxLeveragePct", np.nan), default=np.nan)
-        if not np.isfinite(lev):
-            lev = to_float(row.get("Max_LeveragePct_Closed", np.nan), default=0.0)
-        lev_vals.append(lev if np.isfinite(lev) else 0.0)
+    if out.empty:
+        raise SystemExit(f"[ERROR] After lev-cap filter <= {lev_cap}, no rows remain.")
 
-        # extend over maxdays
-        ext = to_float(row.get("MaxExtendDaysObserved", np.nan), default=np.nan)
-        if not np.isfinite(ext):
-            ext = to_float(row.get("Max_Extend_Over_MaxDays", np.nan), default=0.0)
-        ext_vals.append(ext if np.isfinite(ext) else 0.0)
+    prefer_adj = str(args.prefer_adjusted).lower() == "true"
 
-        # success rate
-        succ = to_float(row.get("SuccessRate", np.nan), default=0.0)
-        succ_vals.append(succ)
+    rank_col = None
+    if prefer_adj and "Adj_Recent10Y_SeedMultiple" in out.columns and out["Adj_Recent10Y_SeedMultiple"].notna().any():
+        rank_col = "Adj_Recent10Y_SeedMultiple"
+    elif "Recent10Y_SeedMultiple" in out.columns and out["Recent10Y_SeedMultiple"].notna().any():
+        rank_col = "Recent10Y_SeedMultiple"
+    elif prefer_adj and "Adj_SeedMultiple" in out.columns and out["Adj_SeedMultiple"].notna().any():
+        rank_col = "Adj_SeedMultiple"
+    elif "SeedMultiple" in out.columns and out["SeedMultiple"].notna().any():
+        rank_col = "SeedMultiple"
+    else:
+        # fallback: success then seed
+        if "SuccessRate" in out.columns:
+            rank_col = "SuccessRate"
 
-        # cycle count
-        cyc = to_float(row.get("CycleCount", np.nan), default=0.0)
-        cyc_vals.append(cyc)
+    out["RankBy"] = rank_col if rank_col else ""
 
-    out["LeveragePct_eff"] = lev_vals
-    out["ExtendOverMax_eff"] = ext_vals
-    out["SuccessRate_eff"] = succ_vals
-    out["CycleCount_eff"] = cyc_vals
+    # sort
+    if rank_col and rank_col in out.columns:
+        out_sorted = out.sort_values([rank_col], ascending=False).reset_index(drop=True)
+    else:
+        out_sorted = out.reset_index(drop=True)
 
-    # --- scoring: prioritize recent 10y seed multiple, optionally penalize leverage ---
-    out["Recent10Y_SeedMultiple_num"] = pd.to_numeric(out["Recent10Y_SeedMultiple"], errors="coerce")
-    out["SeedMultiple_num"] = pd.to_numeric(out["SeedMultiple"], errors="coerce")
-
-    # choose a primary metric (recent10y if available else overall)
-    out["PrimarySeedMultiple"] = out["Recent10Y_SeedMultiple_num"].combine_first(out["SeedMultiple_num"])
-
-    alpha = float(args.penalty_alpha)
-    out["AdjustedScore"] = out["PrimarySeedMultiple"] - alpha * (out["LeveragePct_eff"] / 100.0)
-
-    # save aggregate
     Path(args.out_aggregate).parent.mkdir(parents=True, exist_ok=True)
-    out.sort_values(["AdjustedScore", "PrimarySeedMultiple"], ascending=False).to_csv(args.out_aggregate, index=False)
-    print(f"[DONE] wrote aggregate: {args.out_aggregate} rows={len(out)}")
+    out_sorted.to_csv(args.out_aggregate, index=False)
 
-    # top table
-    top = out.sort_values(["AdjustedScore", "PrimarySeedMultiple"], ascending=False).head(int(args.topn)).copy()
+    top = out_sorted.head(int(args.topn)).copy()
     top.to_csv(args.out_top, index=False)
-    print(f"[DONE] wrote top: {args.out_top} rows={len(top)}")
+
+    print(f"[DONE] aggregate: {args.out_aggregate} rows={len(out_sorted)} rank_by={rank_col}")
+    print(f"[DONE] top      : {args.out_top} rows={len(top)}")
 
 
 if __name__ == "__main__":
