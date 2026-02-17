@@ -7,12 +7,10 @@ set -euo pipefail
 trim() { awk '{$1=$1;print}'; }
 
 split_csv() {
-  # usage: split_csv "0.1,0.2, 0.3"
   echo "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF>0{print}'
 }
 
 tok() {
-  # float -> token (0.75 -> 0p75, -0.10 -> m0p10)
   python - <<'PY' "$1"
 import sys
 x=float(sys.argv[1])
@@ -23,7 +21,6 @@ PY
 }
 
 build_tag() {
-  # profit_target max_days stop_level max_extend_days
   python - <<'PY' "$1" "$2" "$3" "$4"
 import sys
 pt=float(sys.argv[1])
@@ -48,10 +45,10 @@ run_one_gate() {
 
   local tag; tag="$(build_tag "$pt" "$h" "$sl" "$ex")"
 
-  # ✅ 다운스트림이 찾는 suffix 규칙을 "고정"한다 (gamma 같은 거 파일명에 절대 안 넣음)
+  # ✅ downstream expected suffix (NO gamma in filename)
   local suffix="${mode}_t$(tok "$tail_max")_q$(tok "$u_q")_r${rank_by}"
 
-  # ✅ 파일명도 downstream 기대값으로 강제
+  # ✅ force exact picks path
   local picks="data/signals/picks_${tag}_gate_${suffix}.csv"
 
   echo "=============================="
@@ -63,7 +60,7 @@ run_one_gate() {
 
   mkdir -p data/signals
 
-  # ---- predict_gate: 반드시 picks 파일을 기대 이름으로 생성하게 강제 ----
+  # ---- predict_gate: force to create the exact picks filename ----
   python scripts/predict_gate.py \
     --profit-target "$pt" \
     --max-days "$h" \
@@ -78,7 +75,6 @@ run_one_gate() {
     --suffix "$suffix" \
     --out-csv "$picks"
 
-  # ---- hard check (여기서 없으면 predict_gate 저장이 안 된 것) ----
   if [ ! -f "$picks" ]; then
     echo "[ERROR] predict_gate did not create picks: $picks"
     echo "[DEBUG] list data/signals (picks*):"
@@ -86,14 +82,13 @@ run_one_gate() {
     exit 1
   fi
 
-  # ---- simulate (너 repo의 simulate CLI에 맞게 호출) ----
-  # 아래는 '일반적인' 형태고, 네 simulate 파일의 인자명과 다르면 여기만 맞추면 됨.
+  # ---- simulate: your engine requires --picks-path ----
   python scripts/simulate_single_position_engine.py \
     --profit-target "$pt" \
     --max-days "$h" \
     --stop-level "$sl" \
     --max-extend-days "$ex" \
-    --picks-csv "$picks" \
+    --picks-path "$picks" \
     --suffix "$suffix" \
     --tag "$tag"
 
