@@ -1,138 +1,179 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# scripts/run_grid_workflow.sh
+# Required envs
+: "${PROFIT_TARGET:?}"
+: "${MAX_DAYS:?}"
+: "${STOP_LEVEL:?}"
+: "${MAX_EXTEND_DAYS:?}"
+: "${P_TAIL_THRESHOLDS:?}"
+: "${UTILITY_QUANTILES:?}"
+: "${RANK_METRICS:?}"
+: "${LAMBDA_TAIL:?}"
+: "${GATE_MODES:?}"
 
-PT="${PROFIT_TARGET:?}"
-H="${MAX_DAYS:?}"
-SL="${STOP_LEVEL:?}"
-EX="${MAX_EXTEND_DAYS:?}"
+OUT_DIR="data/signals"
+FEATURES_PARQ="data/features/features_model.parquet"
+FEATURES_CSV="data/features/features_model.csv"
 
-P_TAILS="${P_TAIL_THRESHOLDS:?}"          # e.g. "0.20,0.30"
-U_QS="${UTILITY_QUANTILES:?}"             # e.g. "0.75,0.60,0.50"
-RANKS="${RANK_METRICS:?}"                 # e.g. "utility,ret_score,p_success"
-LAM="${LAMBDA_TAIL:?}"                    # e.g. "0.05"
-
-GATE_MODES="${GATE_MODES:-none,tail,utility,tail_utility}"
-
-TAG="pt$(python - <<PY
-pt=float("$PT"); print(int(round(pt*100)))
-PY
-)_h${H}_sl$(python - <<PY
-sl=float("$SL"); print(int(round(abs(sl)*100)))
-PY
-)_ex${EX}"
-
+# tools
 PRED="scripts/predict_gate.py"
 SIM="scripts/simulate_single_position_engine.py"
 SUM="scripts/summarize_sim_trades.py"
 
-if [ ! -f "$PRED" ]; then echo "[ERROR] $PRED not found"; exit 1; fi
-if [ ! -f "$SIM" ]; then echo "[ERROR] $SIM not found"; exit 1; fi
-if [ ! -f "$SUM" ]; then echo "[ERROR] $SUM not found"; exit 1; fi
+if [ ! -f "$PRED" ]; then echo "[ERROR] missing $PRED"; exit 1; fi
+if [ ! -f "$SIM" ]; then echo "[ERROR] missing $SIM"; exit 1; fi
+if [ ! -f "$SUM" ]; then echo "[ERROR] missing $SUM"; exit 1; fi
 
-mkdir -p data/signals
+mkdir -p "$OUT_DIR"
 
-# tail model 존재 확인 -> 없으면 tail 계열 모드 스킵
-TAIL_OK=0
-if [ -f "app/tail_model_${TAG}.pkl" ] && [ -f "app/tail_scaler_${TAG}.pkl" ]; then
-  TAIL_OK=1
-elif [ -f "app/tail_model.pkl" ] && [ -f "app/tail_scaler.pkl" ]; then
-  TAIL_OK=1
+has_tail_model="0"
+if [ -f "app/tail_model.pkl" ] && [ -f "app/tail_scaler.pkl" ]; then
+  has_tail_model="1"
 fi
 
-if [ "$TAIL_OK" = "0" ]; then
-  echo "[WARN] tail model missing -> will skip tail / tail_utility modes"
-fi
+# helper: trim spaces
+trim() { echo "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
-# CSV split helper
-split_csv () {
-  local s="$1"
+# helper: normalize floats for suffix
+fkey() {
   python - <<PY
-s="$s"
-print("\n".join([x.strip() for x in s.split(",") if x.strip()]))
+x=float("$1")
+s=str(x)
+s=s.replace("-","m").replace(".","p")
+print(s)
 PY
 }
 
-# sanitize suffix for file name
-sanitize () {
-  python - <<PY
-import re
-s=r"""$1"""
-print(re.sub(r"[^A-Za-z0-9_.-]+","_",s))
+# TAG from PT/H/SL/EX (match your yml logic)
+TAG="pt$(python - <<PY
+print(int(round(float("$PROFIT_TARGET")*100)))
 PY
-}
+)_h${MAX_DAYS}_sl$(python - <<PY
+print(int(round(abs(float("$STOP_LEVEL"))*100)))
+PY
+)_ex${MAX_EXTEND_DAYS}"
 
-for mode in $(split_csv "$GATE_MODES"); do
-  if [ "$TAIL_OK" = "0" ] && { [ "$mode" = "tail" ] || [ "$mode" = "tail_utility" ]; }; then
-    continue
+echo "[INFO] TAG=$TAG"
+
+# Parse lists
+IFS=',' read -r -a MODE_ARR <<< "$GATE_MODES"
+IFS=',' read -r -a TAIL_ARR <<< "$P_TAIL_THRESHOLDS"
+IFS=',' read -r -a UQ_ARR <<< "$UTILITY_QUANTILES"
+IFS=',' read -r -a RM_ARR <<< "$RANK_METRICS"
+
+for m0 in "${MODE_ARR[@]}"; do
+  mode="$(trim "$m0")"
+  if [ -z "$mode" ]; then continue; fi
+
+  if [[ "$mode" == "tail" || "$mode" == "tail_utility" ]]; then
+    if [ "$has_tail_model" != "1" ]; then
+      echo "[SKIP] mode=$mode (tail model missing)"
+      continue
+    fi
   fi
 
-  for rank_by in $(split_csv "$RANKS"); do
-    for tail_max in $(split_csv "$P_TAILS"); do
+  for t0 in "${TAIL_ARR[@]}"; do
+    tail_thr="$(trim "$t0")"
+    [ -z "$tail_thr" ] && continue
 
-      # utility 모드가 아니면 u_q는 의미 없지만, suffix 통일 위해 그대로 루프
-      # (원하면 none/tail에서는 u_q 루프를 1회로 줄일 수도 있음)
-      for u_qs in "$U_QS"; do
-        # u_qs는 "0.75,0.60,0.50" 전체 문자열을 그대로 predict_gate에 넘김
-        # suffix는 보기 좋게 q0p75_0p60_0p50 로 표기
-        U_TAG="$(python - <<PY
-s="$u_qs"
-parts=[p.strip() for p in s.split(",") if p.strip()]
-def qtag(x):
-  x=float(x)
-  return "q"+str(int(round(x*100))).replace("-", "m")
-print("_".join(qtag(p) for p in parts))
-PY
-)"
-        base_suffix="${mode}_t$(python - <<PY
-x=float("$tail_max"); print(str(x).replace(".","p"))
-PY
-)_${U_TAG}_r${rank_by}_lam$(python - <<PY
-x=float("$LAM"); print(str(x).replace(".","p"))
-PY
-)"
-        suffix="$(sanitize "$base_suffix")"
+    for uq0 in "${UQ_ARR[@]}"; do
+      uq="$(trim "$uq0")"
+      [ -z "$uq" ] && continue
+
+      for rm0 in "${RM_ARR[@]}"; do
+        rank_by="$(trim "$rm0")"
+        [ -z "$rank_by" ] && continue
+
+        # suffix (stable)
+        tkey="$(fkey "$tail_thr")"
+        uqkey="$(fkey "$uq")"
+        lamkey="$(fkey "$LAMBDA_TAIL")"
+        SUFFIX="${mode}_t${tkey}_q${uqkey}_r${rank_by}_lam${lamkey}"
 
         echo "=============================="
-        echo "[RUN] mode=$mode tail_max=$tail_max u_qs=$u_qs rank_by=$rank_by suffix=$suffix"
+        echo "[RUN] mode=${mode} tail_max=${tail_thr} u_q=${uq} rank_by=${rank_by} suffix=${SUFFIX}"
         echo "=============================="
 
+        # 1) predict -> picks
         python "$PRED" \
-          --profit-target "$PT" --max-days "$H" --stop-level "$SL" --max-extend-days "$EX" \
-          --mode "$mode" --tag "$TAG" --suffix "$suffix" --out-dir "data/signals" \
-          --tail-threshold "$tail_max" --utility-quantile "$u_qs" \
-          --rank-by "$rank_by" --lambda-tail "$LAM"
+          --profit-target "$PROFIT_TARGET" \
+          --max-days "$MAX_DAYS" \
+          --stop-level "$STOP_LEVEL" \
+          --max-extend-days "$MAX_EXTEND_DAYS" \
+          --mode "$mode" \
+          --tag "$TAG" \
+          --suffix "$SUFFIX" \
+          --out-dir "$OUT_DIR" \
+          --features-parq "$FEATURES_PARQ" \
+          --features-csv "$FEATURES_CSV" \
+          --tail-threshold "$tail_thr" \
+          --utility-quantile "$uq" \
+          --rank-by "$rank_by" \
+          --lambda-tail "$LAMBDA_TAIL"
 
-        PICKS="data/signals/picks_${TAG}_gate_${suffix}.csv"
-        if [ ! -f "$PICKS" ]; then
-          echo "[ERROR] picks file missing: $PICKS"
+        # picks path (predict_gate writes standard name)
+        PICKS_CSV="${OUT_DIR}/picks_${TAG}_gate_${SUFFIX}.csv"
+        if [ ! -f "$PICKS_CSV" ]; then
+          echo "[ERROR] picks missing: $PICKS_CSV"
+          ls -la "$OUT_DIR" | sed -n '1,120p'
           exit 1
         fi
 
-        # simulate engine: picks-path 필수인 너 환경 기준으로 호출
+        # 2) simulate -> trades + curve
         python "$SIM" \
-          --profit-target "$PT" --max-days "$H" --stop-level "$SL" --max-extend-days "$EX" \
-          --picks-path "$PICKS" \
-          --out-dir "data/signals" \
+          --picks-path "$PICKS_CSV" \
+          --profit-target "$PROFIT_TARGET" \
+          --max-days "$MAX_DAYS" \
+          --stop-level "$STOP_LEVEL" \
+          --max-extend-days "$MAX_EXTEND_DAYS" \
           --tag "$TAG" \
-          --suffix "$suffix"
+          --suffix "$SUFFIX" \
+          --out-dir "$OUT_DIR"
 
-        TRADES="data/signals/sim_engine_trades_${TAG}_gate_${suffix}.parquet"
-        if [ ! -f "$TRADES" ]; then
-          echo "[ERROR] trades parquet missing: $TRADES"
+        # locate trades/curve (parquet)
+        TRADES_PQ="${OUT_DIR}/sim_engine_trades_${TAG}_gate_${SUFFIX}.parquet"
+        CURVE_PQ="${OUT_DIR}/sim_engine_curve_${TAG}_gate_${SUFFIX}.parquet"
+
+        if [ ! -f "$TRADES_PQ" ]; then
+          echo "[ERROR] trades parquet missing: $TRADES_PQ"
+          echo "[DEBUG] listing sim_engine_trades*:"
+          ls -la "$OUT_DIR"/sim_engine_trades* 2>/dev/null || true
           exit 1
         fi
 
-        python "$SUM" \
-          --trades-path "$TRADES" \
-          --tag "$TAG" \
-          --suffix "$suffix" \
-          --profit-target "$PT" --max-days "$H" --stop-level "$SL" --max-extend-days "$EX" \
-          --out-dir "data/signals"
+        if [ ! -f "$CURVE_PQ" ]; then
+          echo "[WARN] curve parquet missing: $CURVE_PQ (summary will fallback)"
+          CURVE_PQ=""
+        fi
+
+        # 3) summarize -> gate_summary csv
+        if [ -n "$CURVE_PQ" ]; then
+          python "$SUM" \
+            --trades-path "$TRADES_PQ" \
+            --curve-path "$CURVE_PQ" \
+            --tag "$TAG" \
+            --suffix "$SUFFIX" \
+            --profit-target "$PROFIT_TARGET" \
+            --max-days "$MAX_DAYS" \
+            --stop-level "$STOP_LEVEL" \
+            --max-extend-days "$MAX_EXTEND_DAYS" \
+            --out-dir "$OUT_DIR"
+        else
+          python "$SUM" \
+            --trades-path "$TRADES_PQ" \
+            --tag "$TAG" \
+            --suffix "$SUFFIX" \
+            --profit-target "$PROFIT_TARGET" \
+            --max-days "$MAX_DAYS" \
+            --stop-level "$STOP_LEVEL" \
+            --max-extend-days "$MAX_EXTEND_DAYS" \
+            --out-dir "$OUT_DIR"
+        fi
+
       done
     done
   done
 done
 
-echo "[DONE] run_grid_workflow.sh"
+echo "[DONE] grid finished. summaries in $OUT_DIR/gate_summary_*.csv"
