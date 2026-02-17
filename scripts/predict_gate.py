@@ -71,13 +71,11 @@ def _load_tau_cuts(tag: str, max_days: int) -> tuple[int, int, int]:
 
 
 def _require_files(spec: str | None) -> None:
-    """
-    spec: comma-separated file paths.
-    If any missing -> raise FileNotFoundError.
-    """
     if not spec:
         return
     paths = [p.strip() for p in str(spec).split(",") if p.strip()]
+    if not paths:
+        return
     missing = [p for p in paths if not Path(p).exists()]
     if missing:
         raise FileNotFoundError(f"[require-files] Missing: {missing}")
@@ -103,17 +101,18 @@ def main() -> None:
     ap.add_argument("--rank-by", required=True, type=str, choices=["utility", "ret_score", "p_success"])
     ap.add_argument("--lambda-tail", required=True, type=float)
 
-    # ✅ added: keep yml/shell compatible
+    # ✅ 핵심: 값 없이 들어와도 OK
     ap.add_argument(
         "--require-files",
+        nargs="?",
+        const="",
         default="",
         type=str,
-        help="comma-separated paths that must exist before running (used by workflow)",
+        help="comma-separated paths that must exist before running (optional)",
     )
 
     args = ap.parse_args()
 
-    # ✅ enforce required files if passed
     _require_files(args.require_files)
 
     out_dir = Path(args.out_dir)
@@ -127,14 +126,13 @@ def main() -> None:
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
-    # models
     success_model = joblib.load("app/model.pkl")
     success_scaler = joblib.load("app/scaler.pkl")
 
     tail_model = joblib.load("app/tail_model.pkl")
     tail_scaler = joblib.load("app/tail_scaler.pkl")
 
-    tau_models = joblib.load("app/tau_cdf_models.pkl")  # keys: TauLE1/2/3
+    tau_models = joblib.load("app/tau_cdf_models.pkl")
     tau_scaler = joblib.load("app/tau_scaler.pkl")
 
     fallback_feats = [
@@ -159,26 +157,21 @@ def main() -> None:
     p_success = success_model.predict_proba(Xs_s)[:, 1]
     p_tail = tail_model.predict_proba(Xt_s)[:, 1]
 
-    # tau cuts
     cut1, cut2, cut3 = _load_tau_cuts(args.tag, int(args.max_days))
 
-    # CDF probs
     p_le1 = tau_models["TauLE1"].predict_proba(Xtau_s)[:, 1]
     p_le2 = tau_models["TauLE2"].predict_proba(Xtau_s)[:, 1]
     p_le3 = tau_models["TauLE3"].predict_proba(Xtau_s)[:, 1]
 
-    # monotonic clamp
     p_le1 = np.clip(p_le1, 0.0, 1.0)
     p_le2 = np.clip(np.maximum(p_le2, p_le1), 0.0, 1.0)
     p_le3 = np.clip(np.maximum(p_le3, p_le2), 0.0, 1.0)
 
-    # bin probs
     p1 = p_le1
     p2 = np.clip(p_le2 - p_le1, 0.0, 1.0)
     p3 = np.clip(p_le3 - p_le2, 0.0, 1.0)
     p4 = np.clip(1.0 - p_le3, 0.0, 1.0)
 
-    # expected tau from representative mids
     mid1 = max(1.0, cut1 * 0.7)
     mid2 = (cut1 + cut2) / 2.0
     mid3 = (cut2 + cut3) / 2.0
@@ -203,13 +196,11 @@ def main() -> None:
     out["p_tau4"] = pd.to_numeric(p4, errors="coerce")
     out["tau_exp"] = pd.to_numeric(tau_exp, errors="coerce")
 
-    # ret_score
     if "ret_score" in feats.columns:
         out["ret_score"] = pd.to_numeric(feats["ret_score"], errors="coerce").fillna(0.0)
     else:
         out["ret_score"] = out["p_success"].fillna(0.0) - out["p_tail"].fillna(0.0)
 
-    # utility
     lam = float(args.lambda_tail)
     out["utility"] = out["p_success"].fillna(0.0) - lam * out["p_tail"].fillna(0.0)
 
