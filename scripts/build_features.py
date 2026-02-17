@@ -2,259 +2,207 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from datetime import datetime, timezone
-
-import numpy as np
 import pandas as pd
+import numpy as np
 
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
-FEATURE_DIR = DATA_DIR / "features"
+FEAT_DIR = DATA_DIR / "features"
 
-PRICES_PARQUET = RAW_DIR / "prices.parquet"
+PRICES_PARQ = RAW_DIR / "prices.parquet"
 PRICES_CSV = RAW_DIR / "prices.csv"
 
-OUT_PARQUET = FEATURE_DIR / "features.parquet"
-OUT_CSV = FEATURE_DIR / "features.csv"
-META_JSON = FEATURE_DIR / "features_meta.json"
+OUT_PARQ = FEAT_DIR / "features_model.parquet"
+OUT_CSV = FEAT_DIR / "features_model.csv"
 
-MARKET_TICKER = "SPY"
-VIX_TICKER = "^VIX"
-
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+MARKET_TICKER = "SPY"   # market proxy
+VIX_TICKER = "^VIX"     # optional (not required for these features)
 
 
-def normalize_prices(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"])
-    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-    # 기본 컬럼 보장
-    for c in ["Open", "High", "Low", "Close", "AdjClose", "Volume"]:
-        if c not in df.columns:
-            df[c] = np.nan
-    df = df.sort_values(["Ticker", "Date"]).drop_duplicates(["Ticker", "Date"], keep="last").reset_index(drop=True)
-    return df
-
-
-def load_prices() -> pd.DataFrame:
-    if PRICES_PARQUET.exists():
-        df = pd.read_parquet(PRICES_PARQUET)
+def read_prices() -> pd.DataFrame:
+    if PRICES_PARQ.exists():
+        df = pd.read_parquet(PRICES_PARQ)
     elif PRICES_CSV.exists():
         df = pd.read_csv(PRICES_CSV)
     else:
-        raise FileNotFoundError("No prices found. Run scripts/fetch_prices.py first.")
-    return normalize_prices(df)
+        raise FileNotFoundError(f"Missing prices: {PRICES_PARQ} (or {PRICES_CSV})")
+
+    # normalize schema
+    df = df.copy()
+    if "Date" not in df.columns:
+        raise ValueError("prices must include Date column")
+    if "Ticker" not in df.columns:
+        raise ValueError("prices must include Ticker column")
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+
+    # Require essential OHLCV
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    for c in needed:
+        if c not in df.columns:
+            raise ValueError(f"prices missing required column: {c}")
+
+    df = df.dropna(subset=["Date", "Ticker", "Close"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    return df
+
+
+def compute_atr_ratio(g: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = g["High"].astype(float).to_numpy()
+    low = g["Low"].astype(float).to_numpy()
+    close = g["Close"].astype(float).to_numpy()
+    prev_close = np.r_[np.nan, close[:-1]]
+
+    tr1 = high - low
+    tr2 = np.abs(high - prev_close)
+    tr3 = np.abs(low - prev_close)
+    tr = np.nanmax(np.vstack([tr1, tr2, tr3]), axis=0)
+
+    tr_s = pd.Series(tr, index=g.index)
+    atr = tr_s.rolling(n, min_periods=n).mean()
+    atr_ratio = atr / pd.Series(close, index=g.index)
+    return atr_ratio
 
 
 def ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False).mean()
+    return s.ewm(span=span, adjust=False, min_periods=span).mean()
 
 
-def true_range(high: pd.Series, low: pd.Series, prev_close: pd.Series) -> pd.Series:
-    a = high - low
-    b = (high - prev_close).abs()
-    c = (low - prev_close).abs()
-    return pd.concat([a, b, c], axis=1).max(axis=1)
+def compute_ticker_features(g: pd.DataFrame) -> pd.DataFrame:
+    g = g.sort_values("Date").copy()
+    c = pd.to_numeric(g["Close"], errors="coerce")
+    v = pd.to_numeric(g["Volume"], errors="coerce")
 
+    # Drawdown windows
+    roll_max_252 = c.rolling(252, min_periods=252).max()
+    dd_252 = (c / roll_max_252) - 1.0
 
-def compute_atr_ratio(df: pd.DataFrame, atr_window: int = 14) -> pd.Series:
-    prev_close = df["Close"].shift(1)
-    tr = true_range(df["High"], df["Low"], prev_close)
-    atr = tr.rolling(atr_window, min_periods=atr_window).mean()
-    return atr / df["Close"]
+    roll_max_60 = c.rolling(60, min_periods=60).max()
+    dd_60 = (c / roll_max_60) - 1.0
 
+    # ATR ratio
+    atr_ratio = compute_atr_ratio(g, n=14)
 
-def compute_drawdown(close: pd.Series, window: int) -> pd.Series:
-    roll_max = close.rolling(window, min_periods=window).max()
-    return close / roll_max - 1.0
+    # Z-score on 20d
+    ma20 = c.rolling(20, min_periods=20).mean()
+    std20 = c.rolling(20, min_periods=20).std(ddof=0)
+    z = (c - ma20) / std20
 
+    # MACD histogram
+    ema12 = ema(c, 12)
+    ema26 = ema(c, 26)
+    macd = ema12 - ema26
+    signal = ema(macd, 9)
+    macd_hist = macd - signal
 
-def compute_zscore(close: pd.Series, window: int = 20) -> pd.Series:
-    ma = close.rolling(window, min_periods=window).mean()
-    sd = close.rolling(window, min_periods=window).std()
-    return (close - ma) / sd
+    # MA20 slope (5d change rate)
+    ma20_slope = (ma20 / ma20.shift(5)) - 1.0
 
+    # simple momentum score (ret_score) : 20d return
+    ret_score = (c / c.shift(20)) - 1.0
 
-def compute_macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
-    macd = ema(close, fast) - ema(close, slow)
-    sig = ema(macd, signal)
-    return macd - sig
+    out = pd.DataFrame({
+        "Date": g["Date"].values,
+        "Ticker": g["Ticker"].values,
+        "Drawdown_252": dd_252.values,
+        "Drawdown_60": dd_60.values,
+        "ATR_ratio": atr_ratio.values,
+        "Z_score": z.values,
+        "MACD_hist": macd_hist.values,
+        "MA20_slope": ma20_slope.values,
+        "ret_score": ret_score.values,
+        "Volume": v.values,
+        "Close": c.values,
+    })
 
-
-def compute_ma20_slope(close: pd.Series, ma_window: int = 20, slope_lookback: int = 5) -> pd.Series:
-    ma = close.rolling(ma_window, min_periods=ma_window).mean()
-    # 단순 기울기(퍼센트)
-    return (ma - ma.shift(slope_lookback)) / ma.shift(slope_lookback)
-
-
-def compute_market_frames(prices: pd.DataFrame, max_window: int) -> pd.DataFrame:
-    m = prices[prices["Ticker"] == MARKET_TICKER].sort_values("Date").copy()
-    if m.empty:
-        raise ValueError(f"Market ticker {MARKET_TICKER} not found. Run fetch_prices.py --include-extra")
-
-    m["Market_ret_1d"] = m["Close"].pct_change()
-    m["Market_realized_vol_20"] = m["Market_ret_1d"].rolling(20, min_periods=20).std() * np.sqrt(252)
-
-    # drawdown windows(60/252는 킬스위치와 모델에서 유용)
-    m["Market_Drawdown_60"] = compute_drawdown(m["Close"], 60)
-    m["Market_Drawdown_252"] = compute_drawdown(m["Close"], 252)
-
-    m["Market_ATR_ratio"] = compute_atr_ratio(m, atr_window=14)
-
-    out = m[["Date", "Market_ret_1d", "Market_realized_vol_20", "Market_Drawdown_60", "Market_Drawdown_252", "Market_ATR_ratio"]]
     return out
 
 
-def compute_vix_frame(prices: pd.DataFrame) -> pd.DataFrame:
-    v = prices[prices["Ticker"] == VIX_TICKER].sort_values("Date").copy()
-    if v.empty:
-        # VIX 없으면 그냥 NaN으로 붙이기 (죽지 않게)
-        return pd.DataFrame(columns=["Date", "VIX"])
-    v = v[["Date", "Close"]].rename(columns={"Close": "VIX"})
-    return v
+def compute_market_features(prices: pd.DataFrame) -> pd.DataFrame:
+    m = prices.loc[prices["Ticker"] == MARKET_TICKER].sort_values("Date").copy()
+    if m.empty:
+        raise ValueError(f"Market ticker {MARKET_TICKER} not found. Use fetch_prices.py --include-extra")
 
+    c = pd.to_numeric(m["Close"], errors="coerce")
 
-def is_eligible(
-    df_t: pd.DataFrame,
-    min_history_days: int,
-    min_dollar_vol: float,
-) -> tuple[bool, str]:
-    df_t = df_t.dropna(subset=["Close", "Volume"]).copy()
-    if len(df_t) < min_history_days:
-        return False, f"short_history<{min_history_days}"
+    roll_max_252 = c.rolling(252, min_periods=252).max()
+    mdd = (c / roll_max_252) - 1.0
 
-    dvol = (df_t["Close"] * df_t["Volume"]).rolling(20, min_periods=20).median()
-    last = float(dvol.iloc[-1]) if len(dvol) else np.nan
-    if not np.isfinite(last):
-        return False, "no_dollarvol"
-    if last < min_dollar_vol:
-        return False, f"illiquid<{min_dollar_vol:g}"
-    return True, "ok"
+    atr_ratio = compute_atr_ratio(m, n=14)
 
+    out = pd.DataFrame({
+        "Date": m["Date"].values,
+        "Market_Drawdown": mdd.values,
+        "Market_ATR_ratio": atr_ratio.values,
+    }).sort_values("Date").reset_index(drop=True)
 
-def compute_features_for_ticker(df_t: pd.DataFrame) -> pd.DataFrame:
-    df_t = df_t.sort_values("Date").copy()
-    close = df_t["Close"]
-
-    df_t["Drawdown_252"] = compute_drawdown(close, 252)
-    df_t["Drawdown_60"] = compute_drawdown(close, 60)
-    df_t["ATR_ratio"] = compute_atr_ratio(df_t, atr_window=14)
-    df_t["Z_score"] = compute_zscore(close, window=20)
-    df_t["MACD_hist"] = compute_macd_hist(close, 12, 26, 9)
-    df_t["MA20_slope"] = compute_ma20_slope(close, 20, 5)
-
-    return df_t
-
-
-def save_features(df: pd.DataFrame) -> str:
-    FEATURE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        df.to_parquet(OUT_PARQUET, index=False)
-        return f"parquet:{OUT_PARQUET}"
-    except Exception as e:
-        print(f"[WARN] parquet save failed ({e}), saving csv: {OUT_CSV}")
-        df.to_csv(OUT_CSV, index=False)
-        return f"csv:{OUT_CSV}"
+    return out
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-window", type=int, default=252)
-    ap.add_argument("--min-history-days", type=int, default=260)  # 레버ETF 고려(대충 1년+)
-    ap.add_argument("--min-dollar-vol", type=float, default=0.0)  # 처음엔 0으로 두고, 필요하면 올려
-    ap.add_argument("--min-feature-rows", type=int, default=120)  # dropna 이후 최소 남아야 할 행
-    ap.add_argument("--strict-dropna", action="store_true", help="drop rows with any NaN in feature columns")
+    ap.add_argument("--start-date", type=str, default=None, help="only output rows with Date >= start-date (YYYY-MM-DD)")
+    ap.add_argument("--max-window", type=int, default=260, help="max rolling window used (controls lookback)")
+    ap.add_argument("--buffer-days", type=int, default=40, help="extra days added to lookback for safety")
+    ap.add_argument("--min-volume", type=float, default=0.0, help="optional: drop rows with Volume < min-volume")
     args = ap.parse_args()
 
-    prices = load_prices()
+    FEAT_DIR.mkdir(parents=True, exist_ok=True)
 
-    market_feat = compute_market_frames(prices, args.max_window)
-    vix_feat = compute_vix_frame(prices)
+    prices = read_prices()
 
-    tickers = sorted(set(prices["Ticker"].unique().tolist()))
-    # 시장 티커는 피처 생성 대상에서 제외(시장/보조 용도)
-    tickers = [t for t in tickers if t not in (MARKET_TICKER, VIX_TICKER)]
+    # start-date handling: include lookback
+    start_date = None
+    if args.start_date:
+        start_date = pd.to_datetime(args.start_date, errors="coerce")
+        if pd.isna(start_date):
+            raise ValueError(f"Invalid --start-date: {args.start_date}")
 
-    reasons = {}
-    feats = []
+        lookback_days = int(args.max_window + args.buffer_days)
+        compute_start = start_date - pd.Timedelta(days=lookback_days)
+        prices = prices.loc[prices["Date"] >= compute_start].copy()
 
-    def run_with_thresholds(min_hist: int, min_dvol: float) -> int:
-        nonlocal reasons, feats
-        reasons = {}
-        feats = []
+    # compute per-ticker features
+    feats_list = []
+    for t, g in prices.groupby("Ticker", sort=False):
+        feats_list.append(compute_ticker_features(g))
+    feats = pd.concat(feats_list, ignore_index=True)
 
-        for t in tickers:
-            df_t = prices[prices["Ticker"] == t].copy()
-            ok, why = is_eligible(df_t, min_hist, min_dvol)
-            if not ok:
-                reasons[why] = reasons.get(why, 0) + 1
-                continue
+    # market features merge
+    market = compute_market_features(prices)
 
-            df_f = compute_features_for_ticker(df_t)
-            # market/vix merge
-            df_f = df_f.merge(market_feat, on="Date", how="left").merge(vix_feat, on="Date", how="left")
+    feats = feats.sort_values(["Date", "Ticker"]).reset_index(drop=True)
+    market = market.sort_values("Date").reset_index(drop=True)
 
-            df_f["Ticker"] = t
+    feats = feats.merge(market, on="Date", how="left")
 
-            # strict mode: feature NaN 제거
-            feature_cols = [c for c in df_f.columns if c not in ("Date", "Ticker", "Open", "High", "Low", "Close", "AdjClose", "Volume")]
-            if args.strict_dropna:
-                df_f = df_f.dropna(subset=feature_cols).reset_index(drop=True)
+    # strict NaN drop (feature completeness)
+    FEATURE_COLS = [
+        "Drawdown_252", "Drawdown_60", "ATR_ratio", "Z_score",
+        "MACD_hist", "MA20_slope", "Market_Drawdown", "Market_ATR_ratio",
+        "ret_score",
+    ]
 
-            if len(df_f) < args.min_feature_rows:
-                reasons["too_few_feature_rows"] = reasons.get("too_few_feature_rows", 0) + 1
-                continue
+    # optional volume filter
+    if args.min_volume and args.min_volume > 0:
+        feats = feats.loc[pd.to_numeric(feats["Volume"], errors="coerce") >= float(args.min_volume)].copy()
 
-            keep_cols = ["Date", "Ticker"] + feature_cols
-            feats.append(df_f[keep_cols])
+    feats = feats.dropna(subset=FEATURE_COLS + ["Date", "Ticker"]).copy()
 
-        return len(feats)
+    # output filter to start-date
+    if start_date is not None:
+        feats = feats.loc[pd.to_datetime(feats["Date"]) >= start_date].copy()
 
-    # 1차 시도
-    n_ok = run_with_thresholds(args.min_history_days, args.min_dollar_vol)
+    feats = feats.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
 
-    # 0개면 자동 완화(너처럼 액션에서 디버깅 힘들 때 이게 진짜 도움됨)
-    if n_ok == 0:
-        print("[WARN] 0 eligible tickers. Relaxing thresholds and retrying...")
-        relaxed_min_hist = max(90, min(args.min_history_days, args.max_window + 30))
-        n_ok = run_with_thresholds(relaxed_min_hist, 0.0)
+    # save
+    feats.to_parquet(OUT_PARQ, index=False)
+    feats.to_csv(OUT_CSV, index=False)
 
-    if n_ok == 0:
-        print("[DEBUG] eligibility reject reasons:", reasons)
-        # 가격 데이터 자체를 점검할 수 있게 표본 로그
-        counts = prices.groupby("Ticker")["Date"].count().sort_values(ascending=False).head(20)
-        print("[DEBUG] top ticker row counts:\n", counts.to_string())
-        raise RuntimeError("No eligible tickers produced features. Check eligibility thresholds and raw data.")
-
-    out = pd.concat(feats, ignore_index=True).sort_values(["Date", "Ticker"]).reset_index(drop=True)
-    saved_to = save_features(out)
-
-    meta = {
-        "updated_at_utc": now_utc_iso(),
-        "saved_to": saved_to,
-        "rows": int(len(out)),
-        "tickers_used": sorted(out["Ticker"].unique().tolist()),
-        "tickers_used_count": int(out["Ticker"].nunique()),
-        "min_date": str(out["Date"].min().date()),
-        "max_date": str(out["Date"].max().date()),
-        "params": {
-            "max_window": args.max_window,
-            "min_history_days": args.min_history_days,
-            "min_dollar_vol": args.min_dollar_vol,
-            "min_feature_rows": args.min_feature_rows,
-            "strict_dropna": bool(args.strict_dropna),
-        },
-    }
-    FEATURE_DIR.mkdir(parents=True, exist_ok=True)
-    META_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    print(f"[DONE] features saved={saved_to} rows={meta['rows']} tickers={meta['tickers_used_count']}")
-    print(f"[RANGE] {meta['min_date']}..{meta['max_date']}")
-    print(f"[TICKERS] sample={meta['tickers_used'][:20]}")
+    print(f"[DONE] wrote: {OUT_PARQ} rows={len(feats)}")
+    if len(feats):
+        print(f"[INFO] range: {pd.to_datetime(feats['Date']).min().date()}..{pd.to_datetime(feats['Date']).max().date()}")
 
 
 if __name__ == "__main__":
