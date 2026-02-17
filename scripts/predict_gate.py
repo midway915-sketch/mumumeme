@@ -3,33 +3,35 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import joblib
 
 
 DATA_DIR = Path("data")
-FEATURE_DIR = DATA_DIR / "features"
+RAW_DIR = DATA_DIR / "raw"
+FEATURES_DIR = DATA_DIR / "features"
 SIGNALS_DIR = DATA_DIR / "signals"
 APP_DIR = Path("app")
 
-FEATS_PARQ = FEATURE_DIR / "features_model.parquet"
-FEATS_CSV = FEATURE_DIR / "features_model.csv"
+PRICES_PARQ = RAW_DIR / "prices.parquet"
+PRICES_CSV = RAW_DIR / "prices.csv"
 
-SUCCESS_MODEL = APP_DIR / "model.pkl"
-SUCCESS_SCALER = APP_DIR / "scaler.pkl"
+FEATURES_MODEL_PARQ = FEATURES_DIR / "features_model.parquet"
+FEATURES_MODEL_CSV = FEATURES_DIR / "features_model.csv"
 
-TAIL_MODEL = APP_DIR / "tail_model.pkl"
-TAIL_SCALER = APP_DIR / "tail_scaler.pkl"
+MODEL_PKL = APP_DIR / "model.pkl"
+SCALER_PKL = APP_DIR / "scaler.pkl"
 
-TAU_PRED_PARQ = SIGNALS_DIR / "tau_pred.parquet"
-TAU_PRED_CSV = SIGNALS_DIR / "tau_pred.csv"
-TAU_MODEL = APP_DIR / "tau_model.pkl"
-TAU_SCALER = APP_DIR / "tau_scaler.pkl"
+TAIL_MODEL_PKL = APP_DIR / "tail_model.pkl"
+TAIL_SCALER_PKL = APP_DIR / "tail_scaler.pkl"
 
-# 기본 feature 셋(없으면 더미로라도 맞추게)
-FEATURE_COLS = [
+TAU_MODEL_PKL = APP_DIR / "tau_model.pkl"
+TAU_SCALER_PKL = APP_DIR / "tau_scaler.pkl"
+
+
+# 기본 feature 컬럼(없으면 자동 0 채움)
+BASE_FEATURE_COLS = [
     "Drawdown_252",
     "Drawdown_60",
     "ATR_ratio",
@@ -40,8 +42,6 @@ FEATURE_COLS = [
     "Market_ATR_ratio",
 ]
 
-DEFAULT_TAU_GAMMA = 0.05  # utility_time 페널티 강도
-
 
 def read_table(parq: Path, csv: Path) -> pd.DataFrame:
     if parq.exists():
@@ -51,203 +51,296 @@ def read_table(parq: Path, csv: Path) -> pd.DataFrame:
     raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
 
 
-def make_tag(profit_target: float, max_days: int, stop_level: float, max_extend_days: int) -> str:
+def read_prices() -> pd.DataFrame:
+    df = read_table(PRICES_PARQ, PRICES_CSV).copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    need = {"Date", "Ticker", "High", "Low", "Close"}
+    miss = need - set(df.columns)
+    if miss:
+        raise ValueError(f"prices missing columns: {miss}")
+    return df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+
+
+def ensure_market_features(feats: pd.DataFrame, prices: pd.DataFrame, market_ticker: str = "SPY") -> pd.DataFrame:
+    """
+    Ensure Market_Drawdown and Market_ATR_ratio exist by computing from SPY daily bars,
+    then merging by Date.
+    """
+    out = feats.copy()
+    out["Date"] = pd.to_datetime(out["Date"])
+    out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
+
+    # 이미 둘 다 있으면 그대로
+    if "Market_Drawdown" in out.columns and "Market_ATR_ratio" in out.columns:
+        return out
+
+    m = prices[prices["Ticker"] == market_ticker].sort_values("Date").copy()
+    if m.empty:
+        raise ValueError(f"Market ticker {market_ticker} not found. Run fetch_prices.py --include-extra")
+
+    close = pd.to_numeric(m["Close"], errors="coerce")
+    high = pd.to_numeric(m["High"], errors="coerce")
+    low = pd.to_numeric(m["Low"], errors="coerce")
+
+    # Market_Drawdown: close / rolling_max_252 - 1
+    roll_max_252 = close.rolling(252, min_periods=20).max()
+    m["Market_Drawdown"] = (close / roll_max_252) - 1.0
+
+    # Market_ATR_ratio: ATR14 / close
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr14 = tr.rolling(14, min_periods=10).mean()
+    m["Market_ATR_ratio"] = atr14 / close
+
+    m_feat = m[["Date", "Market_Drawdown", "Market_ATR_ratio"]].copy()
+    out = out.merge(m_feat, on="Date", how="left", suffixes=("", "_mkt"))
+
+    # combine_first로 채우기
+    if "Market_Drawdown" in out.columns and "Market_Drawdown_mkt" in out.columns:
+        out["Market_Drawdown"] = pd.to_numeric(out["Market_Drawdown"], errors="coerce").combine_first(
+            pd.to_numeric(out["Market_Drawdown_mkt"], errors="coerce")
+        )
+        out.drop(columns=["Market_Drawdown_mkt"], inplace=True, errors="ignore")
+    elif "Market_Drawdown" not in out.columns:
+        out["Market_Drawdown"] = pd.to_numeric(out["Market_Drawdown_mkt"], errors="coerce")
+        out.drop(columns=["Market_Drawdown_mkt"], inplace=True, errors="ignore")
+
+    if "Market_ATR_ratio" in out.columns and "Market_ATR_ratio_mkt" in out.columns:
+        out["Market_ATR_ratio"] = pd.to_numeric(out["Market_ATR_ratio"], errors="coerce").combine_first(
+            pd.to_numeric(out["Market_ATR_ratio_mkt"], errors="coerce")
+        )
+        out.drop(columns=["Market_ATR_ratio_mkt"], inplace=True, errors="ignore")
+    elif "Market_ATR_ratio" not in out.columns:
+        out["Market_ATR_ratio"] = pd.to_numeric(out["Market_ATR_ratio_mkt"], errors="coerce")
+        out.drop(columns=["Market_ATR_ratio_mkt"], inplace=True, errors="ignore")
+
+    return out
+
+
+def safe_load_model(model_path: Path, scaler_path: Path):
+    if model_path.exists() and scaler_path.exists():
+        return joblib.load(model_path), joblib.load(scaler_path)
+    return None, None
+
+
+def build_tag(profit_target: float, max_days: int, stop_level: float, max_extend_days: int) -> str:
     pt = int(round(profit_target * 100))
     sl = int(round(abs(stop_level) * 100))
-    return f"pt{pt}_h{int(max_days)}_sl{sl}_ex{int(max_extend_days)}"
+    return f"pt{pt}_h{max_days}_sl{sl}_ex{max_extend_days}"
 
 
-def ensure_cols(df: pd.DataFrame, cols: list[str]) -> None:
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"features_model missing required FEATURE_COLS: {missing}")
-
-
-def predict_proba_if_possible(df: pd.DataFrame, model_path: Path, scaler_path: Path, out_col: str) -> pd.Series:
-    if not model_path.exists() or not scaler_path.exists():
-        # 모델이 없으면 NaN으로 반환
-        return pd.Series([np.nan] * len(df), index=df.index)
-
-    model = joblib.load(model_path)
-    scaler = joblib.load(scaler_path)
-
-    X = df[FEATURE_COLS].astype(float)
-    Xs = scaler.transform(X)
-
-    # sklearn CalibratedClassifierCV / LogisticRegression 등 predict_proba 지원 가정
-    p = model.predict_proba(Xs)[:, 1]
-    return pd.Series(p, index=df.index, name=out_col)
-
-
-def attach_tau_hat(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    우선순위:
-      1) data/signals/tau_pred.(parquet/csv) 가 있으면 merge
-      2) 없으면 app/tau_model.pkl + scaler로 여기서 예측
-      3) 둘 다 없으면 tau_hat NaN
-    """
+def prepare_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     out = df.copy()
-
-    if TAU_PRED_PARQ.exists() or TAU_PRED_CSV.exists():
-        tau = read_table(TAU_PRED_PARQ, TAU_PRED_CSV)
-        tau["Date"] = pd.to_datetime(tau["Date"])
-        tau["Ticker"] = tau["Ticker"].astype(str).str.upper().str.strip()
-        tau = tau[["Date", "Ticker", "tau_hat"]].drop_duplicates(["Date", "Ticker"], keep="last")
-        out = out.merge(tau, on=["Date", "Ticker"], how="left")
-        return out
-
-    if TAU_MODEL.exists() and TAU_SCALER.exists():
-        model = joblib.load(TAU_MODEL)
-        scaler = joblib.load(TAU_SCALER)
-        X = out[FEATURE_COLS].astype(float)
-        Xs = scaler.transform(X)
-        tau_hat = model.predict(Xs)
-        out["tau_hat"] = pd.Series(tau_hat, index=out.index).astype(float)
-        return out
-
-    out["tau_hat"] = np.nan
+    for c in cols:
+        if c not in out.columns:
+            out[c] = 0.0
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
     return out
 
 
-def daily_pick_top1(df: pd.DataFrame, score_col: str) -> pd.DataFrame:
-    """
-    df: candidate rows (already filtered by gate), columns Date, Ticker, score_col
-    returns: Date -> top1 ticker (score desc), ties by score then ticker
-    """
-    df2 = df.copy()
-    df2["_score"] = pd.to_numeric(df2[score_col], errors="coerce")
-    df2 = df2.dropna(subset=["_score"])
-    if df2.empty:
-        return pd.DataFrame(columns=["Date", "pick_custom"])
-
-    df2 = df2.sort_values(["Date", "_score", "Ticker"], ascending=[True, False, True])
-    top = df2.groupby("Date", sort=False).head(1)
-    out = top[["Date", "Ticker"]].rename(columns={"Ticker": "pick_custom"})
-    return out
+def per_date_quantile_threshold(x: pd.Series, q: float) -> float:
+    x = pd.to_numeric(x, errors="coerce")
+    x = x.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(x) == 0:
+        return np.nan
+    return float(x.quantile(q))
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-
+    ap = argparse.ArgumentParser(description="Gate picks by p_tail/utility then rank; outputs daily picks CSV.")
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
     ap.add_argument("--max-extend-days", type=int, required=True)
 
-    ap.add_argument("--gate-mode", type=str, required=True,
-                    choices=["none", "tail", "utility", "tail_utility"])
-    ap.add_argument("--tail-max", type=float, default=0.20)
-    ap.add_argument("--u-quantile", type=float, default=0.75)
-
-    ap.add_argument("--rank-by", type=str, required=True,
-                    choices=["utility", "ret_score", "p_success", "utility_time"])
+    ap.add_argument("--mode", type=str, default="none", choices=["none", "tail", "utility", "tail_utility"])
+    ap.add_argument("--tail-threshold", dest="tail_max", type=float, default=0.20)
+    ap.add_argument("--utility-quantile", dest="u_quantile", type=float, default=0.75)
+    ap.add_argument("--rank-by", type=str, default="utility", choices=["utility", "ret_score", "p_success", "utility_time"])
     ap.add_argument("--lambda-tail", type=float, default=0.05)
+    ap.add_argument("--tau-gamma", type=float, default=0.05)
+    ap.add_argument("--topk", type=int, default=1)
+    ap.add_argument("--market-ticker", type=str, default="SPY")
+    ap.add_argument("--suffix", type=str, default="")
+    ap.add_argument("--out-csv", type=str, default="")
 
-    ap.add_argument("--out-suffix", type=str, required=True)
-    ap.add_argument("--tag", type=str, default=None)
-
-    # utility_time 페널티 강도(워크플로 input 유지해야 하니 기본값만 사용해도 됨)
-    ap.add_argument("--tau-gamma", type=float, default=DEFAULT_TAU_GAMMA)
-
-    args = ap.parse_args()
+    # run_grid_workflow.sh가 추가 인자를 줘도 안 깨지게
+    args, _unknown = ap.parse_known_args()
 
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 
-    tag = args.tag or make_tag(args.profit_target, args.max_days, args.stop_level, args.max_extend_days)
+    tag = build_tag(args.profit_target, args.max_days, args.stop_level, args.max_extend_days)
+    suffix = args.suffix.strip()
+    if not suffix:
+        # 기본 suffix 생성(로그/파일명 일관)
+        # 예: tail_utility_t0p30_q0p75_rutility_time_g0p05
+        def tok(x: float) -> str:
+            s = f"{x:.4f}".rstrip("0").rstrip(".")
+            return s.replace(".", "p").replace("-", "m")
+        suffix = f"{args.mode}_t{tok(args.tail_max)}_q{tok(args.u_quantile)}_r{args.rank_by}_g{tok(args.tau_gamma)}"
 
-    feats = read_table(FEATS_PARQ, FEATS_CSV)
+    print("=" * 30)
+    print(f"[RUN] mode={args.mode} tail_max={args.tail_max} u_q={args.u_quantile} rank_by={args.rank_by} gamma={args.tau_gamma} suffix={suffix}")
+    print("=" * 30)
+
+    feats = read_table(FEATURES_MODEL_PARQ, FEATURES_MODEL_CSV).copy()
     feats["Date"] = pd.to_datetime(feats["Date"])
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
 
-    # 필수 feature 확보 (없으면 즉시 에러 -> 너가 원한 것처럼 조용히 틀어지지 않게)
-    ensure_cols(feats, FEATURE_COLS)
+    prices = read_prices()
+    feats = ensure_market_features(feats, prices, market_ticker=args.market_ticker)
 
-    use = feats.copy()
+    # 모델 로드(없으면 NaN으로 진행)
+    success_model, success_scaler = safe_load_model(MODEL_PKL, SCALER_PKL)
+    tail_model, tail_scaler = safe_load_model(TAIL_MODEL_PKL, TAIL_SCALER_PKL)
+    tau_model, tau_scaler = safe_load_model(TAU_MODEL_PKL, TAU_SCALER_PKL)
 
-    # === p_success / p_tail 예측 ===
-    use["p_success"] = predict_proba_if_possible(use, SUCCESS_MODEL, SUCCESS_SCALER, "p_success")
+    # 모델 입력 feature 준비
+    feats = prepare_features(feats, BASE_FEATURE_COLS)
+    X = feats[BASE_FEATURE_COLS].to_numpy(dtype=float)
 
-    # tail gate를 쓰는데 tail model이 없으면 바로 에러 (silent fail 방지)
-    if args.gate_mode in ("tail", "tail_utility"):
-        if not (TAIL_MODEL.exists() and TAIL_SCALER.exists()):
-            raise FileNotFoundError(
-                "gate-mode requires tail model: missing app/tail_model.pkl or app/tail_scaler.pkl"
+    # p_success
+    if success_model is not None and success_scaler is not None:
+        Xs = success_scaler.transform(X)
+        p_success = success_model.predict_proba(Xs)[:, 1]
+    else:
+        p_success = np.full(len(feats), np.nan)
+
+    # p_tail
+    if tail_model is not None and tail_scaler is not None:
+        Xt = tail_scaler.transform(X)
+        p_tail = tail_model.predict_proba(Xt)[:, 1]
+    else:
+        # tail 모델이 없으면 보수적으로 NaN (tail gate 쓰면 자동 skip 많이 날 수 있음)
+        p_tail = np.full(len(feats), np.nan)
+
+    # tau_pred(성공까지 걸릴 기간 예측) — 없으면 NaN
+    if tau_model is not None and tau_scaler is not None:
+        Xtau = tau_scaler.transform(X)
+        # 회귀모델/분류모델 모두 대응: predict 있으면 그걸로
+        try:
+            tau_pred = tau_model.predict(Xtau).astype(float)
+        except Exception:
+            tau_pred = np.full(len(feats), np.nan)
+    else:
+        tau_pred = np.full(len(feats), np.nan)
+
+    # ret_score: 없으면 간단히 만들기(변동성/추세/낙폭 조합)
+    if "ret_score" in feats.columns:
+        ret_score = pd.to_numeric(feats["ret_score"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    else:
+        # Drawdown_60 낮을수록(+), MA20_slope 높을수록(+), Z_score 너무 과열이면(-)
+        ret_score = (
+            (-feats["Drawdown_60"].to_numpy(dtype=float))
+            + (feats["MA20_slope"].to_numpy(dtype=float) * 5.0)
+            - (np.abs(feats["Z_score"].to_numpy(dtype=float)) * 0.2)
+        )
+
+    # utility(기본): p_success - lambda*p_tail
+    # utility_time: utility - gamma*(tau_pred/max_days)
+    util = p_success.copy()
+    if np.isfinite(args.lambda_tail) and args.lambda_tail != 0:
+        util = util - args.lambda_tail * p_tail
+
+    util_time = util.copy()
+    if np.isfinite(args.tau_gamma) and args.tau_gamma != 0:
+        # tau_pred를 horizon 스케일로 정규화(0~1 근사)
+        tau_norm = np.where(np.isfinite(tau_pred), np.clip(tau_pred / max(1, args.max_days), 0, 10), np.nan)
+        util_time = util_time - args.tau_gamma * tau_norm
+
+    use = feats[["Date", "Ticker"]].copy()
+    use["p_success"] = p_success
+    use["p_tail"] = p_tail
+    use["ret_score"] = ret_score
+    use["utility"] = util
+    use["utility_time"] = util_time
+    use["Skipped"] = 0
+
+    # gate 통과 여부
+    # tail gate: p_tail <= tail_max (NaN이면 실패 처리)
+    use["pass_tail"] = (pd.to_numeric(use["p_tail"], errors="coerce") <= float(args.tail_max)).astype(int)
+
+    # utility gate: per-date quantile 이상
+    # 기준 컬럼은 rank_by가 utility_time이면 utility_time, 아니면 utility
+    gate_util_col = "utility_time" if args.rank_by == "utility_time" else "utility"
+    use["_gate_util_thr"] = use.groupby("Date")[gate_util_col].transform(lambda s: per_date_quantile_threshold(s, float(args.u_quantile)))
+    use["pass_utility"] = (pd.to_numeric(use[gate_util_col], errors="coerce") >= pd.to_numeric(use["_gate_util_thr"], errors="coerce")).astype(int)
+
+    if args.mode == "none":
+        use["pass_gate"] = 1
+    elif args.mode == "tail":
+        use["pass_gate"] = use["pass_tail"]
+    elif args.mode == "utility":
+        use["pass_gate"] = use["pass_utility"]
+    else:  # tail_utility
+        use["pass_gate"] = (use["pass_tail"] & use["pass_utility"]).astype(int)
+
+    # rank score
+    rank_col = args.rank_by
+    use["_rank"] = pd.to_numeric(use[rank_col], errors="coerce")
+
+    # 날짜별 TopK 선정
+    out_rows = []
+    for d, g in use.groupby("Date", sort=True):
+        gg = g[g["pass_gate"] == 1].copy()
+        if gg.empty:
+            out_rows.append(
+                {
+                    "Date": d,
+                    "Ticker": "",
+                    "Skipped": 1,
+                    "rank_by": rank_col,
+                    "score": np.nan,
+                    "mode": args.mode,
+                    "tail_max": args.tail_max,
+                    "u_quantile": args.u_quantile,
+                    "tau_gamma": args.tau_gamma,
+                    "lambda_tail": args.lambda_tail,
+                    "label": suffix,
+                    "TAG": tag,
+                }
             )
+            continue
 
-    use["p_tail"] = predict_proba_if_possible(use, TAIL_MODEL, TAIL_SCALER, "p_tail")
+        gg = gg.sort_values("_rank", ascending=False)
+        pick = gg.iloc[0]
+        out_rows.append(
+            {
+                "Date": d,
+                "Ticker": pick["Ticker"],
+                "Skipped": 0,
+                "rank_by": rank_col,
+                "score": float(pick["_rank"]) if np.isfinite(pick["_rank"]) else np.nan,
+                "mode": args.mode,
+                "tail_max": args.tail_max,
+                "u_quantile": args.u_quantile,
+                "tau_gamma": args.tau_gamma,
+                "lambda_tail": args.lambda_tail,
+                "p_success": float(pick["p_success"]) if np.isfinite(pick["p_success"]) else np.nan,
+                "p_tail": float(pick["p_tail"]) if np.isfinite(pick["p_tail"]) else np.nan,
+                "utility": float(pick["utility"]) if np.isfinite(pick["utility"]) else np.nan,
+                "utility_time": float(pick["utility_time"]) if np.isfinite(pick["utility_time"]) else np.nan,
+                "ret_score": float(pick["ret_score"]) if np.isfinite(pick["ret_score"]) else np.nan,
+                "label": suffix,
+                "TAG": tag,
+            }
+        )
 
-    # === tau_hat attach (utility_time용) ===
-    use = attach_tau_hat(use)
-
-    # === 기본 점수 구성 ===
-    # ret_score 컬럼이 있으면 사용, 없으면 p_success로 fallback
-    if "ret_score" not in use.columns:
-        use["ret_score"] = use["p_success"]
-
-    # utility 컬럼이 있으면 사용, 없으면 (p_success - lambda * p_tail)로 구성
-    if "utility" not in use.columns:
-        ptail = pd.to_numeric(use["p_tail"], errors="coerce").fillna(0.0)
-        psucc = pd.to_numeric(use["p_success"], errors="coerce").fillna(0.0)
-        use["utility"] = psucc - float(args.lambda_tail) * ptail
-
-    # utility_time: utility - gamma*log1p(tau_hat)
-    tau = pd.to_numeric(use["tau_hat"], errors="coerce")
-    tau_fill = tau.fillna(tau.median() if np.isfinite(tau.median()) else float(args.max_days))
-    use["utility_time"] = pd.to_numeric(use["utility"], errors="coerce").fillna(0.0) - float(args.tau_gamma) * np.log1p(
-        tau_fill.clip(lower=1.0)
-    )
-
-    # === Gate 필터 ===
-    candidates = use.copy()
-
-    # tail gate
-    if args.gate_mode in ("tail", "tail_utility"):
-        candidates = candidates[pd.to_numeric(candidates["p_tail"], errors="coerce") <= float(args.tail_max)]
-
-    # utility gate (daily quantile)
-    if args.gate_mode in ("utility", "tail_utility"):
-        base = pd.to_numeric(candidates["utility"], errors="coerce")
-        candidates = candidates.assign(_u=base)
-        # 날짜별 분위수 컷
-        q = float(args.u_quantile)
-        u_cut = candidates.groupby("Date")["_u"].transform(lambda s: s.quantile(q) if len(s) else np.nan)
-        candidates = candidates[candidates["_u"] >= u_cut].drop(columns=["_u"], errors="ignore")
-
-    # rank score 선택
-    score_col = args.rank_by
-
-    # === 날짜별 top1 pick ===
-    picks = daily_pick_top1(candidates[["Date", "Ticker", score_col]].copy(), score_col=score_col)
-
-    # 모든 날짜에 대해 “스킵 여부”를 포함한 pick 테이블 만들기
-    all_dates = pd.DataFrame({"Date": sorted(use["Date"].dropna().unique())})
-    out = all_dates.merge(picks, on="Date", how="left")
-    out["Skipped"] = out["pick_custom"].isna().astype(int)
-
-    # 메타 컬럼
-    out["tag"] = tag
-    out["gate_mode"] = args.gate_mode
-    out["rank_by"] = args.rank_by
-    out["tail_max"] = float(args.tail_max)
-    out["u_quantile"] = float(args.u_quantile)
-    out["lambda_tail"] = float(args.lambda_tail)
-    out["profit_target"] = float(args.profit_target)
-    out["max_days"] = int(args.max_days)
-    out["stop_level"] = float(args.stop_level)
-    out["max_extend_days"] = int(args.max_extend_days)
-    out["out_suffix"] = args.out_suffix
+    out = pd.DataFrame(out_rows).sort_values("Date").reset_index(drop=True)
 
     # 저장
-    out_path = SIGNALS_DIR / f"picks_{tag}_gate_{args.out_suffix}.csv"
-    out.to_csv(out_path, index=False)
+    if args.out_csv.strip():
+        out_path = Path(args.out_csv)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_path = SIGNALS_DIR / f"picks_{tag}_{suffix}.csv"
 
-    # 디버그(짧게)
-    skip_rate = float(out["Skipped"].mean()) if len(out) else 1.0
-    print("=" * 60)
-    print(f"[DONE] wrote {out_path}")
-    print("rows:", len(out), "skip_rate:", round(skip_rate, 4))
-    print("example picks:\n", out.dropna(subset=["pick_custom"]).head(5).to_string(index=False))
-    print("=" * 60)
+    out.to_csv(out_path, index=False)
+    print(f"[DONE] wrote picks: {out_path} rows={len(out)} skipped_days={int(out['Skipped'].sum())}")
 
 
 if __name__ == "__main__":
