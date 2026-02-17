@@ -1,37 +1,37 @@
-name: Gate Grid Backtest
+name: gate-grid
 
 on:
   workflow_dispatch:
     inputs:
       profit_target:
-        description: "profit target (e.g. 0.10) OR list (e.g. 0.05,0.10,0.15)"
+        description: "profit target list (comma-separated). e.g. 0.10 or 0.08,0.10,0.12"
         required: true
         default: "0.10"
       max_holding_days:
-        description: "max holding days (e.g. 40) OR list (e.g. 30,40,50)"
+        description: "max holding days list (comma-separated). e.g. 40 or 35,40,45"
         required: true
         default: "40"
       stop_level:
-        description: "stop level (e.g. -0.10) OR list (e.g. -0.05,-0.10,-0.15)"
+        description: "stop level list (comma-separated, negative). e.g. -0.10 or -0.08,-0.10,-0.12"
         required: true
         default: "-0.10"
-      max_extend_days:
+      extend_horizon:
         description: "extend horizon tag + strategy label horizon add (e.g. 30)"
         required: true
         default: "30"
-      tail_max_list:
-        description: "comma-separated p_tail thresholds (e.g. 0.15,0.25,0.35)"
+      p_tail_thresholds:
+        description: "comma-separated p_tail thresholds. e.g. 0.15,0.25,0.35"
         required: true
         default: "0.20,0.30"
-      u_quantile_list:
-        description: "comma-separated utility quantiles (e.g. 0.60,0.75,0.90)"
+      utility_quantiles:
+        description: "comma-separated utility quantiles. e.g. 0.60,0.75,0.90"
         required: true
         default: "0.75,0.90"
-      rank_by_list:
-        description: "comma-separated rank metric (utility|ret_score|p_success). e.g. utility,ret_score"
+      rank_metric:
+        description: "comma-separated rank metric (utility|ret_score|p_success|utility_time). e.g. utility,utility_time"
         required: true
-        default: "utility"
-      lambda_tail:
+        default: "utility,utility_time"
+      utility_tail_penalty_lambda:
         description: "utility tail penalty lambda (e.g. 0.05)"
         required: true
         default: "0.05"
@@ -43,8 +43,7 @@ on:
 jobs:
   gate-grid:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -54,65 +53,264 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install deps
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install -U pip wheel setuptools
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install -U pyarrow
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy yfinance pyarrow scikit-learn joblib
+          fi
 
-      - name: Prepare universe.csv
+      - name: Sanity check scripts exist
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f scripts/universe.py ]; then
-            python scripts/universe.py
-          else
-            echo "[WARN] scripts/universe.py not found. Assuming data/universe.csv exists."
-          fi
+          ls -la scripts || true
 
-      - name: Fetch prices + Build base features (only once)
+          for f in \
+            scripts/run_grid_workflow.sh \
+            scripts/gate_grid_lib.sh \
+            scripts/fetch_prices.py \
+            scripts/build_features.py \
+            scripts/build_labels.py \
+            scripts/train_model.py \
+            scripts/build_tau_labels.py \
+            scripts/train_tau_model.py \
+            scripts/predict_tau.py \
+            scripts/predict_gate.py \
+            scripts/simulate_single_position_engine.py \
+            scripts/merge_sim_summaries.py \
+            scripts/aggregate_gate_grid.py \
+            scripts/universe.py
+          do
+            if [ ! -f "$f" ]; then
+              echo "[ERROR] missing file: $f"
+              exit 1
+            fi
+          done
+
+          chmod +x scripts/run_grid_workflow.sh scripts/gate_grid_lib.sh || true
+
+      - name: (Optional) Reset data
+        if: ${{ inputs.rebuild_all == 'true' }}
         shell: bash
-        env:
-          REBUILD_ALL: "${{ inputs.rebuild_all }}"
         run: |
           set -euo pipefail
-          cd "${GITHUB_WORKSPACE}"
-          if [ "${REBUILD_ALL}" = "true" ]; then
-            python scripts/fetch_prices.py --include-extra --reset --force-full
-          else
-            python scripts/fetch_prices.py --include-extra
-          fi
+          rm -rf data || true
+          mkdir -p data/raw data/features data/labels data/signals app
+
+      - name: Ensure universe.csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          python scripts/universe.py
+          echo "[INFO] universe.csv head:"
+          head -n 20 data/universe.csv || true
+
+      - name: Fetch prices (include SPY/VIX)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/raw
+          python scripts/fetch_prices.py --include-extra --force-full
+
+      - name: Build features
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/features
+          # build_features.py는 네 repo의 CLI에 맞게 동작한다고 가정
           python scripts/build_features.py
 
-      - name: Run grid (PT/H/SL + gate)
+      # =========================
+      # 1차 넓은 그리드
+      # =========================
+      - name: Run grid (Round-1 broad)
         shell: bash
         env:
-          PROFIT_TARGET_INPUT: "${{ inputs.profit_target }}"
-          HOLDING_DAYS_INPUT: "${{ inputs.max_holding_days }}"
-          STOP_LEVEL_INPUT: "${{ inputs.stop_level }}"
-          MAX_EXTEND_DAYS: "${{ inputs.max_extend_days }}"
-          TAIL_MAX_LIST: "${{ inputs.tail_max_list }}"
-          U_QUANTILE_LIST: "${{ inputs.u_quantile_list }}"
-          RANK_BY_LIST: "${{ inputs.rank_by_list }}"
-          LAMBDA_TAIL: "${{ inputs.lambda_tail }}"
+          PROFIT_TARGET_INPUT: ${{ inputs.profit_target }}
+          HOLDING_DAYS_INPUT: ${{ inputs.max_holding_days }}
+          STOP_LEVEL_INPUT: ${{ inputs.stop_level }}
+          MAX_EXTEND_DAYS: ${{ inputs.extend_horizon }}
+
+          TAIL_MAX_LIST: ${{ inputs.p_tail_thresholds }}
+          U_QUANTILE_LIST: ${{ inputs.utility_quantiles }}
+          RANK_BY_LIST: ${{ inputs.rank_metric }}
+          LAMBDA_TAIL: ${{ inputs.utility_tail_penalty_lambda }}
+
+          # 내부 gamma 그리드(원하면 여기 숫자만 바꾸면 됨)
+          TAU_GAMMA_LIST: "0.03,0.05,0.08"
         run: |
           set -euo pipefail
           bash scripts/run_grid_workflow.sh
 
-      - name: Upload artifacts
-        if: always()
+      - name: Aggregate gate grid (Round-1)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/aggregate_gate_grid.py
+          echo "[INFO] Round-1 outputs:"
+          ls -la data/signals | tail -n 200 || true
+
+      # =========================
+      # 2차 미세 그리드: Pareto Top30 기반 자동 축소
+      #  - PT/H/SL + gate params( tail_max/u_quantile/rank_by/tau_gamma )를
+      #    Top30에서 추출해, "좁힌 리스트"로 2차 grid 재실행
+      # =========================
+      - name: Derive refine grid from Pareto Top30
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+
+          sig = Path("data/signals")
+          src = sig / "gate_grid_pareto4.csv"
+          if not src.exists():
+            # pareto4가 없으면 pareto로 fallback
+            src = sig / "gate_grid_pareto.csv"
+          if not src.exists():
+            raise SystemExit("[ERROR] No pareto csv found (gate_grid_pareto4.csv or gate_grid_pareto.csv).")
+
+          df = pd.read_csv(src)
+          if df.empty:
+            raise SystemExit("[ERROR] pareto csv is empty.")
+
+          # eff_score4 있으면 그걸로, 없으면 eff_score/metric로
+          if "eff_score4" in df.columns:
+            df = df.sort_values("eff_score4", ascending=False)
+          elif "eff_score" in df.columns:
+            df = df.sort_values("eff_score", ascending=False)
+
+          top = df.head(30).copy()
+
+          def uniq_limit(vals, limit):
+            out=[]
+            for v in vals:
+              if pd.isna(v): 
+                continue
+              if v not in out:
+                out.append(v)
+              if len(out) >= limit:
+                break
+            return out
+
+          # 1) PT/H/SL 후보(Top30 중심 + 주변 미세)
+          pts = []
+          hs = []
+          sls = []
+
+          for _, r in top.iterrows():
+            pt = float(r.get("PT", r.get("profit_target", float("nan"))))
+            h  = int(r.get("H", r.get("max_days", float("nan"))))
+            sl = float(r.get("SL", r.get("stop_level", float("nan"))))
+
+            if pt == pt:
+              pts += [max(0.01, pt-0.01), pt, pt+0.01]
+            if h == h and h > 0:
+              hs += [max(5, h-5), h, h+5]
+            if sl == sl:
+              # sl은 음수
+              sls += [sl-0.05, sl, sl+0.05]
+
+          # 정리/라운딩
+          pts = sorted(set(round(x, 4) for x in pts if x > 0 and x < 1.0))
+          hs  = sorted(set(int(x) for x in hs if x > 0))
+          sls = sorted(set(round(x, 4) for x in sls if x < 0))
+
+          # 폭발 방지: 너무 많으면 컷(액션 시간)
+          pts = pts[:12]
+          hs  = hs[:9]
+          sls = sls[:9]
+
+          # 2) gate 파라미터 후보도 Top30에서 좁힘
+          tails = uniq_limit([round(float(x), 4) for x in top.get("tail_max", []) if pd.notna(x)], 8)
+          uqs   = uniq_limit([round(float(x), 4) for x in top.get("u_quantile", []) if pd.notna(x)], 8)
+          ranks = uniq_limit([str(x) for x in top.get("rank_by", []) if pd.notna(x)], 6)
+          gams  = uniq_limit([round(float(x), 4) for x in top.get("tau_gamma", []) if pd.notna(x)], 6)
+
+          # fallback(혹시 컬럼이 없으면)
+          if not tails: tails = [0.20, 0.30]
+          if not uqs:   uqs   = [0.75, 0.90]
+          if not ranks: ranks = ["utility", "utility_time"]
+          if not gams:  gams  = [0.03, 0.05, 0.08]
+
+          def join(vals):
+            return ",".join(str(v) for v in vals)
+
+          env_lines = [
+            f"PROFIT_TARGET_INPUT_REFINE={join(pts)}",
+            f"HOLDING_DAYS_INPUT_REFINE={join(hs)}",
+            f"STOP_LEVEL_INPUT_REFINE={join(sls)}",
+            f"TAIL_MAX_LIST_REFINE={join(tails)}",
+            f"U_QUANTILE_LIST_REFINE={join(uqs)}",
+            f"RANK_BY_LIST_REFINE={join(ranks)}",
+            f"TAU_GAMMA_LIST_REFINE={join(gams)}",
+          ]
+
+          # write to GITHUB_ENV
+          github_env = os.environ.get("GITHUB_ENV")
+          if not github_env:
+            raise SystemExit("[ERROR] GITHUB_ENV not set")
+          with open(github_env, "a", encoding="utf-8") as f:
+            for line in env_lines:
+              f.write(line + "\n")
+
+          print("[REFINE] derived:")
+          for line in env_lines:
+            print(" ", line)
+          PY
+
+      - name: Run grid (Round-2 refine from Pareto Top30)
+        shell: bash
+        env:
+          PROFIT_TARGET_INPUT: ${{ env.PROFIT_TARGET_INPUT_REFINE }}
+          HOLDING_DAYS_INPUT: ${{ env.HOLDING_DAYS_INPUT_REFINE }}
+          STOP_LEVEL_INPUT: ${{ env.STOP_LEVEL_INPUT_REFINE }}
+          MAX_EXTEND_DAYS: ${{ inputs.extend_horizon }}
+
+          TAIL_MAX_LIST: ${{ env.TAIL_MAX_LIST_REFINE }}
+          U_QUANTILE_LIST: ${{ env.U_QUANTILE_LIST_REFINE }}
+          RANK_BY_LIST: ${{ env.RANK_BY_LIST_REFINE }}
+          LAMBDA_TAIL: ${{ inputs.utility_tail_penalty_lambda }}
+
+          TAU_GAMMA_LIST: ${{ env.TAU_GAMMA_LIST_REFINE }}
+        run: |
+          set -euo pipefail
+          # 2차는 기존 결과 위에 계속 쌓이게 둠 (요약/aggregate가 전체를 다시 읽음)
+          bash scripts/run_grid_workflow.sh
+
+      - name: Aggregate gate grid (Round-2 final)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/aggregate_gate_grid.py
+          echo "[INFO] Final outputs:"
+          ls -la data/signals | tail -n 200 || true
+
+      # =========================
+      # Artifacts 업로드
+      # =========================
+      - name: Upload artifacts (signals + summaries)
         uses: actions/upload-artifact@v4
         with:
-          name: "gate-grid-results"
-          retention-days: 14
+          name: gate-grid-results-${{ github.run_id }}
           if-no-files-found: warn
           path: |
+            data/signals/gate_grid_*.csv
             data/signals/gate_summary_*.csv
-            data/signals/gate_grid_aggregate.csv
-            data/signals/gate_grid_top_by_recent10y.csv
-            data/**/sim_engine_summary*.csv
             data/signals/picks_*.csv
+            data/signals/sim_engine_*.parquet
+            data/signals/sim_engine_*.csv
+            data/raw/prices*.*
+            data/features/*.*
+            data/labels/*.*
+            app/*.pkl
