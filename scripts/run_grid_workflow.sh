@@ -116,7 +116,7 @@ for PT0 in "${PT_LIST[@]}"; do
       run_gate_grid
 
       # --- sim_engine_summary_{TAG}_GATES_ALL.csv 생성(요약 파일들 합치기)
-      python scripts/merge_sim_summaries.py --tag "${TAG}"
+      python scripts/merge_sim_summaries.py --tag "${TAG}" --max-days "${H0}" --recent-years 10
 
       # --- 최근10년 배수/최대홀딩 포함 gate_summary_{TAG}.csv 생성
       python scripts/make_gate_summary.py --tag "${TAG}" --max-days "${H0}" --recent-years 10
