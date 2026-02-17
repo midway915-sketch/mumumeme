@@ -2,29 +2,20 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import joblib
 
 
-# ===============================
-# Paths
-# ===============================
 DATA_DIR = Path("data")
-RAW_DIR = DATA_DIR / "raw"
-FEAT_DIR = DATA_DIR / "features"
-SIG_DIR = DATA_DIR / "signals"
+FEATURE_DIR = DATA_DIR / "features"
+SIGNALS_DIR = DATA_DIR / "signals"
 APP_DIR = Path("app")
 
-PRICES_PARQUET = RAW_DIR / "prices.parquet"
-PRICES_CSV = RAW_DIR / "prices.csv"
-
-DEFAULT_FEATURES_PARQUET = FEAT_DIR / "features_model.parquet"
-DEFAULT_FEATURES_CSV = FEAT_DIR / "features_model.csv"
+FEATS_PARQ = FEATURE_DIR / "features_model.parquet"
+FEATS_CSV = FEATURE_DIR / "features_model.csv"
 
 SUCCESS_MODEL = APP_DIR / "model.pkl"
 SUCCESS_SCALER = APP_DIR / "scaler.pkl"
@@ -32,13 +23,12 @@ SUCCESS_SCALER = APP_DIR / "scaler.pkl"
 TAIL_MODEL = APP_DIR / "tail_model.pkl"
 TAIL_SCALER = APP_DIR / "tail_scaler.pkl"
 
+TAU_PRED_PARQ = SIGNALS_DIR / "tau_pred.parquet"
+TAU_PRED_CSV = SIGNALS_DIR / "tau_pred.csv"
+TAU_MODEL = APP_DIR / "tau_model.pkl"
+TAU_SCALER = APP_DIR / "tau_scaler.pkl"
 
-# ===============================
-# Config
-# ===============================
-MARKET_TICKER = "SPY"
-EXCLUDE_TICKERS = {MARKET_TICKER, "^VIX"}  # market/vix는 매수 후보에서 제외
-
+# 기본 feature 셋(없으면 더미로라도 맞추게)
 FEATURE_COLS = [
     "Drawdown_252",
     "Drawdown_60",
@@ -50,386 +40,214 @@ FEATURE_COLS = [
     "Market_ATR_ratio",
 ]
 
-
-# ===============================
-# Utils
-# ===============================
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+DEFAULT_TAU_GAMMA = 0.05  # utility_time 페널티 강도
 
 
-def fmt_tag(pt: float, max_days: int, sl: float, ex: int) -> str:
-    pt_tag = int(round(pt * 100))
-    sl_tag = int(round(abs(sl) * 100))
-    return f"pt{pt_tag}_h{max_days}_sl{sl_tag}_ex{ex}"
+def read_table(parq: Path, csv: Path) -> pd.DataFrame:
+    if parq.exists():
+        return pd.read_parquet(parq)
+    if csv.exists():
+        return pd.read_csv(csv)
+    raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
 
 
-def read_prices() -> pd.DataFrame:
-    if PRICES_PARQUET.exists():
-        px = pd.read_parquet(PRICES_PARQUET)
-    elif PRICES_CSV.exists():
-        px = pd.read_csv(PRICES_CSV)
-    else:
-        raise FileNotFoundError(
-            "Missing prices: data/raw/prices.parquet or data/raw/prices.csv (run fetch_prices.py first)"
-        )
-
-    px = px.copy()
-    px["Date"] = pd.to_datetime(px["Date"])
-    px["Ticker"] = px["Ticker"].astype(str).str.upper().str.strip()
-    px = (
-        px.sort_values(["Ticker", "Date"])
-        .drop_duplicates(["Date", "Ticker"], keep="last")
-        .reset_index(drop=True)
-    )
-    return px
+def make_tag(profit_target: float, max_days: int, stop_level: float, max_extend_days: int) -> str:
+    pt = int(round(profit_target * 100))
+    sl = int(round(abs(stop_level) * 100))
+    return f"pt{pt}_h{int(max_days)}_sl{sl}_ex{int(max_extend_days)}"
 
 
-def auto_load_features(features_path: str | None) -> tuple[pd.DataFrame, str]:
-    """
-    1) --features-path 지정 시 그 파일 사용
-    2) data/features/features_model.* 있으면 사용
-    3) 없으면 data/features 내 Date/Ticker 있는 파일 자동탐색
-    """
-    if features_path:
-        fp = Path(features_path)
-        if not fp.exists():
-            raise FileNotFoundError(f"features-path not found: {fp}")
-        df = pd.read_parquet(fp) if fp.suffix.lower() == ".parquet" else pd.read_csv(fp)
-        return df, str(fp)
-
-    if DEFAULT_FEATURES_PARQUET.exists():
-        return pd.read_parquet(DEFAULT_FEATURES_PARQUET), str(DEFAULT_FEATURES_PARQUET)
-    if DEFAULT_FEATURES_CSV.exists():
-        return pd.read_csv(DEFAULT_FEATURES_CSV), str(DEFAULT_FEATURES_CSV)
-
-    if not FEAT_DIR.exists():
-        raise FileNotFoundError(f"features dir not found: {FEAT_DIR}")
-
-    candidates = []
-    candidates += list(FEAT_DIR.glob("*.parquet"))
-    candidates += list(FEAT_DIR.glob("*.csv"))
-    candidates = [p for p in candidates if p.is_file()]
-    if not candidates:
-        raise FileNotFoundError(f"No feature files found in {FEAT_DIR}")
-
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-
-    last_err = None
-    for p in candidates:
-        try:
-            df = pd.read_parquet(p) if p.suffix.lower() == ".parquet" else pd.read_csv(p)
-            if {"Date", "Ticker"}.issubset(df.columns):
-                return df, str(p)
-        except Exception as e:
-            last_err = e
-
-    raise FileNotFoundError(
-        f"Could not find a usable features file in {FEAT_DIR} (need Date/Ticker). Last error: {last_err}"
-    )
+def ensure_cols(df: pd.DataFrame, cols: list[str]) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"features_model missing required FEATURE_COLS: {missing}")
 
 
-def compute_market_frame_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    Market_Drawdown: SPY 기준 rolling high 대비 drawdown
-    Market_ATR_ratio: SPY ATR(14)/Close
-    - 히스토리가 짧아도 전부 NaN이 되지 않게 min_periods 완화
-    """
-    m = prices[prices["Ticker"] == MARKET_TICKER].sort_values("Date").copy()
-    if m.empty:
-        raise RuntimeError(f"Market ticker {MARKET_TICKER} not found. Run fetch_prices.py --include-extra")
-
-    for c in ["High", "Low", "Close"]:
-        if c not in m.columns:
-            raise ValueError(f"prices missing {c} for {MARKET_TICKER}")
-
-    close = m["Close"].astype(float)
-    high = m["High"].astype(float)
-    low = m["Low"].astype(float)
-
-    # drawdown
-    # 252를 쓰되, 데이터가 짧으면 최소 20일 정도부터라도 값이 생기게
-    dd_minp = min(len(close), 252)
-    dd_minp = max(20, min(252, dd_minp))
-    roll_max = close.rolling(252, min_periods=dd_minp).max()
-    market_dd = (close / roll_max) - 1.0
-
-    # atr ratio
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1,
-    ).max(axis=1)
-    atr_minp = max(5, min(14, len(close)))
-    atr14 = tr.rolling(14, min_periods=atr_minp).mean()
-    market_atr_ratio = atr14 / close
-
-    return pd.DataFrame(
-        {
-            "Date": m["Date"].values,
-            "Market_Drawdown": market_dd.values,
-            "Market_ATR_ratio": market_atr_ratio.values,
-        }
-    )
-
-
-def ensure_market_features(feats: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    feats에 Market_* 없으면 SPY로 계산해서 Date 기준으로 붙임.
-    merge 충돌 방지: suffixes=('', '_m') 후 coalesce 처리.
-    """
-    need = [c for c in ["Market_Drawdown", "Market_ATR_ratio"] if c not in feats.columns]
-    if not need:
-        return feats
-
-    market = compute_market_frame_from_prices(prices)
-    merged = feats.merge(market, on="Date", how="left", suffixes=("", "_m"))
-
-    for col in ["Market_Drawdown", "Market_ATR_ratio"]:
-        col_m = f"{col}_m"
-        if col in merged.columns and col_m in merged.columns:
-            merged[col] = merged[col].combine_first(merged[col_m])
-            merged.drop(columns=[col_m], inplace=True)
-        elif col not in merged.columns and col_m in merged.columns:
-            merged.rename(columns={col_m: col}, inplace=True)
-
-    return merged
-
-
-def load_model_and_scaler(model_path: Path, scaler_path: Path):
+def predict_proba_if_possible(df: pd.DataFrame, model_path: Path, scaler_path: Path, out_col: str) -> pd.Series:
     if not model_path.exists() or not scaler_path.exists():
-        raise FileNotFoundError(f"Missing model or scaler: {model_path} / {scaler_path}")
+        # 모델이 없으면 NaN으로 반환
+        return pd.Series([np.nan] * len(df), index=df.index)
+
     model = joblib.load(model_path)
     scaler = joblib.load(scaler_path)
-    return model, scaler
 
-
-def predict_proba_df(df: pd.DataFrame, model, scaler, feature_cols: list[str]) -> np.ndarray:
-    X = df[feature_cols].to_numpy(dtype=np.float64)
+    X = df[FEATURE_COLS].astype(float)
     Xs = scaler.transform(X)
+
+    # sklearn CalibratedClassifierCV / LogisticRegression 등 predict_proba 지원 가정
     p = model.predict_proba(Xs)[:, 1]
-    return p.astype(np.float64)
+    return pd.Series(p, index=df.index, name=out_col)
 
 
-def safe_rank_column(df: pd.DataFrame, rank_by: str) -> str:
-    # rank_by가 우리 계산 컬럼이 아닐 수도 있어서 방어
-    if rank_by in df.columns:
-        return rank_by
-    # 흔한 대체
-    for alt in ["utility", "p_success", "ret_score"]:
-        if alt in df.columns:
-            return alt
-    return "p_success"
+def attach_tau_hat(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    우선순위:
+      1) data/signals/tau_pred.(parquet/csv) 가 있으면 merge
+      2) 없으면 app/tau_model.pkl + scaler로 여기서 예측
+      3) 둘 다 없으면 tau_hat NaN
+    """
+    out = df.copy()
+
+    if TAU_PRED_PARQ.exists() or TAU_PRED_CSV.exists():
+        tau = read_table(TAU_PRED_PARQ, TAU_PRED_CSV)
+        tau["Date"] = pd.to_datetime(tau["Date"])
+        tau["Ticker"] = tau["Ticker"].astype(str).str.upper().str.strip()
+        tau = tau[["Date", "Ticker", "tau_hat"]].drop_duplicates(["Date", "Ticker"], keep="last")
+        out = out.merge(tau, on=["Date", "Ticker"], how="left")
+        return out
+
+    if TAU_MODEL.exists() and TAU_SCALER.exists():
+        model = joblib.load(TAU_MODEL)
+        scaler = joblib.load(TAU_SCALER)
+        X = out[FEATURE_COLS].astype(float)
+        Xs = scaler.transform(X)
+        tau_hat = model.predict(Xs)
+        out["tau_hat"] = pd.Series(tau_hat, index=out.index).astype(float)
+        return out
+
+    out["tau_hat"] = np.nan
+    return out
 
 
-# ===============================
-# Main
-# ===============================
+def daily_pick_top1(df: pd.DataFrame, score_col: str) -> pd.DataFrame:
+    """
+    df: candidate rows (already filtered by gate), columns Date, Ticker, score_col
+    returns: Date -> top1 ticker (score desc), ties by score then ticker
+    """
+    df2 = df.copy()
+    df2["_score"] = pd.to_numeric(df2[score_col], errors="coerce")
+    df2 = df2.dropna(subset=["_score"])
+    if df2.empty:
+        return pd.DataFrame(columns=["Date", "pick_custom"])
+
+    df2 = df2.sort_values(["Date", "_score", "Ticker"], ascending=[True, False, True])
+    top = df2.groupby("Date", sort=False).head(1)
+    out = top[["Date", "Ticker"]].rename(columns={"Ticker": "pick_custom"})
+    return out
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Gate + Rank picker (writes daily Top-1 picks).")
+    ap = argparse.ArgumentParser()
+
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
     ap.add_argument("--max-extend-days", type=int, required=True)
 
-    ap.add_argument("--gate-mode", type=str, default="none",
+    ap.add_argument("--gate-mode", type=str, required=True,
                     choices=["none", "tail", "utility", "tail_utility"])
-    ap.add_argument("--tail-max", type=float, default=0.30,
-                    help="Pass if p_tail <= tail_max (lower tail risk)")
-    ap.add_argument("--u-quantile", type=float, default=0.75,
-                    help="Utility gate threshold by daily quantile (pass if utility >= q)")
-    ap.add_argument("--rank-by", type=str, default="utility",
-                    help="Ranking column: utility|p_success|ret_score|<existing_column>")
-    ap.add_argument("--lambda-tail", type=float, default=0.05,
-                    help="utility = p_success - lambda_tail * p_tail (if tail model exists)")
+    ap.add_argument("--tail-max", type=float, default=0.20)
+    ap.add_argument("--u-quantile", type=float, default=0.75)
 
-    ap.add_argument("--features-path", type=str, default=None)
-    ap.add_argument("--out-suffix", type=str, default="run")
+    ap.add_argument("--rank-by", type=str, required=True,
+                    choices=["utility", "ret_score", "p_success", "utility_time"])
+    ap.add_argument("--lambda-tail", type=float, default=0.05)
 
-    ap.add_argument("--out-dir", type=str, default=str(SIG_DIR))
-    ap.add_argument("--write-scores", action="store_true",
-                    help="Also write per-date per-ticker score table for debugging.")
+    ap.add_argument("--out-suffix", type=str, required=True)
+    ap.add_argument("--tag", type=str, default=None)
+
+    # utility_time 페널티 강도(워크플로 input 유지해야 하니 기본값만 사용해도 됨)
+    ap.add_argument("--tau-gamma", type=float, default=DEFAULT_TAU_GAMMA)
+
     args = ap.parse_args()
 
-    pt = float(args.profit_target)
-    h = int(args.max_days)
-    sl = float(args.stop_level)
-    ex = int(args.max_extend_days)
-    tag = fmt_tag(pt, h, sl, ex)
+    SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 
-    gate_mode = args.gate_mode
-    tail_max = float(args.tail_max)
-    u_q = float(args.u_quantile)
-    lambda_tail = float(args.lambda_tail)
-    out_suffix = str(args.out_suffix)
+    tag = args.tag or make_tag(args.profit_target, args.max_days, args.stop_level, args.max_extend_days)
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # --- load features & prices
-    prices = read_prices()
-    feats, feats_src = auto_load_features(args.features_path)
-
-    feats = feats.copy()
+    feats = read_table(FEATS_PARQ, FEATS_CSV)
     feats["Date"] = pd.to_datetime(feats["Date"])
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
-    feats = (
-        feats.sort_values(["Ticker", "Date"])
-        .drop_duplicates(["Date", "Ticker"], keep="last")
-        .reset_index(drop=True)
-    )
 
-    # --- ensure Market_* columns exist (SPY derived)
-    feats = ensure_market_features(feats, prices)
+    # 필수 feature 확보 (없으면 즉시 에러 -> 너가 원한 것처럼 조용히 틀어지지 않게)
+    ensure_cols(feats, FEATURE_COLS)
 
-    # --- required columns check (but allow NaN rows to be dropped)
-    missing_cols = [c for c in ["Date", "Ticker"] + FEATURE_COLS if c not in feats.columns]
-    if missing_cols:
-        raise ValueError(f"features_model missing required columns: {missing_cols} (src={feats_src})")
+    use = feats.copy()
 
-    # --- drop excluded tickers
-    feats = feats[~feats["Ticker"].isin(EXCLUDE_TICKERS)].reset_index(drop=True)
+    # === p_success / p_tail 예측 ===
+    use["p_success"] = predict_proba_if_possible(use, SUCCESS_MODEL, SUCCESS_SCALER, "p_success")
 
-    # --- drop rows with NaNs in feature cols
-    feats = feats.dropna(subset=FEATURE_COLS).reset_index(drop=True)
-    if feats.empty:
-        raise RuntimeError("After dropping NaNs, no rows left in features. Check build_features output / prices history.")
-
-    # --- load success model
-    success_model, success_scaler = load_model_and_scaler(SUCCESS_MODEL, SUCCESS_SCALER)
-    feats["p_success"] = predict_proba_df(feats, success_model, success_scaler, FEATURE_COLS)
-
-    # --- load tail model if exists (optional for baseline/utility)
-    tail_available = TAIL_MODEL.exists() and TAIL_SCALER.exists()
-    if tail_available:
-        tail_model, tail_scaler = load_model_and_scaler(TAIL_MODEL, TAIL_SCALER)
-        feats["p_tail"] = predict_proba_df(feats, tail_model, tail_scaler, FEATURE_COLS)
-    else:
-        feats["p_tail"] = 0.0
-
-    # mode tail/tail_utility는 tail model 필요
-    if gate_mode in ("tail", "tail_utility") and not tail_available:
-        raise RuntimeError(f"gate-mode={gate_mode} requires tail_model.pkl & tail_scaler.pkl, but they are missing.")
-
-    # --- utility
-    if tail_available:
-        feats["utility"] = feats["p_success"] - (lambda_tail * feats["p_tail"])
-    else:
-        feats["utility"] = feats["p_success"]
-
-    # optional ret_score fallback (없으면 p_success로)
-    if "ret_score" not in feats.columns:
-        feats["ret_score"] = feats["p_success"]
-
-    # --- pick per date
-    picks = []
-    score_rows = []  # optional debugging table
-
-    rank_col = safe_rank_column(feats, args.rank_by)
-
-    for d, day in feats.groupby("Date", sort=True):
-        day = day.copy()
-
-        # daily utility threshold
-        # (pass if utility >= quantile)
-        if len(day) > 0:
-            u_cut = float(day["utility"].quantile(u_q))
-        else:
-            u_cut = float("nan")
-
-        # gate flags
-        pass_tail = (day["p_tail"] <= tail_max)
-        pass_utility = (day["utility"] >= u_cut)
-
-        if gate_mode == "none":
-            passed = np.ones(len(day), dtype=bool)
-        elif gate_mode == "tail":
-            passed = pass_tail.to_numpy()
-        elif gate_mode == "utility":
-            passed = pass_utility.to_numpy()
-        else:  # tail_utility
-            passed = (pass_tail & pass_utility).to_numpy()
-
-        day["Passed"] = passed.astype(int)
-        day["u_cut"] = u_cut
-        day["tail_max"] = tail_max
-        day["gate_mode"] = gate_mode
-        day["rank_col"] = rank_col
-
-        cand = day[day["Passed"] == 1].copy()
-        skipped = 0
-
-        if cand.empty:
-            # gate 통과자가 없으면 skip
-            pick_ticker = ""
-            skipped = 1
-            chosen_score = np.nan
-        else:
-            cand = cand.sort_values(rank_col, ascending=False)
-            pick_ticker = str(cand.iloc[0]["Ticker"])
-            chosen_score = float(cand.iloc[0][rank_col])
-
-        picks.append(
-            {
-                "Date": d,
-                "pick_custom": pick_ticker,
-                "Skipped": skipped,
-                "gate_mode": gate_mode,
-                "tail_max": tail_max,
-                "u_quantile": u_q,
-                "u_cut": u_cut,
-                "rank_by": args.rank_by,
-                "rank_col_used": rank_col,
-                "lambda_tail": lambda_tail,
-                "tail_model_available": int(tail_available),
-                "chosen_score": chosen_score,
-            }
-        )
-
-        if args.write_scores:
-            score_rows.append(
-                day[
-                    [
-                        "Date", "Ticker", "Passed",
-                        "p_success", "p_tail", "utility", "ret_score",
-                        "u_cut", "tail_max"
-                    ]
-                ]
+    # tail gate를 쓰는데 tail model이 없으면 바로 에러 (silent fail 방지)
+    if args.gate_mode in ("tail", "tail_utility"):
+        if not (TAIL_MODEL.exists() and TAIL_SCALER.exists()):
+            raise FileNotFoundError(
+                "gate-mode requires tail model: missing app/tail_model.pkl or app/tail_scaler.pkl"
             )
 
-    picks_df = pd.DataFrame(picks).sort_values("Date").reset_index(drop=True)
+    use["p_tail"] = predict_proba_if_possible(use, TAIL_MODEL, TAIL_SCALER, "p_tail")
 
-    out_path = out_dir / f"picks_{tag}_gate_{out_suffix}.csv"
-    picks_df.to_csv(out_path, index=False)
+    # === tau_hat attach (utility_time용) ===
+    use = attach_tau_hat(use)
 
-    meta = {
-        "updated_at_utc": now_utc_iso(),
-        "tag": tag,
-        "out_suffix": out_suffix,
-        "gate_mode": gate_mode,
-        "tail_max": tail_max,
-        "u_quantile": u_q,
-        "rank_by": args.rank_by,
-        "rank_col_used": rank_col,
-        "lambda_tail": lambda_tail,
-        "features_source": feats_src,
-        "rows_features": int(len(feats)),
-        "rows_picks": int(len(picks_df)),
-        "tail_model_available": bool(tail_available),
-        "price_source": str(PRICES_PARQUET if PRICES_PARQUET.exists() else PRICES_CSV),
-    }
-    (out_dir / f"picks_{tag}_gate_{out_suffix}_meta.json").write_text(
-        json.dumps(meta, indent=2), encoding="utf-8"
+    # === 기본 점수 구성 ===
+    # ret_score 컬럼이 있으면 사용, 없으면 p_success로 fallback
+    if "ret_score" not in use.columns:
+        use["ret_score"] = use["p_success"]
+
+    # utility 컬럼이 있으면 사용, 없으면 (p_success - lambda * p_tail)로 구성
+    if "utility" not in use.columns:
+        ptail = pd.to_numeric(use["p_tail"], errors="coerce").fillna(0.0)
+        psucc = pd.to_numeric(use["p_success"], errors="coerce").fillna(0.0)
+        use["utility"] = psucc - float(args.lambda_tail) * ptail
+
+    # utility_time: utility - gamma*log1p(tau_hat)
+    tau = pd.to_numeric(use["tau_hat"], errors="coerce")
+    tau_fill = tau.fillna(tau.median() if np.isfinite(tau.median()) else float(args.max_days))
+    use["utility_time"] = pd.to_numeric(use["utility"], errors="coerce").fillna(0.0) - float(args.tau_gamma) * np.log1p(
+        tau_fill.clip(lower=1.0)
     )
 
-    print(f"[DONE] wrote picks -> {out_path}")
-    print(json.dumps(meta, ensure_ascii=False))
+    # === Gate 필터 ===
+    candidates = use.copy()
 
-    if args.write_scores and score_rows:
-        scores_df = pd.concat(score_rows, ignore_index=True)
-        scores_path = out_dir / f"scores_{tag}_gate_{out_suffix}.csv"
-        scores_df.to_csv(scores_path, index=False)
-        print(f"[DONE] wrote scores -> {scores_path}")
+    # tail gate
+    if args.gate_mode in ("tail", "tail_utility"):
+        candidates = candidates[pd.to_numeric(candidates["p_tail"], errors="coerce") <= float(args.tail_max)]
+
+    # utility gate (daily quantile)
+    if args.gate_mode in ("utility", "tail_utility"):
+        base = pd.to_numeric(candidates["utility"], errors="coerce")
+        candidates = candidates.assign(_u=base)
+        # 날짜별 분위수 컷
+        q = float(args.u_quantile)
+        u_cut = candidates.groupby("Date")["_u"].transform(lambda s: s.quantile(q) if len(s) else np.nan)
+        candidates = candidates[candidates["_u"] >= u_cut].drop(columns=["_u"], errors="ignore")
+
+    # rank score 선택
+    score_col = args.rank_by
+
+    # === 날짜별 top1 pick ===
+    picks = daily_pick_top1(candidates[["Date", "Ticker", score_col]].copy(), score_col=score_col)
+
+    # 모든 날짜에 대해 “스킵 여부”를 포함한 pick 테이블 만들기
+    all_dates = pd.DataFrame({"Date": sorted(use["Date"].dropna().unique())})
+    out = all_dates.merge(picks, on="Date", how="left")
+    out["Skipped"] = out["pick_custom"].isna().astype(int)
+
+    # 메타 컬럼
+    out["tag"] = tag
+    out["gate_mode"] = args.gate_mode
+    out["rank_by"] = args.rank_by
+    out["tail_max"] = float(args.tail_max)
+    out["u_quantile"] = float(args.u_quantile)
+    out["lambda_tail"] = float(args.lambda_tail)
+    out["profit_target"] = float(args.profit_target)
+    out["max_days"] = int(args.max_days)
+    out["stop_level"] = float(args.stop_level)
+    out["max_extend_days"] = int(args.max_extend_days)
+    out["out_suffix"] = args.out_suffix
+
+    # 저장
+    out_path = SIGNALS_DIR / f"picks_{tag}_gate_{args.out_suffix}.csv"
+    out.to_csv(out_path, index=False)
+
+    # 디버그(짧게)
+    skip_rate = float(out["Skipped"].mean()) if len(out) else 1.0
+    print("=" * 60)
+    print(f"[DONE] wrote {out_path}")
+    print("rows:", len(out), "skip_rate:", round(skip_rate, 4))
+    print("example picks:\n", out.dropna(subset=["pick_custom"]).head(5).to_string(index=False))
+    print("=" * 60)
 
 
 if __name__ == "__main__":
