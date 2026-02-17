@@ -82,12 +82,10 @@ echo "[INFO] TAG=${TAG}"
 trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
 
 to_list() {
-  # split comma string into lines
   echo "$1" | tr ',' '\n' | trim | sed '/^$/d'
 }
 
 fmt_q() {
-  # float -> q0p75 style
   python - <<PY
 x=float("$1")
 s=f"{x:.2f}".rstrip("0").rstrip(".")
@@ -96,7 +94,6 @@ PY
 }
 
 fmt_t() {
-  # float -> t0p20 style
   python - <<PY
 x=float("$1")
 s=f"{x:.2f}".rstrip("0").rstrip(".")
@@ -129,7 +126,6 @@ run_one() {
   ttag="$(fmt_t "${tail}")"
   qtag="$(fmt_q "${uq}")"
 
-  # suffix format: <mode>_<t>_<q>_r<rank>
   local suffix="${mode}_${ttag}_q${qtag}_r${rank}"
 
   echo "=============================="
@@ -141,8 +137,13 @@ run_one() {
   local curve_parq="${SIGNALS_DIR}/sim_engine_curve_${TAG}_gate_${suffix}.parquet"
   local summary_csv="${SIGNALS_DIR}/gate_summary_${TAG}_gate_${suffix}.csv"
 
-  # 1) predict + pick (writes picks_*.csv)
+  # 1) predict + pick
+  # ✅ FIX: predict_gate.py가 요구하는 PT/H/SL/EX 인자 전달
   python "${PRED}" \
+    --profit-target "${PROFIT_TARGET}" \
+    --max-days "${MAX_DAYS}" \
+    --stop-level "${STOP_LEVEL}" \
+    --max-extend-days "${MAX_EXTEND_DAYS}" \
     --mode "${mode}" \
     --tag "${TAG}" \
     --suffix "${suffix}" \
@@ -161,7 +162,7 @@ run_one() {
     exit 1
   fi
 
-  # 2) simulate (writes trades/curve parquet)
+  # 2) simulate
   python "${SIM}" \
     --picks-path "${picks_path}" \
     --prices-parq "${PRICES_PARQ}" \
@@ -184,7 +185,7 @@ run_one() {
     exit 1
   fi
 
-  # 3) summarize -> gate_summary_*.csv (includes leverage-adjusted metrics)
+  # 3) summarize
   python "${SUM}" \
     --trades-path "${trades_parq}" \
     --curve-path "${curve_parq}" \
@@ -206,15 +207,9 @@ run_one() {
   echo "[OK] summary=${summary_csv}"
 }
 
-# Modes determine what axes to run:
-# - none      : ignores tail/uq but still iterates for consistent suffix grid (use given values)
-# - tail      : iter tail x ranks (uq fixed)
-# - utility   : iter uq x ranks (tail fixed)
-# - tail_utility : full tail x uq x ranks
 for mode in ${modes}; do
   case "${mode}" in
     none)
-      # pick first tail/uq values (still loop ranks)
       first_tail="$(echo "${tails}" | head -n 1)"
       first_uq="$(echo "${uqnts}" | head -n 1)"
       for rank in ${ranks}; do
@@ -255,7 +250,7 @@ done
 echo "--------------------------------------------"
 echo "[DONE] gate grid runs completed"
 echo "[DEBUG] summaries:"
-ls -la "${SIGNALS_DIR}"/gate_summary_"${TAG}"_gate_*.csv | sed -n '1,200p' || true
+ls -la "${SIGNALS_DIR}"/gate_summary_"${TAG}"_gate_*.csv 2>/dev/null | sed -n '1,200p' || true
 echo "[DEBUG] count summaries:"
 ls -1 "${SIGNALS_DIR}"/gate_summary_"${TAG}"_gate_*.csv 2>/dev/null | wc -l || true
 echo "--------------------------------------------"
