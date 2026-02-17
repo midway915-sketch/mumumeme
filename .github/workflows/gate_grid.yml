@@ -40,6 +40,10 @@ on:
         required: true
         default: "false"
 
+  schedule:
+    # 매일 한국시간 08:10 (UTC 23:10)
+    - cron: "10 23 * * *"
+
 jobs:
   grid:
     runs-on: ubuntu-latest
@@ -70,66 +74,222 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p data/raw data/features data/labels data/signals app scripts
+          mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      # ✅ 핵심: "없으면 만들고, 있으면 재사용" + rebuild_all=true면 강제 재생성
-      - name: Prepare required files (reuse if possible)
+      - name: Set LABEL_SPEC env
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "LABEL_SPEC=pt=${{ inputs.profit_target }},h=${{ inputs.max_days }},sl=${{ inputs.stop_level }},ex=${{ inputs.max_extend_days }}" >> $GITHUB_ENV
+
+      # ---- PRICES cache
+      - name: Restore cache (PRICES)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/raw/prices.parquet
+            data/raw/prices.csv
+            data/raw/prices_meta.json
+          key: >
+            mumumeme-prices-v2-${{ runner.os }}-
+            ${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
+          restore-keys: |
+            mumumeme-prices-v2-${{ runner.os }}-
+
+      # ---- FEATURES cache
+      - name: Restore cache (FEATURES_MODEL)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/features/features_model.parquet
+            data/features/features_model.csv
+          key: >
+            mumumeme-features-v2-${{ runner.os }}-
+            ${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py',
+                          'scripts/build_features.py','scripts/build_ev_features.py','scripts/merge_incremental_table.py') }}
+          restore-keys: |
+            mumumeme-features-v2-${{ runner.os }}-
+
+      # ---- MODEL cache
+      - name: Restore cache (MODEL)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/labels/labels_model.parquet
+            data/labels/labels_model.csv
+            app/model.pkl
+            app/scaler.pkl
+            data/meta/build_fingerprint.json
+          key: >
+            mumumeme-model-v2-${{ runner.os }}-
+            ${{ env.LABEL_SPEC }}-
+            ${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/check_rebuild.py','scripts/merge_incremental_table.py') }}
+          restore-keys: |
+            mumumeme-model-v2-${{ runner.os }}-
+
+      - name: Fingerprint check (partial rebuild flags)
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(python scripts/check_rebuild.py \
+            --fingerprint-path data/meta/build_fingerprint.json \
+            --label-spec "${{ env.LABEL_SPEC }}" \
+            --features-files "scripts/build_features.py,scripts/build_ev_features.py,scripts/merge_incremental_table.py" \
+            --labels-files "scripts/build_labels.py,scripts/train_model.py,scripts/merge_incremental_table.py" \
+            --universe-files "scripts/universe.py,data/universe.csv" \
+            --strategy-files "scripts/predict_gate.py,scripts/simulate_single_position_engine.py,scripts/gate_grid_lib.sh,scripts/run_grid_workflow.sh,scripts/summarize_sim_trades.py,scripts/aggregate_gate_grid.py" \
+          )"
+          echo "$out"
+          echo "$out" | tail -n 4 >> $GITHUB_ENV
+
+      - name: Prepare required files (daily incremental)
         shell: bash
         env:
           REBUILD_ALL: ${{ inputs.rebuild_all }}
+          REBUILD_PRICES: ${{ env.REBUILD_PRICES }}
+          REBUILD_FEATURES: ${{ env.REBUILD_FEATURES }}
+          REBUILD_MODEL: ${{ env.REBUILD_MODEL }}
+          CLEAR_SIGNALS: ${{ env.CLEAR_SIGNALS }}
+
+          PROFIT_TARGET: ${{ inputs.profit_target }}
+          MAX_DAYS: ${{ inputs.max_days }}
+          STOP_LEVEL: ${{ inputs.stop_level }}
+
         run: |
           set -euo pipefail
 
-          prices_ok="false"
-          feat_ok="false"
-          model_ok="false"
-
-          if [ -f data/raw/prices.parquet ] || [ -f data/raw/prices.csv ]; then prices_ok="true"; fi
-          if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then feat_ok="true"; fi
-          if [ -f app/model.pkl ] && [ -f app/scaler.pkl ]; then model_ok="true"; fi
-
-          echo "[INFO] existing: prices_ok=$prices_ok feat_ok=$feat_ok model_ok=$model_ok"
-          echo "[INFO] rebuild_all=$REBUILD_ALL"
-
           if [ "$REBUILD_ALL" = "true" ]; then
-            echo "[INFO] rebuild_all=true -> force rebuild everything"
+            REBUILD_PRICES="1"; REBUILD_FEATURES="1"; REBUILD_MODEL="1"; CLEAR_SIGNALS="1"
+          fi
+
+          if [ "$CLEAR_SIGNALS" = "1" ]; then
+            rm -rf data/signals/* || true
+          fi
+
+          # upstream 삭제
+          if [ "$REBUILD_PRICES" = "1" ]; then
             rm -f data/raw/prices.parquet data/raw/prices.csv data/raw/prices_meta.json || true
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
             rm -f app/model.pkl app/scaler.pkl || true
-            prices_ok="false"; feat_ok="false"; model_ok="false"
+          elif [ "$REBUILD_FEATURES" = "1" ]; then
+            rm -f data/features/features_model.parquet data/features/features_model.csv || true
+            rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
+            rm -f app/model.pkl app/scaler.pkl || true
+          elif [ "$REBUILD_MODEL" = "1" ]; then
+            rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
+            rm -f app/model.pkl app/scaler.pkl || true
           fi
 
-          # 1) prices
-          if [ "$prices_ok" != "true" ]; then
-            echo "[INFO] building prices..."
-            python scripts/universe.py
+          # 1) prices: 매일 증분 갱신
+          python scripts/universe.py
+          if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full
           else
-            echo "[INFO] prices reuse"
+            python scripts/fetch_prices.py --include-extra --lookback-days 10
           fi
 
-          # 2) features_model
-          if [ "$feat_ok" != "true" ]; then
-            echo "[INFO] building features_model..."
-            python scripts/build_features.py
+          # 2) START_DATE 자동 산출 (features 마지막 날짜 기준)
+          #    - 매일은 15~30일 정도만 다시 만들면 충분 (롤링은 build_features.py가 내부 lookback으로 해결)
+          RECOMPUTE_DAYS=20
+          START_DATE=""
+          if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
+            START_DATE="$(python - <<'PY'
+import pandas as pd
+from pathlib import Path
+p=Path("data/features/features_model.parquet")
+c=Path("data/features/features_model.csv")
+df=None
+if p.exists():
+  df=pd.read_parquet(p)
+elif c.exists():
+  df=pd.read_csv(c)
+if df is None or len(df)==0 or "Date" not in df.columns:
+  print("")
+else:
+  d=pd.to_datetime(df["Date"], errors="coerce").dropna()
+  if len(d)==0:
+    print("")
+  else:
+    last=d.max()
+    start=last - pd.Timedelta(days=20)
+    print(start.strftime("%Y-%m-%d"))
+PY
+)"
+          fi
+          echo "[INFO] START_DATE=$START_DATE"
+
+          # 3) features: backup -> build recent -> merge
+          if [ -n "$START_DATE" ] && [ -f data/features/features_model.parquet -o -f data/features/features_model.csv ]; then
+            rm -rf data/_backup/features || true
+            mkdir -p data/_backup/features
+            [ -f data/features/features_model.parquet ] && cp data/features/features_model.parquet data/_backup/features/old.parquet || true
+            [ -f data/features/features_model.csv ] && cp data/features/features_model.csv data/_backup/features/old.csv || true
+
+            # build recent slice (overwrites output)
+            python scripts/build_features.py --start-date "$START_DATE" --max-window 260 --buffer-days 40
+
+            # move new slice to temp
+            rm -rf data/_backup/features/new || true
+            mkdir -p data/_backup/features/new
+            [ -f data/features/features_model.parquet ] && mv data/features/features_model.parquet data/_backup/features/new/new.parquet || true
+            [ -f data/features/features_model.csv ] && mv data/features/features_model.csv data/_backup/features/new/new.csv || true
+
+            # merge back to final
+            python scripts/merge_incremental_table.py \
+              --old-parq data/_backup/features/old.parquet \
+              --old-csv data/_backup/features/old.csv \
+              --new-parq data/_backup/features/new/new.parquet \
+              --new-csv data/_backup/features/new/new.csv \
+              --out-parq data/features/features_model.parquet \
+              --out-csv data/features/features_model.csv \
+              --cut-date "$START_DATE"
           else
-            echo "[INFO] features_model reuse"
+            # no existing -> full
+            python scripts/build_features.py
           fi
 
-          # 3) model.pkl/scaler.pkl (gate에서 p_success 쓰면 필수)
-          if [ "$model_ok" != "true" ]; then
-            echo "[INFO] building labels + training model..."
-            python scripts/build_labels.py
+          # 4) labels: backup -> build recent -> merge
+          #    label은 inputs/env의 PT/H/SL 반영해야 하니까 args로 넘김
+          if [ -n "$START_DATE" ] && ( [ -f data/labels/labels_model.parquet ] || [ -f data/labels/labels_model.csv ] ); then
+            rm -rf data/_backup/labels || true
+            mkdir -p data/_backup/labels
+            [ -f data/labels/labels_model.parquet ] && cp data/labels/labels_model.parquet data/_backup/labels/old.parquet || true
+            [ -f data/labels/labels_model.csv ] && cp data/labels/labels_model.csv data/_backup/labels/old.csv || true
+
+            python scripts/build_labels.py \
+              --start-date "$START_DATE" \
+              --profit-target "$PROFIT_TARGET" \
+              --max-days "$MAX_DAYS" \
+              --stop-level "$STOP_LEVEL" \
+              --buffer-days 120
+
+            rm -rf data/_backup/labels/new || true
+            mkdir -p data/_backup/labels/new
+            [ -f data/labels/labels_model.parquet ] && mv data/labels/labels_model.parquet data/_backup/labels/new/new.parquet || true
+            [ -f data/labels/labels_model.csv ] && mv data/labels/labels_model.csv data/_backup/labels/new/new.csv || true
+
+            python scripts/merge_incremental_table.py \
+              --old-parq data/_backup/labels/old.parquet \
+              --old-csv data/_backup/labels/old.csv \
+              --new-parq data/_backup/labels/new/new.parquet \
+              --new-csv data/_backup/labels/new/new.csv \
+              --out-parq data/labels/labels_model.parquet \
+              --out-csv data/labels/labels_model.csv \
+              --cut-date "$START_DATE"
+          else
+            python scripts/build_labels.py \
+              --profit-target "$PROFIT_TARGET" \
+              --max-days "$MAX_DAYS" \
+              --stop-level "$STOP_LEVEL"
+          fi
+
+          # 5) model: 없으면 학습 (매일 재학습 원하면 여기서 무조건 호출로 바꾸면 됨)
+          if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
             python scripts/train_model.py
           else
-            echo "[INFO] model reuse"
+            echo "[INFO] model exists -> reuse"
           fi
-
-          echo "[INFO] final check:"
-          ls -la data/raw | sed -n '1,200p' || true
-          ls -la data/features | sed -n '1,200p' || true
-          ls -la app | sed -n '1,200p' || true
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
@@ -146,10 +306,6 @@ jobs:
           GATE_MODES: "none,tail,utility,tail_utility"
         run: |
           set -euo pipefail
-          if [ ! -f scripts/run_grid_workflow.sh ]; then
-            echo "[ERROR] scripts/run_grid_workflow.sh not found"
-            exit 1
-          fi
           chmod +x scripts/run_grid_workflow.sh || true
           bash scripts/run_grid_workflow.sh
 
@@ -164,26 +320,12 @@ jobs:
             --pattern "gate_summary_*.csv" \
             --topn 30
 
-      - name: Sanity check (counts)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "[CHECK] gate_summary count:"
-          ls -1 data/signals/gate_summary_*.csv 2>/dev/null | wc -l || true
-          echo "[CHECK] picks count:"
-          ls -1 data/signals/picks_*.csv 2>/dev/null | wc -l || true
-          echo "[CHECK] trades parquet count:"
-          ls -1 data/signals/sim_engine_trades_*.parquet 2>/dev/null | wc -l || true
-          echo "[CHECK] curve parquet count:"
-          ls -1 data/signals/sim_engine_curve_*.parquet 2>/dev/null | wc -l || true
-          echo "[CHECK] signals dir (first 200):"
-          ls -la data/signals | sed -n '1,200p' || true
-
-      - name: Upload artifacts (signals)
+      - name: Upload artifacts (signals + meta)
         uses: actions/upload-artifact@v4
         with:
           name: gate-grid-results
           path: |
+            data/meta/build_fingerprint.json
             data/signals/gate_summary_*.csv
             data/signals/gate_grid_aggregate.csv
             data/signals/gate_grid_top_by_recent10y.csv
