@@ -11,28 +11,39 @@ def _to_dt(x):
     return pd.to_datetime(x, errors="coerce")
 
 
-def _as_series(x, n: int | None = None) -> pd.Series:
-    """
-    Ensure x becomes a pandas Series.
-    If scalar, wrap it. If None, return empty/filled series as appropriate.
-    """
+def _force_series(x, n: int) -> pd.Series:
+    """Always return a Series of length n (broadcast scalar if needed)."""
     if isinstance(x, pd.Series):
-        return x
-    if isinstance(x, pd.DataFrame):
-        raise TypeError("Expected Series/scalar, got DataFrame")
-    if n is None:
-        return pd.Series([x])
-    return pd.Series([x] * n)
+        if len(x) == n:
+            return x
+        # length mismatch -> align by broadcasting last value
+        if len(x) == 0:
+            return pd.Series([np.nan] * n)
+        return pd.Series([x.iloc[-1]] * n)
+    # scalar / list / ndarray
+    if np.isscalar(x):
+        return pd.Series([x] * n)
+    try:
+        s = pd.Series(x)
+        if len(s) == n:
+            return s
+        if len(s) == 0:
+            return pd.Series([np.nan] * n)
+        return pd.Series([s.iloc[-1]] * n)
+    except Exception:
+        return pd.Series([np.nan] * n)
 
 
 def _safe_numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
+    n = len(df)
     if col not in df.columns:
-        return pd.Series([np.nan] * len(df))
+        return pd.Series([np.nan] * n)
+
     x = df[col]
-    s = pd.to_numeric(_as_series(x, n=len(df)), errors="coerce")
-    # if df[col] was already a Series, _as_series returns it unchanged
-    if isinstance(x, pd.Series):
-        s = pd.to_numeric(x, errors="coerce")
+
+    # df[col] can be Series, scalar-like, or even weird object -> force Series
+    s = _force_series(x, n)
+    s = pd.to_numeric(s, errors="coerce")
     return s
 
 
@@ -72,11 +83,12 @@ def _holding_days(df: pd.DataFrame) -> pd.Series:
             entry_col = c
         if cl in ("exitdate", "exit_date", "exit"):
             exit_col = c
+
     if entry_col and exit_col:
         e = _to_dt(df[entry_col])
         x = _to_dt(df[exit_col])
         d = (x - e).dt.days
-        return pd.to_numeric(d, errors="coerce")
+        return pd.to_numeric(_force_series(d, len(df)), errors="coerce")
 
     return pd.Series([np.nan] * len(df))
 
@@ -96,18 +108,23 @@ def _is_win(df: pd.DataFrame) -> pd.Series:
     if df is None or len(df) == 0:
         return pd.Series(dtype=int)
 
+    n = len(df)
+
     for col in ["Win", "win", "IsWin", "is_win", "Success", "success"]:
         if col in df.columns:
             s = _safe_numeric_series(df, col)
+            # ✅ 핵심: 여기서 어떤 경우든 Series이므로 fillna 안전
             return (s.fillna(0) > 0).astype(int)
 
     r = _cycle_return(df)
-    return (pd.to_numeric(r, errors="coerce") > 0).astype(int)
+    r = pd.to_numeric(_force_series(r, n), errors="coerce")
+    return (r.fillna(0) > 0).astype(int)
 
 
 def _max_leverage_pct(df: pd.DataFrame) -> float | None:
     if df is None or len(df) == 0:
         return None
+
     for col in ["MaxLeveragePct", "max_leverage_pct", "LeveragePct", "leverage_pct"]:
         if col in df.columns:
             v = _safe_numeric_series(df, col).dropna()
@@ -129,12 +146,15 @@ def _recent10y_seed_multiple(df: pd.DataFrame) -> float | None:
         return None
 
     d = _to_dt(df[date_col])
-    if d.isna().all():
+    if isinstance(d, pd.Series) and d.isna().all():
         return None
 
-    last = d.max()
+    last = pd.to_datetime(d, errors="coerce").max()
+    if pd.isna(last):
+        return None
+
     start = last - pd.Timedelta(days=365 * 10)
-    sub = df.loc[d >= start].copy()
+    sub = df.loc[pd.to_datetime(d, errors="coerce") >= start].copy()
     if sub.empty:
         return None
 
@@ -158,8 +178,11 @@ def main() -> None:
         raise FileNotFoundError(f"Missing trades parquet: {p}")
 
     df = pd.read_parquet(p)
-    if not isinstance(df, pd.DataFrame):
-        # ultra defensive: wrap scalar/series into DataFrame
+
+    # ultra defensive
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+    elif not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(df)
 
     hold = _holding_days(df)
@@ -171,7 +194,8 @@ def main() -> None:
         max_extend = float(max(0.0, max_hold - float(args.max_days)))
 
     wins = _is_win(df)
-    cycle_cnt = int(len(wins)) if wins is not None else 0
+    wins = _force_series(wins, len(df))
+    cycle_cnt = int(len(wins))
     win_cnt = int(pd.to_numeric(wins, errors="coerce").fillna(0).sum()) if cycle_cnt > 0 else 0
     success_rate = (win_cnt / cycle_cnt) if cycle_cnt > 0 else 0.0
 
