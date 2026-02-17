@@ -89,16 +89,35 @@ def summarize_one_method(
         out["Seed_Multiple_All"] = float(final_eq / start_eq) if start_eq != 0 else float("nan")
         out["Max_Drawdown"] = max_drawdown(eq)
 
-        # 최대 홀딩일
-        out["max_holding_days"] = int(pd.to_numeric(c["HoldingDays"], errors="coerce").max())
+        # 최대 홀딩일 (curve에 없거나 NaN이면 trades로 보강)
+        max_hold = 0
 
-        # max_days 초과분(=연장 최대치)
+        if "HoldingDays" in c.columns:
+            hd_series = pd.to_numeric(c["HoldingDays"], errors="coerce")
+            hd_max = hd_series.max()
+            if pd.notna(hd_max):
+                max_hold = int(hd_max)
+
+        # curve에서 못 구하면 trades에서 보강
+        if (max_hold == 0) and (trades is not None) and (not trades.empty):
+            t2 = trades[trades["Method"] == method].copy()
+            if "HoldingDays" in t2.columns:
+                hd2 = pd.to_numeric(t2["HoldingDays"], errors="coerce").max()
+                if pd.notna(hd2):
+                    max_hold = int(hd2)
+
+        out["max_holding_days"] = int(max_hold)
+
+        # max_days 초과분(=연장 최대치) - HoldingDays가 없거나 NaN이면 0
         if max_days > 0:
-            hd = pd.to_numeric(c["HoldingDays"], errors="coerce").fillna(0).to_numpy(dtype=float)
-            exceed = np.maximum(hd - max_days, 0)
-            out["max_extend_days_over_maxday"] = int(np.max(exceed))
+            if "HoldingDays" in c.columns:
+                hd = pd.to_numeric(c["HoldingDays"], errors="coerce").fillna(0).to_numpy(dtype=float)
+                exceed = np.maximum(hd - max_days, 0)
+                out["max_extend_days_over_maxday"] = int(np.nanmax(exceed)) if exceed.size else 0
+            else:
+                out["max_extend_days_over_maxday"] = 0
         else:
-            out["max_extend_days_over_maxday"] = int(0)
+            out["max_extend_days_over_maxday"] = 0
 
         # 최근 N년 배수
         start_date = last_date - pd.DateOffset(years=recent_years)
