@@ -124,7 +124,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p data/features
-          # build_features.py는 네 repo의 CLI에 맞게 동작한다고 가정
           python scripts/build_features.py
 
       - name: Normalize features filename (ensure features_model.* exists)
@@ -144,46 +143,36 @@ jobs:
           import shutil
 
           d = Path("data/features")
-          # 후보: parquet 우선, 없으면 csv
-          cand_parq = sorted([p for p in d.glob("*.parquet") if "features" in p.name.lower()])
-          cand_csv  = sorted([p for p in d.glob("*.csv") if "features" in p.name.lower()])
+          cand_parq = sorted([p for p in d.glob("*.parquet") if "feature" in p.name.lower()])
+          cand_csv  = sorted([p for p in d.glob("*.csv") if "feature" in p.name.lower()])
 
           def pick_best(paths):
-              # features_model/ model / 가장 긴(보통 feature가 많음) 파일명을 우선
               if not paths:
                   return None
-              score = []
+              scored=[]
               for p in paths:
-                  name = p.name.lower()
-                  s = 0
-                  if "model" in name: s += 50
-                  if "features_model" in name: s += 100
-                  if "daily" in name: s += 10
-                  if "all" in name: s += 5
-                  # 파일 크기 가산
+                  name=p.name.lower()
+                  s=0
+                  if "features_model" in name: s+=200
+                  if "model" in name: s+=100
+                  if "daily" in name: s+=10
                   try:
-                      s += int(p.stat().st_size / 1024)
+                      s += int(p.stat().st_size/1024)
                   except:
                       pass
-                  score.append((s, p))
-              score.sort(key=lambda x: x[0], reverse=True)
-              return score[0][1]
+                  scored.append((s,p))
+              scored.sort(key=lambda x:x[0], reverse=True)
+              return scored[0][1]
 
           src = pick_best(cand_parq) or pick_best(cand_csv)
           if src is None:
-              raise SystemExit("[ERROR] No features*.parquet/csv found under data/features. build_features.py output missing?")
+              raise SystemExit("[ERROR] No feature files found under data/features. build_features.py output missing?")
 
-          # 복사해서 표준명 생성
-          if src.suffix == ".parquet":
-              dst = d / "features_model.parquet"
-          else:
-              dst = d / "features_model.csv"
-
+          dst = d / ("features_model.parquet" if src.suffix == ".parquet" else "features_model.csv")
           shutil.copy2(src, dst)
           print(f"[DONE] normalized features: {src} -> {dst}")
           PY
 
-          echo "[INFO] data/features listing:"
           ls -la data/features | head -n 200 || true
 
       # =========================
@@ -202,7 +191,6 @@ jobs:
           RANK_BY_LIST: ${{ inputs.rank_metric }}
           LAMBDA_TAIL: ${{ inputs.utility_tail_penalty_lambda }}
 
-          # 내부 gamma 그리드(원하면 여기 숫자만 바꾸면 됨)
           TAU_GAMMA_LIST: "0.03,0.05,0.08"
         run: |
           set -euo pipefail
@@ -217,9 +205,7 @@ jobs:
           ls -la data/signals | tail -n 200 || true
 
       # =========================
-      # 2차 미세 그리드: Pareto Top30 기반 자동 축소
-      #  - PT/H/SL + gate params( tail_max/u_quantile/rank_by/tau_gamma )를
-      #    Top30에서 추출해, "좁힌 리스트"로 2차 grid 재실행
+      # 2차 미세그리드: Pareto Top30 기반 자동 축소
       # =========================
       - name: Derive refine grid from Pareto Top30
         shell: bash
@@ -234,7 +220,6 @@ jobs:
           sig = Path("data/signals")
           src = sig / "gate_grid_pareto4.csv"
           if not src.exists():
-            # pareto4가 없으면 pareto로 fallback
             src = sig / "gate_grid_pareto.csv"
           if not src.exists():
             raise SystemExit("[ERROR] No pareto csv found (gate_grid_pareto4.csv or gate_grid_pareto.csv).")
@@ -243,7 +228,6 @@ jobs:
           if df.empty:
             raise SystemExit("[ERROR] pareto csv is empty.")
 
-          # eff_score4 있으면 그걸로, 없으면 eff_score/metric로
           if "eff_score4" in df.columns:
             df = df.sort_values("eff_score4", ascending=False)
           elif "eff_score" in df.columns:
@@ -262,48 +246,30 @@ jobs:
                 break
             return out
 
-          # 1) PT/H/SL 후보(Top30 중심 + 주변 미세)
-          pts = []
-          hs = []
-          sls = []
-
+          pts=[]; hs=[]; sls=[]
           for _, r in top.iterrows():
-            pt = float(r.get("PT", r.get("profit_target", float("nan"))))
-            h  = int(r.get("H", r.get("max_days", float("nan"))))
-            sl = float(r.get("SL", r.get("stop_level", float("nan"))))
+            pt = float(r.get("PT", float("nan")))
+            h  = float(r.get("H", float("nan")))
+            sl = float(r.get("SL", float("nan")))
 
             if pt == pt:
               pts += [max(0.01, pt-0.01), pt, pt+0.01]
-            if h == h and h > 0:
+            if h == h:
+              h = int(h)
               hs += [max(5, h-5), h, h+5]
             if sl == sl:
-              # sl은 음수
               sls += [sl-0.05, sl, sl+0.05]
 
-          # 정리/라운딩
-          pts = sorted(set(round(x, 4) for x in pts if x > 0 and x < 1.0))
-          hs  = sorted(set(int(x) for x in hs if x > 0))
-          sls = sorted(set(round(x, 4) for x in sls if x < 0))
+          pts = sorted(set(round(x,4) for x in pts if 0 < x < 1.0))[:12]
+          hs  = sorted(set(int(x) for x in hs if x > 0))[:9]
+          sls = sorted(set(round(x,4) for x in sls if x < 0))[:9]
 
-          # 폭발 방지: 너무 많으면 컷(액션 시간)
-          pts = pts[:12]
-          hs  = hs[:9]
-          sls = sls[:9]
+          tails = uniq_limit([round(float(x),4) for x in top.get("tail_max", []) if pd.notna(x)], 8) or [0.20, 0.30]
+          uqs   = uniq_limit([round(float(x),4) for x in top.get("u_quantile", []) if pd.notna(x)], 8) or [0.75, 0.90]
+          ranks = uniq_limit([str(x) for x in top.get("rank_by", []) if pd.notna(x)], 6) or ["utility", "utility_time"]
+          gams  = uniq_limit([round(float(x),4) for x in top.get("tau_gamma", []) if pd.notna(x)], 6) or [0.03, 0.05, 0.08]
 
-          # 2) gate 파라미터 후보도 Top30에서 좁힘
-          tails = uniq_limit([round(float(x), 4) for x in top.get("tail_max", []) if pd.notna(x)], 8)
-          uqs   = uniq_limit([round(float(x), 4) for x in top.get("u_quantile", []) if pd.notna(x)], 8)
-          ranks = uniq_limit([str(x) for x in top.get("rank_by", []) if pd.notna(x)], 6)
-          gams  = uniq_limit([round(float(x), 4) for x in top.get("tau_gamma", []) if pd.notna(x)], 6)
-
-          # fallback(혹시 컬럼이 없으면)
-          if not tails: tails = [0.20, 0.30]
-          if not uqs:   uqs   = [0.75, 0.90]
-          if not ranks: ranks = ["utility", "utility_time"]
-          if not gams:  gams  = [0.03, 0.05, 0.08]
-
-          def join(vals):
-            return ",".join(str(v) for v in vals)
+          def join(vals): return ",".join(str(v) for v in vals)
 
           env_lines = [
             f"PROFIT_TARGET_INPUT_REFINE={join(pts)}",
@@ -315,7 +281,6 @@ jobs:
             f"TAU_GAMMA_LIST_REFINE={join(gams)}",
           ]
 
-          # write to GITHUB_ENV
           github_env = os.environ.get("GITHUB_ENV")
           if not github_env:
             raise SystemExit("[ERROR] GITHUB_ENV not set")
@@ -328,7 +293,7 @@ jobs:
             print(" ", line)
           PY
 
-      - name: Run grid (Round-2 refine from Pareto Top30)
+      - name: Run grid (Round-2 refine)
         shell: bash
         env:
           PROFIT_TARGET_INPUT: ${{ env.PROFIT_TARGET_INPUT_REFINE }}
@@ -344,10 +309,9 @@ jobs:
           TAU_GAMMA_LIST: ${{ env.TAU_GAMMA_LIST_REFINE }}
         run: |
           set -euo pipefail
-          # 2차는 기존 결과 위에 계속 쌓이게 둠 (요약/aggregate가 전체를 다시 읽음)
           bash scripts/run_grid_workflow.sh
 
-      - name: Aggregate gate grid (Round-2 final)
+      - name: Aggregate gate grid (Final)
         shell: bash
         run: |
           set -euo pipefail
@@ -355,9 +319,6 @@ jobs:
           echo "[INFO] Final outputs:"
           ls -la data/signals | tail -n 200 || true
 
-      # =========================
-      # Artifacts 업로드
-      # =========================
       - name: Upload artifacts (signals + summaries)
         uses: actions/upload-artifact@v4
         with:
@@ -368,8 +329,8 @@ jobs:
             data/signals/gate_summary_*.csv
             data/signals/picks_*.csv
             data/signals/sim_engine_*.parquet
-            data/signals/sim_engine_*.csv
             data/raw/prices*.*
             data/features/*.*
             data/labels/*.*
+            data/raw_data.csv
             app/*.pkl
