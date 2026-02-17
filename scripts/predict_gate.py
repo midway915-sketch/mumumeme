@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -22,9 +23,26 @@ def _to_dt(x):
     return pd.to_datetime(x, errors="coerce")
 
 
+def _make_tau_cutoffs(max_days: int) -> tuple[int, int, int]:
+    c3 = int(max_days)
+    c1 = min(10, c3)
+    c2 = min(20, c3)
+    if c1 >= c3:
+        c1 = max(1, c3 - 2)
+    if c2 <= c1:
+        mid = (c1 + c3) // 2
+        c2 = mid if mid > c1 else min(c3 - 1, c1 + 1)
+    if c2 >= c3:
+        c2 = max(c1 + 1, c3 - 1)
+    if not (c1 < c2 < c3):
+        c1 = max(1, int(round(c3 * 0.33)))
+        c2 = max(c1 + 1, int(round(c3 * 0.66)))
+        c2 = min(c2, c3 - 1)
+    return int(c1), int(c2), int(c3)
+
+
 def _pick_feature_cols(model, fallback: list[str], df_cols: list[str]) -> list[str]:
     cols = set(df_cols)
-    # sklearn sometimes has feature_names_in_
     if hasattr(model, "feature_names_in_"):
         feats = [c for c in list(getattr(model, "feature_names_in_")) if c in cols]
         if feats:
@@ -32,10 +50,25 @@ def _pick_feature_cols(model, fallback: list[str], df_cols: list[str]) -> list[s
     feats = [c for c in fallback if c in cols]
     if feats:
         return feats
-    # last resort: numeric cols
     banned = {"Date", "Ticker"}
-    num = [c for c in df_cols if c not in banned and pd.api.types.is_numeric_dtype(pd.Series(dtype=float))]
     return [c for c in df_cols if c not in banned][:8]
+
+
+def _load_tau_cuts(tag: str, max_days: int) -> tuple[int, int, int]:
+    # prefer report json
+    report = Path(f"data/meta/train_tau_report_{tag}.json")
+    if report.exists():
+        try:
+            j = json.loads(report.read_text(encoding="utf-8"))
+            cuts = j.get("cuts", {})
+            c1 = int(cuts.get("cut1", 10))
+            c2 = int(cuts.get("cut2", 20))
+            c3 = int(cuts.get("cut3", max_days))
+            if c1 < c2 < c3:
+                return c1, c2, c3
+        except Exception:
+            pass
+    return _make_tau_cutoffs(int(max_days))
 
 
 def main() -> None:
@@ -57,8 +90,6 @@ def main() -> None:
     ap.add_argument("--utility-quantile", required=True, type=float)
     ap.add_argument("--rank-by", required=True, type=str, choices=["utility", "ret_score", "p_success"])
     ap.add_argument("--lambda-tail", required=True, type=float)
-
-    ap.add_argument("--require-files", action="store_true")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -67,27 +98,21 @@ def main() -> None:
     feats = read_table(args.features_parq, args.features_csv).copy()
     if "Date" not in feats.columns or "Ticker" not in feats.columns:
         raise ValueError("features_model must contain Date and Ticker")
+
     feats["Date"] = _to_dt(feats["Date"])
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
-    # Load models
-    # success
-    if args.require_files:
-        for p in ["app/model.pkl", "app/scaler.pkl", "app/tail_model.pkl", "app/tail_scaler.pkl", "app/tau_cdf_models.pkl", "app/tau_scaler.pkl"]:
-            if not Path(p).exists():
-                raise FileNotFoundError(f"Missing required model file: {p}")
-
+    # models
     success_model = joblib.load("app/model.pkl")
     success_scaler = joblib.load("app/scaler.pkl")
 
     tail_model = joblib.load("app/tail_model.pkl")
     tail_scaler = joblib.load("app/tail_scaler.pkl")
 
-    tau_models = joblib.load("app/tau_cdf_models.pkl")  # dict: TauLE10/20/40 -> model
+    tau_models = joblib.load("app/tau_cdf_models.pkl")  # keys: TauLE1/2/3
     tau_scaler = joblib.load("app/tau_scaler.pkl")
 
-    # Choose feature columns per model
     fallback_feats = [
         "Drawdown_252","Drawdown_60","ATR_ratio","Z_score","MACD_hist","MA20_slope","Market_Drawdown","Market_ATR_ratio"
     ]
@@ -95,11 +120,10 @@ def main() -> None:
 
     succ_feats = _pick_feature_cols(success_model, fallback_feats, cols)
     tail_feats = _pick_feature_cols(tail_model, fallback_feats, cols)
-    # tau models share same scaler features ideally; use TauLE40 model as reference
-    ref_tau_model = tau_models.get("TauLE40", next(iter(tau_models.values())))
+
+    ref_tau_model = tau_models.get("TauLE3", next(iter(tau_models.values())))
     tau_feats = _pick_feature_cols(ref_tau_model, fallback_feats, cols)
 
-    # Prepare matrices (fill NaN with 0 for inference)
     Xs = feats[succ_feats].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
     Xt = feats[tail_feats].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
     Xtau = feats[tau_feats].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=float)
@@ -111,42 +135,60 @@ def main() -> None:
     p_success = success_model.predict_proba(Xs_s)[:, 1]
     p_tail = tail_model.predict_proba(Xt_s)[:, 1]
 
-    p_le10 = tau_models["TauLE10"].predict_proba(Xtau_s)[:, 1]
-    p_le20 = tau_models["TauLE20"].predict_proba(Xtau_s)[:, 1]
-    p_le40 = tau_models["TauLE40"].predict_proba(Xtau_s)[:, 1]
+    # tau cuts
+    cut1, cut2, cut3 = _load_tau_cuts(args.tag, int(args.max_days))
 
-    # enforce monotonic cdf (optional clamp)
-    p_le10 = np.clip(p_le10, 0.0, 1.0)
-    p_le20 = np.clip(np.maximum(p_le20, p_le10), 0.0, 1.0)
-    p_le40 = np.clip(np.maximum(p_le40, p_le20), 0.0, 1.0)
+    # CDF probs
+    p_le1 = tau_models["TauLE1"].predict_proba(Xtau_s)[:, 1]
+    p_le2 = tau_models["TauLE2"].predict_proba(Xtau_s)[:, 1]
+    p_le3 = tau_models["TauLE3"].predict_proba(Xtau_s)[:, 1]
 
-    p10 = p_le10
-    p20 = np.clip(p_le20 - p_le10, 0.0, 1.0)
-    p40 = np.clip(p_le40 - p_le20, 0.0, 1.0)
-    pgt40 = np.clip(1.0 - p_le40, 0.0, 1.0)
+    # monotonic clamp
+    p_le1 = np.clip(p_le1, 0.0, 1.0)
+    p_le2 = np.clip(np.maximum(p_le2, p_le1), 0.0, 1.0)
+    p_le3 = np.clip(np.maximum(p_le3, p_le2), 0.0, 1.0)
 
-    # expected tau (representative mids)
-    tau_exp = (7.0 * p10) + (15.0 * p20) + (30.0 * p40) + (55.0 * pgt40)
+    # bin probs
+    p1 = p_le1
+    p2 = np.clip(p_le2 - p_le1, 0.0, 1.0)
+    p3 = np.clip(p_le3 - p_le2, 0.0, 1.0)
+    p4 = np.clip(1.0 - p_le3, 0.0, 1.0)
+
+    # expected tau from representative mids
+    mid1 = max(1.0, cut1 * 0.7)
+    mid2 = (cut1 + cut2) / 2.0
+    mid3 = (cut2 + cut3) / 2.0
+    mid4 = cut3 + max(5.0, (cut3 - cut2) / 2.0)  # beyond max_days bucket
+    tau_exp = (mid1 * p1) + (mid2 * p2) + (mid3 * p3) + (mid4 * p4)
 
     out = feats[["Date", "Ticker"]].copy()
     out["p_success"] = pd.to_numeric(p_success, errors="coerce")
     out["p_tail"] = pd.to_numeric(p_tail, errors="coerce")
-    out["p_tau10"] = pd.to_numeric(p10, errors="coerce")
-    out["p_tau20"] = pd.to_numeric(p20, errors="coerce")
-    out["p_tau40"] = pd.to_numeric(p40, errors="coerce")
+
+    out["tau_cut1"] = cut1
+    out["tau_cut2"] = cut2
+    out["tau_cut3"] = cut3
+
+    out["p_tau_le1"] = pd.to_numeric(p_le1, errors="coerce")
+    out["p_tau_le2"] = pd.to_numeric(p_le2, errors="coerce")
+    out["p_tau_le3"] = pd.to_numeric(p_le3, errors="coerce")
+
+    out["p_tau1"] = pd.to_numeric(p1, errors="coerce")
+    out["p_tau2"] = pd.to_numeric(p2, errors="coerce")
+    out["p_tau3"] = pd.to_numeric(p3, errors="coerce")
+    out["p_tau4"] = pd.to_numeric(p4, errors="coerce")
     out["tau_exp"] = pd.to_numeric(tau_exp, errors="coerce")
 
-    # ret_score: if exists in features use it, else proxy by (p_success - p_tail)
+    # ret_score
     if "ret_score" in feats.columns:
         out["ret_score"] = pd.to_numeric(feats["ret_score"], errors="coerce").fillna(0.0)
     else:
         out["ret_score"] = out["p_success"].fillna(0.0) - out["p_tail"].fillna(0.0)
 
-    # utility: success - lambda*tail (simple, consistent)
+    # utility
     lam = float(args.lambda_tail)
     out["utility"] = out["p_success"].fillna(0.0) - lam * out["p_tail"].fillna(0.0)
 
-    # Gate filters
     use = out.copy()
     use["Skipped"] = 0
 
@@ -156,8 +198,6 @@ def main() -> None:
         ok_tail = pd.Series([True] * len(use))
 
     if args.mode in ("utility", "tail_utility"):
-        # daily quantile cut on utility
-        # compute per day threshold
         q = float(args.utility_quantile)
         cut = use.groupby("Date")["utility"].transform(lambda s: s.quantile(q))
         ok_util = (use["utility"] >= cut)
@@ -167,41 +207,35 @@ def main() -> None:
     ok = ok_tail & ok_util
     use.loc[~ok, "Skipped"] = 1
 
-    # Rank metric
     rank_col = args.rank_by
     if rank_col not in use.columns:
         raise ValueError(f"rank_by column missing: {rank_col}")
 
-    # pick top-1 among non-skipped per day
     def pick_one(g: pd.DataFrame) -> pd.DataFrame:
         g = g.copy()
         cand = g[g["Skipped"] == 0]
-        if len(cand) == 0:
-            # no pick
-            g["Pick"] = 0
-            return g
-        # highest rank
-        idx = cand[rank_col].astype(float).idxmax()
         g["Pick"] = 0
+        if len(cand) == 0:
+            return g
+        idx = cand[rank_col].astype(float).idxmax()
         g.loc[idx, "Pick"] = 1
         return g
 
     use = use.groupby("Date", group_keys=False).apply(pick_one)
-    # output picks file: one row per day with chosen ticker (or NaN if none)
+
     picks = use[use["Pick"] == 1].copy()
-    # ensure 1 row per day: if multiple (ties), keep first
     picks = picks.sort_values(["Date", rank_col], ascending=[True, False]).drop_duplicates(["Date"], keep="first")
 
-    # create per-day file expected by simulator
-    # If no pick, still emit a file with Date rows and Skipped=1 for debugging? keep only picks is okay if sim expects picks per day.
-    # We'll emit full daily table to be safe.
     out_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
     full_path = out_dir / f"picks_full_{args.tag}_gate_{args.suffix}.csv"
 
     use = use.sort_values(["Date", "Ticker"]).reset_index(drop=True)
     use.to_csv(full_path, index=False)
 
-    picks_out = picks[["Date", "Ticker", "p_success", "p_tail", "utility", "ret_score", "tau_exp", "p_tau10", "p_tau20", "p_tau40"]].copy()
+    picks_out = picks[
+        ["Date","Ticker","p_success","p_tail","utility","ret_score","tau_exp",
+         "tau_cut1","tau_cut2","tau_cut3","p_tau_le1","p_tau_le2","p_tau_le3","p_tau1","p_tau2","p_tau3","p_tau4"]
+    ].copy()
     picks_out.to_csv(out_path, index=False)
 
     print(f"[DONE] wrote picks: {out_path} (rows={len(picks_out)})")
