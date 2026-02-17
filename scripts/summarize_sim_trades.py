@@ -3,254 +3,227 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 
 def _to_dt(x):
     return pd.to_datetime(x, errors="coerce")
 
 
-def _force_series(x, n: int) -> pd.Series:
-    if isinstance(x, pd.Series):
-        if len(x) == n:
-            return x
-        if len(x) == 0:
-            return pd.Series([np.nan] * n)
-        return pd.Series([x.iloc[-1]] * n)
-    if np.isscalar(x):
-        return pd.Series([x] * n)
-    try:
-        s = pd.Series(x)
-        if len(s) == n:
-            return s
-        if len(s) == 0:
-            return pd.Series([np.nan] * n)
-        return pd.Series([s.iloc[-1]] * n)
-    except Exception:
-        return pd.Series([np.nan] * n)
-
-
-def _safe_numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
-    n = len(df)
-    if col not in df.columns:
-        return pd.Series([np.nan] * n)
-    s = _force_series(df[col], n)
-    return pd.to_numeric(s, errors="coerce")
-
-
-def _infer_curve_path(trades_path: Path) -> Path | None:
-    # sim_engine_trades_XXX.parquet -> sim_engine_curve_XXX.parquet
-    name = trades_path.name
-    if "sim_engine_trades_" not in name:
+def _read_parquet_if_exists(path: str) -> pd.DataFrame | None:
+    p = Path(path)
+    if not p.exists():
         return None
-    curve_name = name.replace("sim_engine_trades_", "sim_engine_curve_")
-    p = trades_path.with_name(curve_name)
-    return p if p.exists() else None
+    df = pd.read_parquet(p)
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df)
+    return df
 
 
-def _pick_equity_col(curve: pd.DataFrame) -> str | None:
-    # 가능한 equity 컬럼 후보들
-    candidates = [
-        "Equity", "equity", "TotalEquity", "total_equity",
-        "AccountValue", "account_value", "NAV", "nav",
-        "Seed", "seed", "CashPlusValue", "cash_plus_value",
-    ]
-    for c in candidates:
-        if c in curve.columns:
-            return c
+def _safe_col(df: pd.DataFrame, col: str) -> pd.Series:
+    if df is None or len(df) == 0 or col not in df.columns:
+        return pd.Series([np.nan] * (0 if df is None else len(df)))
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def _curve_seed_multiple(curve: pd.DataFrame) -> float | None:
+    if curve is None or len(curve) == 0:
+        return None
+    if "SeedMultiple" in curve.columns:
+        s = pd.to_numeric(curve["SeedMultiple"], errors="coerce").dropna()
+        if len(s):
+            return float(s.iloc[-1])
+    if "Equity" in curve.columns and len(curve) >= 2:
+        eq = pd.to_numeric(curve["Equity"], errors="coerce").dropna()
+        if len(eq) >= 2 and float(eq.iloc[0]) != 0:
+            return float(eq.iloc[-1] / eq.iloc[0])
     return None
 
 
-def _seed_multiple_from_curve(curve: pd.DataFrame) -> float | None:
+def _curve_recent10y_seed_multiple(curve: pd.DataFrame) -> float | None:
     if curve is None or len(curve) == 0:
         return None
-    eq_col = _pick_equity_col(curve)
-    if eq_col is None:
+    if "Date" not in curve.columns:
         return None
-    eq = pd.to_numeric(curve[eq_col], errors="coerce").dropna()
-    if len(eq) < 2:
-        return None
-    if float(eq.iloc[0]) == 0:
-        return None
-    return float(eq.iloc[-1] / eq.iloc[0])
-
-
-def _recent10y_seed_multiple_from_curve(curve: pd.DataFrame) -> float | None:
-    if curve is None or len(curve) == 0:
+    d = _to_dt(curve["Date"]).dropna()
+    if len(d) == 0:
         return None
 
-    date_col = None
-    for c in ["Date", "date", "Datetime", "datetime", "Time", "time"]:
-        if c in curve.columns:
-            date_col = c
-            break
-    if date_col is None:
-        return None
-
-    d = _to_dt(curve[date_col])
-    if isinstance(d, pd.Series) and d.isna().all():
-        return None
-
-    last = pd.to_datetime(d, errors="coerce").max()
-    if pd.isna(last):
-        return None
-
+    last = d.max()
     start = last - pd.Timedelta(days=365 * 10)
-    sub = curve.loc[pd.to_datetime(d, errors="coerce") >= start].copy()
-    if len(sub) < 2:
+
+    sub = curve.loc[d >= start].copy()
+    if sub.empty:
         return None
 
-    return _seed_multiple_from_curve(sub)
+    # use SeedMultiple if exists
+    if "SeedMultiple" in sub.columns:
+        s = pd.to_numeric(sub["SeedMultiple"], errors="coerce").dropna()
+        if len(s):
+            # If seed multiple is normalized from initial, we need ratio end/start within 10y window:
+            # safer to use Equity ratio if Equity exists
+            if "Equity" in sub.columns:
+                eq = pd.to_numeric(sub["Equity"], errors="coerce").dropna()
+                if len(eq) >= 2 and float(eq.iloc[0]) != 0:
+                    return float(eq.iloc[-1] / eq.iloc[0])
+            # fallback: ratio within window using SeedMultiple
+            if float(s.iloc[0]) != 0:
+                return float(s.iloc[-1] / s.iloc[0])
 
+    if "Equity" in sub.columns:
+        eq = pd.to_numeric(sub["Equity"], errors="coerce").dropna()
+        if len(eq) >= 2 and float(eq.iloc[0]) != 0:
+            return float(eq.iloc[-1] / eq.iloc[0])
 
-def _max_drawdown_from_curve(curve: pd.DataFrame) -> float | None:
-    if curve is None or len(curve) == 0:
-        return None
-    eq_col = _pick_equity_col(curve)
-    if eq_col is None:
-        return None
-    eq = pd.to_numeric(curve[eq_col], errors="coerce").dropna()
-    if len(eq) < 2:
-        return None
-    peak = eq.cummax()
-    dd = (eq - peak) / peak
-    return float(dd.min())
-
-
-def _holding_days(trades: pd.DataFrame) -> pd.Series:
-    if trades is None or len(trades) == 0:
-        return pd.Series(dtype=float)
-
-    for col in ["HoldingDays", "holding_days"]:
-        if col in trades.columns:
-            return _safe_numeric_series(trades, col)
-
-    # fallback: entry/exit date diff
-    entry_col = None
-    exit_col = None
-    for c in trades.columns:
-        cl = c.lower()
-        if cl in ("entrydate", "entry_date", "entry"):
-            entry_col = c
-        if cl in ("exitdate", "exit_date", "exit"):
-            exit_col = c
-    if entry_col and exit_col:
-        e = _to_dt(trades[entry_col])
-        x = _to_dt(trades[exit_col])
-        d = (x - e).dt.days
-        return pd.to_numeric(_force_series(d, len(trades)), errors="coerce")
-
-    return pd.Series([np.nan] * len(trades))
-
-
-def _cycle_return(trades: pd.DataFrame) -> pd.Series:
-    if trades is None or len(trades) == 0:
-        return pd.Series(dtype=float)
-
-    for col in ["CycleReturn", "cycle_return", "Return", "ret", "PnL_pct", "pnl_pct"]:
-        if col in trades.columns:
-            return _safe_numeric_series(trades, col)
-
-    return pd.Series([np.nan] * len(trades))
-
-
-def _is_win(trades: pd.DataFrame) -> pd.Series:
-    if trades is None or len(trades) == 0:
-        return pd.Series(dtype=int)
-
-    for col in ["Win", "win", "IsWin", "is_win", "Success", "success"]:
-        if col in trades.columns:
-            s = _safe_numeric_series(trades, col)
-            return (s.fillna(0) > 0).astype(int)
-
-    r = _cycle_return(trades)
-    r = pd.to_numeric(_force_series(r, len(trades)), errors="coerce")
-    return (r.fillna(0) > 0).astype(int)
-
-
-def _max_leverage_pct(trades: pd.DataFrame) -> float | None:
-    if trades is None or len(trades) == 0:
-        return None
-    for col in ["MaxLeveragePct", "max_leverage_pct", "LeveragePct", "leverage_pct",
-                "Max_LeveragePct_Closed", "max_leverage_pct_closed"]:
-        if col in trades.columns:
-            v = pd.to_numeric(trades[col], errors="coerce").dropna()
-            if len(v):
-                return float(v.max())
     return None
+
+
+def _max_extend_over_maxdays(trades: pd.DataFrame, max_days: int) -> float | None:
+    if trades is None or len(trades) == 0:
+        return None
+    if "HoldingDays" not in trades.columns:
+        return None
+    hd = pd.to_numeric(trades["HoldingDays"], errors="coerce")
+    if hd.dropna().empty:
+        return None
+    mx = float(hd.max())
+    return float(max(0.0, mx - float(max_days)))
+
+
+def _closed_mask(trades: pd.DataFrame) -> pd.Series:
+    if trades is None or len(trades) == 0:
+        return pd.Series([], dtype=bool)
+    if "ExitDate" in trades.columns:
+        x = _to_dt(trades["ExitDate"])
+        return x.notna()
+    # if no ExitDate column, assume all closed
+    return pd.Series([True] * len(trades))
+
+
+def _success_rate(trades: pd.DataFrame, closed_mask: pd.Series) -> float:
+    if trades is None or len(trades) == 0:
+        return 0.0
+    if closed_mask is None or len(closed_mask) != len(trades):
+        closed_mask = pd.Series([True] * len(trades))
+
+    t = trades.loc[closed_mask].copy()
+    if t.empty:
+        return 0.0
+
+    # prefer Win column if exists else CycleReturn > 0
+    if "Win" in t.columns:
+        w = pd.to_numeric(t["Win"], errors="coerce").fillna(0)
+        return float((w > 0).mean())
+    if "CycleReturn" in t.columns:
+        r = pd.to_numeric(t["CycleReturn"], errors="coerce").fillna(0)
+        return float((r > 0).mean())
+    return 0.0
+
+
+def _max_leverage_closed(trades: pd.DataFrame, closed_mask: pd.Series) -> float | None:
+    if trades is None or len(trades) == 0:
+        return None
+    if "MaxLeveragePct" not in trades.columns:
+        return None
+    if closed_mask is None or len(closed_mask) != len(trades):
+        closed_mask = pd.Series([True] * len(trades))
+
+    t = trades.loc[closed_mask].copy()
+    if t.empty:
+        return None
+
+    lev = pd.to_numeric(t["MaxLeveragePct"], errors="coerce").dropna()
+    if lev.empty:
+        return None
+    return float(lev.max())
+
+
+def _lev_adjust(mult: float | None, max_lev: float | None, k: float) -> float | None:
+    if mult is None or not np.isfinite(mult):
+        return None
+    lev = 0.0 if (max_lev is None or not np.isfinite(max_lev)) else float(max_lev)
+    denom = (1.0 + lev) ** float(k)
+    if denom <= 0:
+        return None
+    return float(mult / denom)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trades-path", required=True, type=str)
+    ap.add_argument("--curve-path", default="", type=str)
     ap.add_argument("--tag", required=True, type=str)
     ap.add_argument("--suffix", required=True, type=str)
     ap.add_argument("--profit-target", required=True, type=float)
     ap.add_argument("--max-days", required=True, type=int)
     ap.add_argument("--stop-level", required=True, type=float)
     ap.add_argument("--max-extend-days", required=True, type=int)
+    ap.add_argument("--max-leverage-pct", default=1.0, type=float)  # cap param (100% -> 1.0)
+    ap.add_argument("--lev-penalty-k", default=1.0, type=float)     # k in / (1+lev)^k
     ap.add_argument("--out-dir", default="data/signals", type=str)
     args = ap.parse_args()
 
-    trades_path = Path(args.trades_path)
-    if not trades_path.exists():
-        raise FileNotFoundError(f"Missing trades parquet: {trades_path}")
+    trades_p = Path(args.trades_path)
+    if not trades_p.exists():
+        raise FileNotFoundError(f"Missing trades parquet: {trades_p}")
 
-    trades = pd.read_parquet(trades_path)
-    if isinstance(trades, pd.Series):
-        trades = trades.to_frame()
-    elif not isinstance(trades, pd.DataFrame):
+    trades = pd.read_parquet(trades_p)
+    if not isinstance(trades, pd.DataFrame):
         trades = pd.DataFrame(trades)
 
-    curve_path = _infer_curve_path(trades_path)
     curve = None
-    if curve_path is not None and curve_path.exists():
-        curve = pd.read_parquet(curve_path)
-        if isinstance(curve, pd.Series):
-            curve = curve.to_frame()
-        elif not isinstance(curve, pd.DataFrame):
-            curve = pd.DataFrame(curve)
+    if args.curve_path:
+        curve = _read_parquet_if_exists(args.curve_path)
 
-    # ---- compute metrics from trades ----
-    hold = _holding_days(trades)
-    max_hold = pd.to_numeric(hold, errors="coerce").max()
-    max_hold = float(max_hold) if np.isfinite(max_hold) else np.nan
+    closed = _closed_mask(trades)
+    cycle_cnt = int(len(trades))
+    closed_cnt = int(closed.sum()) if len(closed) else 0
 
-    max_extend = np.nan
-    if np.isfinite(max_hold):
-        max_extend = float(max(0.0, max_hold - float(args.max_days)))
+    success_rate = _success_rate(trades, closed)
+    max_hold = float(pd.to_numeric(trades.get("HoldingDays", pd.Series([], dtype=float)), errors="coerce").max()) if ("HoldingDays" in trades.columns and len(trades)) else np.nan
+    if not np.isfinite(max_hold):
+        max_hold = np.nan
 
-    wins = _is_win(trades)
-    wins = _force_series(wins, len(trades))
-    cycle_cnt = int(len(wins))
-    win_cnt = int(pd.to_numeric(wins, errors="coerce").fillna(0).sum()) if cycle_cnt > 0 else 0
-    success_rate = (win_cnt / cycle_cnt) if cycle_cnt > 0 else 0.0
+    max_extend_over = _max_extend_over_maxdays(trades, int(args.max_days))
+    max_lev_closed = _max_leverage_closed(trades, closed)
 
-    max_lev = _max_leverage_pct(trades)
+    seed_mult = _curve_seed_multiple(curve) if curve is not None else None
+    recent10y = _curve_recent10y_seed_multiple(curve) if curve is not None else None
 
-    # ---- compute equity-based metrics from curve (this is the key fix) ----
-    seed_mult = _seed_multiple_from_curve(curve) if curve is not None else None
-    recent10y = _recent10y_seed_multiple_from_curve(curve) if curve is not None else None
-    mdd = _max_drawdown_from_curve(curve) if curve is not None else None
+    adj_seed = _lev_adjust(seed_mult, max_lev_closed, args.lev_penalty_k)
+    adj_10y = _lev_adjust(recent10y, max_lev_closed, args.lev_penalty_k)
 
     out = {
         "TAG": args.tag,
         "GateSuffix": args.suffix,
+
         "ProfitTarget": args.profit_target,
         "MaxHoldingDays": args.max_days,
         "StopLevel": args.stop_level,
         "MaxExtendDaysParam": args.max_extend_days,
-        "Recent10Y_SeedMultiple": recent10y if recent10y is not None else np.nan,
+
+        "LeverageCapParam": args.max_leverage_pct,
+        "LevPenaltyK": args.lev_penalty_k,
+
         "SeedMultiple": seed_mult if seed_mult is not None else np.nan,
-        "MaxDrawdown": mdd if mdd is not None else np.nan,
+        "Recent10Y_SeedMultiple": recent10y if recent10y is not None else np.nan,
+
         "MaxHoldingDaysObserved": max_hold,
-        "MaxExtendDaysObserved": max_extend,
+        "Max_Extend_Over_MaxDays": max_extend_over if max_extend_over is not None else np.nan,
+
         "CycleCount": cycle_cnt,
+        "ClosedCycleCount": closed_cnt,
         "SuccessRate": success_rate,
-        "MaxLeveragePct": max_lev if max_lev is not None else np.nan,
-        "TradesFile": str(trades_path),
-        "CurveFile": str(curve_path) if curve_path is not None else "",
+
+        "Max_LeveragePct_Closed": max_lev_closed if max_lev_closed is not None else np.nan,
+
+        # leverage-adjusted
+        "Adj_SeedMultiple": adj_seed if adj_seed is not None else np.nan,
+        "Adj_Recent10Y_SeedMultiple": adj_10y if adj_10y is not None else np.nan,
+
+        "TradesFile": str(trades_p),
+        "CurveFile": str(args.curve_path) if args.curve_path else "",
     }
 
     out_dir = Path(args.out_dir)
