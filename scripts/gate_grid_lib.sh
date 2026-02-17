@@ -28,7 +28,6 @@ print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
 PY
 }
 
-# find newest parquet under data/**/sim_engine_trades*.parquet
 find_latest_trades_parquet() {
   python - <<'PY'
 import glob, os
@@ -75,12 +74,10 @@ run_one_gate() {
 
   if [ ! -f "$picks" ]; then
     echo "[ERROR] predict_gate did not create picks: $picks"
-    echo "[DEBUG] list data/signals (picks*):"
     ls -la data/signals | sed -n '1,200p' || true
     exit 1
   fi
 
-  # simulate (engine accepts picks-path only, per your error logs)
   python scripts/simulate_single_position_engine.py \
     --profit-target "$pt" \
     --max-days "$h" \
@@ -88,18 +85,36 @@ run_one_gate() {
     --max-extend-days "$ex" \
     --picks-path "$picks"
 
-  # ✅ create gate_summary_*.csv right after simulate
   local latest_trades
   latest_trades="$(find_latest_trades_parquet || true)"
-
   if [ -z "${latest_trades}" ]; then
     echo "[ERROR] No sim_engine_trades parquet found under data/** after simulate."
-    echo "[DEBUG] listing data/**/sim_engine_trades*.parquet:"
-    ls -la data | sed -n '1,200p' || true
+    find data -maxdepth 4 -type f | sed -n '1,200p' || true
     exit 1
   fi
 
-  python scripts/summarize_sim_trades.py \
+  # =========================
+  # ✅ HARD DEBUG (원인 추적용)
+  # =========================
+  echo "------------------------------"
+  echo "[DEBUG] summarize_sim_trades.py head:"
+  python - <<'PY'
+from pathlib import Path
+p = Path("scripts/summarize_sim_trades.py")
+print("exists:", p.exists(), "path:", p.resolve())
+if p.exists():
+    lines = p.read_text(encoding="utf-8").splitlines()
+    for i in range(min(40, len(lines))):
+        print(f"{i+1:04d}: {lines[i]}")
+PY
+
+  echo "------------------------------"
+  echo "[DEBUG] grep fillna in scripts/:"
+  grep -R --line-number "fillna(" scripts | sed -n '1,200p' || true
+  echo "------------------------------"
+
+  # summarize (faulthandler로 traceback 강제)
+  python -X faulthandler scripts/summarize_sim_trades.py \
     --trades-path "${latest_trades}" \
     --tag "${tag}" \
     --suffix "${suffix}" \
