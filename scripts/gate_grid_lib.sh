@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------------------------
-# Helpers
-# -------------------------
-trim() { awk '{$1=$1;print}'; }
-
 split_csv() {
   echo "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF>0{print}'
 }
@@ -33,9 +28,6 @@ print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
 PY
 }
 
-# -------------------------
-# Core runner: one gate config
-# -------------------------
 run_one_gate() {
   # args:
   #   pt h sl ex mode tail_max u_quantile rank_by lambda_tail tau_gamma
@@ -44,11 +36,7 @@ run_one_gate() {
   local lambda_tail="$9"; local tau_gamma="${10}"
 
   local tag; tag="$(build_tag "$pt" "$h" "$sl" "$ex")"
-
-  # ✅ downstream expected suffix (NO gamma in filename)
   local suffix="${mode}_t$(tok "$tail_max")_q$(tok "$u_q")_r${rank_by}"
-
-  # ✅ force exact picks path
   local picks="data/signals/picks_${tag}_gate_${suffix}.csv"
 
   echo "=============================="
@@ -60,7 +48,7 @@ run_one_gate() {
 
   mkdir -p data/signals
 
-  # ---- predict_gate: force to create the exact picks filename ----
+  # ---- predict_gate: force exact picks filename ----
   python scripts/predict_gate.py \
     --profit-target "$pt" \
     --max-days "$h" \
@@ -82,15 +70,14 @@ run_one_gate() {
     exit 1
   fi
 
-  # ---- simulate: your engine requires --picks-path ----
+  # ---- simulate: only pass arguments it recognizes ----
+  # ✅ Your engine requires --picks-path and does NOT accept --suffix/--tag
   python scripts/simulate_single_position_engine.py \
     --profit-target "$pt" \
     --max-days "$h" \
     --stop-level "$sl" \
     --max-extend-days "$ex" \
-    --picks-path "$picks" \
-    --suffix "$suffix" \
-    --tag "$tag"
+    --picks-path "$picks"
 
   echo "[OK] finished: ${tag} ${suffix}"
 }
