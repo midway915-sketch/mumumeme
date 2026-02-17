@@ -28,9 +28,20 @@ print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
 PY
 }
 
+# find newest parquet under data/**/sim_engine_trades*.parquet
+find_latest_trades_parquet() {
+  python - <<'PY'
+import glob, os
+paths = glob.glob("data/**/sim_engine_trades*.parquet", recursive=True)
+paths = [p for p in paths if os.path.isfile(p)]
+if not paths:
+    raise SystemExit("")
+paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+print(paths[0])
+PY
+}
+
 run_one_gate() {
-  # args:
-  #   pt h sl ex mode tail_max u_quantile rank_by lambda_tail tau_gamma
   local pt="$1"; local h="$2"; local sl="$3"; local ex="$4"
   local mode="$5"; local tail_max="$6"; local u_q="$7"; local rank_by="$8"
   local lambda_tail="$9"; local tau_gamma="${10}"
@@ -48,7 +59,6 @@ run_one_gate() {
 
   mkdir -p data/signals
 
-  # ---- predict_gate: force exact picks filename ----
   python scripts/predict_gate.py \
     --profit-target "$pt" \
     --max-days "$h" \
@@ -70,14 +80,34 @@ run_one_gate() {
     exit 1
   fi
 
-  # ---- simulate: only pass arguments it recognizes ----
-  # ✅ Your engine requires --picks-path and does NOT accept --suffix/--tag
+  # simulate (engine accepts picks-path only, per your error logs)
   python scripts/simulate_single_position_engine.py \
     --profit-target "$pt" \
     --max-days "$h" \
     --stop-level "$sl" \
     --max-extend-days "$ex" \
     --picks-path "$picks"
+
+  # ✅ create gate_summary_*.csv right after simulate
+  local latest_trades
+  latest_trades="$(find_latest_trades_parquet || true)"
+
+  if [ -z "${latest_trades}" ]; then
+    echo "[ERROR] No sim_engine_trades parquet found under data/** after simulate."
+    echo "[DEBUG] listing data/**/sim_engine_trades*.parquet:"
+    ls -la data | sed -n '1,200p' || true
+    exit 1
+  fi
+
+  python scripts/summarize_sim_trades.py \
+    --trades-path "${latest_trades}" \
+    --tag "${tag}" \
+    --suffix "${suffix}" \
+    --profit-target "$pt" \
+    --max-days "$h" \
+    --stop-level "$sl" \
+    --max-extend-days "$ex" \
+    --out-dir "data/signals"
 
   echo "[OK] finished: ${tag} ${suffix}"
 }
