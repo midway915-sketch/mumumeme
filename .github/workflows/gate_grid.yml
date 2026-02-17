@@ -76,6 +76,7 @@ jobs:
             scripts/gate_grid_lib.sh \
             scripts/fetch_prices.py \
             scripts/build_features.py \
+            scripts/patch_market_features.py \
             scripts/build_labels.py \
             scripts/train_model.py \
             scripts/build_tau_labels.py \
@@ -175,6 +176,32 @@ jobs:
 
           ls -la data/features | head -n 200 || true
 
+      - name: Patch Market_* into features_model (hard guarantee)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/patch_market_features.py --market-ticker SPY
+
+      - name: Verify Market_* exists in features_model
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+          p = Path("data/features/features_model.parquet")
+          if p.exists():
+              df = pd.read_parquet(p)
+          else:
+              df = pd.read_csv("data/features/features_model.csv")
+          need = ["Market_Drawdown","Market_ATR_ratio"]
+          miss = [c for c in need if c not in df.columns]
+          print("[INFO] features_model rows:", len(df))
+          print("[INFO] has columns?", {c: (c in df.columns) for c in need})
+          if miss:
+              raise SystemExit(f"[ERROR] still missing: {miss}. columns={list(df.columns)[:40]}")
+          PY
+
       - name: Run grid (Round-1 broad)
         shell: bash
         env:
@@ -199,118 +226,6 @@ jobs:
           set -euo pipefail
           python scripts/aggregate_gate_grid.py
           echo "[INFO] Round-1 outputs:"
-          ls -la data/signals | tail -n 200 || true
-
-      - name: Derive refine grid from Pareto Top30
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python - <<'PY'
-          import os
-          import pandas as pd
-          from pathlib import Path
-
-          sig = Path("data/signals")
-          src = sig / "gate_grid_pareto4.csv"
-          if not src.exists():
-            src = sig / "gate_grid_pareto.csv"
-          if not src.exists():
-            raise SystemExit("[ERROR] No pareto csv found (gate_grid_pareto4.csv or gate_grid_pareto.csv).")
-
-          df = pd.read_csv(src)
-          if df.empty:
-            raise SystemExit("[ERROR] pareto csv is empty.")
-
-          if "eff_score4" in df.columns:
-            df = df.sort_values("eff_score4", ascending=False)
-          elif "eff_score" in df.columns:
-            df = df.sort_values("eff_score", ascending=False)
-
-          top = df.head(30).copy()
-
-          def uniq_limit(vals, limit):
-            out=[]
-            for v in vals:
-              if pd.isna(v): 
-                continue
-              if v not in out:
-                out.append(v)
-              if len(out) >= limit:
-                break
-            return out
-
-          pts=[]; hs=[]; sls=[]
-          for _, r in top.iterrows():
-            pt = float(r.get("PT", float("nan")))
-            h  = float(r.get("H", float("nan")))
-            sl = float(r.get("SL", float("nan")))
-
-            if pt == pt:
-              pts += [max(0.01, pt-0.01), pt, pt+0.01]
-            if h == h:
-              h = int(h)
-              hs += [max(5, h-5), h, h+5]
-            if sl == sl:
-              sls += [sl-0.05, sl, sl+0.05]
-
-          pts = sorted(set(round(x,4) for x in pts if 0 < x < 1.0))[:12]
-          hs  = sorted(set(int(x) for x in hs if x > 0))[:9]
-          sls = sorted(set(round(x,4) for x in sls if x < 0))[:9]
-
-          tails = uniq_limit([round(float(x),4) for x in top.get("tail_max", []) if pd.notna(x)], 8) or [0.20, 0.30]
-          uqs   = uniq_limit([round(float(x),4) for x in top.get("u_quantile", []) if pd.notna(x)], 8) or [0.75, 0.90]
-          ranks = uniq_limit([str(x) for x in top.get("rank_by", []) if pd.notna(x)], 6) or ["utility", "utility_time"]
-          gams  = uniq_limit([round(float(x),4) for x in top.get("tau_gamma", []) if pd.notna(x)], 6) or [0.03, 0.05, 0.08]
-
-          def join(vals): return ",".join(str(v) for v in vals)
-
-          env_lines = [
-            f"PROFIT_TARGET_INPUT_REFINE={join(pts)}",
-            f"HOLDING_DAYS_INPUT_REFINE={join(hs)}",
-            f"STOP_LEVEL_INPUT_REFINE={join(sls)}",
-            f"TAIL_MAX_LIST_REFINE={join(tails)}",
-            f"U_QUANTILE_LIST_REFINE={join(uqs)}",
-            f"RANK_BY_LIST_REFINE={join(ranks)}",
-            f"TAU_GAMMA_LIST_REFINE={join(gams)}",
-          ]
-
-          github_env = os.environ.get("GITHUB_ENV")
-          if not github_env:
-            raise SystemExit("[ERROR] GITHUB_ENV not set")
-          with open(github_env, "a", encoding="utf-8") as f:
-            for line in env_lines:
-              f.write(line + "\n")
-
-          print("[REFINE] derived:")
-          for line in env_lines:
-            print(" ", line)
-          PY
-
-      - name: Run grid (Round-2 refine)
-        shell: bash
-        env:
-          PROFIT_TARGET_INPUT: ${{ env.PROFIT_TARGET_INPUT_REFINE }}
-          HOLDING_DAYS_INPUT: ${{ env.HOLDING_DAYS_INPUT_REFINE }}
-          STOP_LEVEL_INPUT: ${{ env.STOP_LEVEL_INPUT_REFINE }}
-          MAX_EXTEND_DAYS: ${{ inputs.extend_horizon }}
-
-          TAIL_MAX_LIST: ${{ env.TAIL_MAX_LIST_REFINE }}
-          U_QUANTILE_LIST: ${{ env.U_QUANTILE_LIST_REFINE }}
-          RANK_BY_LIST: ${{ env.RANK_BY_LIST_REFINE }}
-          LAMBDA_TAIL: ${{ inputs.utility_tail_penalty_lambda }}
-
-          TAU_GAMMA_LIST: ${{ env.TAU_GAMMA_LIST_REFINE }}
-        run: |
-          set -euo pipefail
-          bash scripts/run_grid_workflow.sh
-
-      - name: Aggregate gate grid (Final)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/aggregate_gate_grid.py
-          echo "[INFO] Final outputs:"
           ls -la data/signals | tail -n 200 || true
 
       - name: Upload artifacts (signals + summaries)
