@@ -218,6 +218,7 @@ jobs:
           else
             python scripts/fetch_prices.py --include-extra --lookback-days 10
           fi
+
           # 2) features (없으면 full)
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             python scripts/build_features.py
@@ -225,18 +226,13 @@ jobs:
             echo "[INFO] features_model exists -> reuse"
           fi
           
-          # predict_gate 호환: features_scored.* 항상 준비
-          mkdir -p data/features
-          
-          if [ -f data/features/features_model.parquet ]; then
-            cp -f data/features/features_model.parquet data/features/features_scored.parquet
-            echo "[INFO] synced -> data/features/features_scored.parquet"
-          fi
-          
-          if [ -f data/features/features_model.csv ]; then
-            cp -f data/features/features_model.csv data/features/features_scored.csv
-            echo "[INFO] synced -> data/features/features_scored.csv"
-          fi
+          # 2.5) features_scored 생성 (p_tail, p_success 붙이기)
+          # - 모델이 없으면 0으로 채움(=gate/tail 의미가 없어지니, 보통은 모델을 먼저 만들게 됨)
+          python scripts/score_features.py \
+            --in-parq data/features/features_model.parquet \
+            --in-csv  data/features/features_model.csv \
+            --out-parq data/features/features_scored.parquet \
+            --out-csv  data/features/features_scored.csv
         
           # 3) labels + model (없으면 생성)
           if [ ! -f data/labels/labels_model.parquet ] && [ ! -f data/labels/labels_model.csv ]; then
