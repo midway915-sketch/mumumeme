@@ -18,6 +18,7 @@ OUT_PARQ = FEAT_DIR / "features_model.parquet"
 OUT_CSV = FEAT_DIR / "features_model.csv"
 
 MARKET_TICKER = "SPY"   # market proxy (must exist in raw prices)
+VIX_TICKER = "^VIX"     # optional (not required)
 
 
 # -----------------------------
@@ -93,23 +94,22 @@ def compute_market_features(prices: pd.DataFrame) -> pd.DataFrame:
     if m.empty:
         raise ValueError(f"Market ticker {MARKET_TICKER} not found. Use fetch_prices.py --include-extra")
 
-    out = pd.DataFrame(index=m.index)
-
-    dt = pd.to_datetime(m["Date"], errors="coerce").dt.tz_localize(None)
     c = pd.to_numeric(m["Close"], errors="coerce")
 
     roll_max_252 = c.rolling(252, min_periods=252).max()
     mdd = (c / roll_max_252) - 1.0
 
     atr_ratio = compute_atr_ratio(m, n=14)
+
     mret = c.pct_change()
 
-    out["Date"] = dt.values
-    out["Market_Drawdown"] = mdd.values
-    out["Market_ATR_ratio"] = atr_ratio.values
-    out["Market_ret_1d"] = mret.values
+    out = pd.DataFrame({
+        "Date": pd.to_datetime(m["Date"], errors="coerce").dt.tz_localize(None).values,
+        "Market_Drawdown": mdd.values,
+        "Market_ATR_ratio": atr_ratio.values,
+        "Market_ret_1d": mret.values,
+    }).sort_values("Date").reset_index(drop=True)
 
-    out = out.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
     return out
 
 
@@ -119,14 +119,8 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
     market_ret_by_date: Series indexed by Date with market 1d returns
     """
     g = g.sort_values("Date").copy()
-    out = pd.DataFrame(index=g.index)
-
     dt = pd.to_datetime(g["Date"], errors="coerce").dt.tz_localize(None)
 
-    # OHLCV
-    o = pd.to_numeric(g["Open"], errors="coerce")
-    h = pd.to_numeric(g["High"], errors="coerce")
-    l = pd.to_numeric(g["Low"], errors="coerce")
     c = pd.to_numeric(g["Close"], errors="coerce")
     v = pd.to_numeric(g["Volume"], errors="coerce")
 
@@ -151,10 +145,11 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
 
     ma20_slope = (ma20 / ma20.shift(5)) - 1.0
 
+    # ret_20 (also ret_score)
     ret_20 = (c / c.shift(20)) - 1.0
     ret_score = ret_20.copy()
 
-    # ----- trailing 친화 피처
+    # ----- NEW: TP1+trailing friendly features
     ret_5 = (c / c.shift(5)) - 1.0
     ret_10 = (c / c.shift(10)) - 1.0
 
@@ -167,43 +162,41 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
     ema50 = ema(c, 50)
     trend_align = (c / ema50) - 1.0
 
-    # ✅ FIX: beta_60 인덱스 정렬 (r도 dt 인덱스로 맞춘다)
+    # ---- FIX: beta_60 length mismatch
+    # Make BOTH series share SAME index = Date (dt),
+    # so rolling.cov won't align on union indexes (which caused 2x length).
     r = c.pct_change()
-    r_dt = pd.Series(r.values, index=dt)  # <-- 핵심
-    mret_dt = market_ret_by_date.reindex(dt).astype(float)
+    r.index = dt
+    mret = market_ret_by_date.reindex(dt).astype(float)
 
-    cov = r_dt.rolling(60, min_periods=60).cov(mret_dt)
-    var = mret_dt.rolling(60, min_periods=60).var()
-    beta_60_dt = cov / var
+    cov = r.rolling(60, min_periods=60).cov(mret)
+    var = mret.rolling(60, min_periods=60).var()
+    beta_60 = cov / var
+    beta_60 = beta_60.reindex(dt)  # safety
 
-    # dt 순서 그대로 values 뽑아서 g.index 길이와 동일하게 만든다
-    beta_60 = pd.Series(beta_60_dt.values, index=g.index)
+    out = pd.DataFrame({
+        "Date": dt.values,
+        "Ticker": g["Ticker"].values,
 
-    # ----- assign columns (one-by-one; safe)
-    out["Date"] = dt.values
-    out["Ticker"] = g["Ticker"].astype(str).str.upper().str.strip().values
+        "Drawdown_252": dd_252.values,
+        "Drawdown_60": dd_60.values,
+        "ATR_ratio": atr_ratio.values,
+        "Z_score": z.values,
+        "MACD_hist": macd_hist.values,
+        "MA20_slope": ma20_slope.values,
+        "ret_score": ret_score.values,
 
-    out["Open"] = o.values
-    out["High"] = h.values
-    out["Low"] = l.values
-    out["Close"] = c.values
-    out["Volume"] = v.values
+        "ret_5": ret_5.values,
+        "ret_10": ret_10.values,
+        "ret_20": ret_20.values,
+        "breakout_20": breakout_20.values,
+        "vol_surge": vol_surge.values,
+        "trend_align": trend_align.values,
+        "beta_60": beta_60.values,
 
-    out["Drawdown_252"] = dd_252.values
-    out["Drawdown_60"] = dd_60.values
-    out["ATR_ratio"] = atr_ratio.values
-    out["Z_score"] = z.values
-    out["MACD_hist"] = macd_hist.values
-    out["MA20_slope"] = ma20_slope.values
-    out["ret_score"] = ret_score.values
-
-    out["ret_5"] = ret_5.values
-    out["ret_10"] = ret_10.values
-    out["ret_20"] = ret_20.values
-    out["breakout_20"] = breakout_20.values
-    out["vol_surge"] = vol_surge.values
-    out["trend_align"] = trend_align.values
-    out["beta_60"] = beta_60.values
+        "Volume": v.values,
+        "Close": c.values,
+    })
 
     return out
 
@@ -233,6 +226,7 @@ def add_sector_strength(feats: pd.DataFrame, ticker_to_group: dict[str, str]) ->
     )
     x = x.merge(sector_ret, on=["Date", "Group"], how="left")
     x["RelStrength"] = pd.to_numeric(x["ret_20"], errors="coerce") - pd.to_numeric(x["Sector_Ret_20"], errors="coerce")
+
     return x
 
 
@@ -262,10 +256,11 @@ def main() -> None:
         compute_start = start_date - pd.Timedelta(days=lookback_days)
         prices = prices.loc[prices["Date"] >= compute_start].copy()
 
-    market = compute_market_features(prices).sort_values("Date").reset_index(drop=True)
+    market = compute_market_features(prices)
+    market = market.sort_values("Date").reset_index(drop=True)
     market_ret_by_date = pd.Series(
         market["Market_ret_1d"].values,
-        index=pd.to_datetime(market["Date"]).dt.tz_localize(None)
+        index=pd.to_datetime(market["Date"]).dt.tz_localize(None),
     )
 
     feats_list = []
@@ -299,7 +294,6 @@ def main() -> None:
         "ret_score",
         "ret_5", "ret_10", "ret_20",
         "breakout_20", "vol_surge", "trend_align", "beta_60",
-        "Open", "High", "Low", "Close",
     ]
     if "Sector_Ret_20" in feats.columns:
         FEATURE_COLS += ["Sector_Ret_20", "RelStrength"]
