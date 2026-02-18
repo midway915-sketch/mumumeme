@@ -3,7 +3,6 @@ name: gate-grid
 on:
   workflow_dispatch:
     inputs:
-      # --- label / horizon ---
       profit_target:
         description: "profit target (e.g. 0.10)"
         required: true
@@ -21,79 +20,35 @@ on:
         required: true
         default: "30"
 
-      # --- gate grid knobs ---
-      gate_modes:
-        description: "comma-separated gate modes (none,tail,utility,tail_utility)"
-        required: true
-        default: "none,tail,utility,tail_utility"
-
+      # ✅ gate grid knobs
       p_tail_thresholds:
         description: "comma-separated p_tail thresholds (e.g. 0.10,0.20,0.30)"
         required: true
         default: "0.10,0.20,0.30"
-
       utility_quantiles:
         description: "comma-separated utility quantiles (e.g. 0.60,0.75,0.90)"
         required: true
         default: "0.60,0.75,0.90"
-
       rank_metrics:
         description: "comma-separated rank metric (utility|ret_score|p_success). e.g. utility,ret_score"
         required: true
         default: "utility,ret_score"
+
+      # ✅ ps_min grid (너 요청)
+      ps_min_thresholds:
+        description: "comma-separated p_success min thresholds (e.g. 0.00,0.05,0.10)"
+        required: true
+        default: "0.00,0.05,0.10"
 
       lambda_tail:
         description: "utility tail penalty lambda (single float, e.g. 0.05)"
         required: true
         default: "0.05"
 
-      # --- p_success gate (grid) ---
-      ps_min_thresholds:
-        description: "comma-separated p_success min thresholds (e.g. 0.00,0.05,0.10)"
-        required: true
-        default: "0.00,0.05,0.10"
-
-      # --- trading / sim knobs ---
-      enable_trailing:
-        description: "true/false to enable 2-step exit (TP1 + trailing stop)"
-        required: true
-        default: "true"
-
-      tp1_frac:
-        description: "fraction to sell at profit target (e.g. 0.50)"
-        required: true
-        default: "0.50"
-
-      trail_stops:
-        description: "comma-separated trailing stops (e.g. 0.08,0.10,0.12)"
-        required: true
-        default: "0.08,0.10,0.12"
-
-      topk_configs:
-        description: "TopK configs: '1|1.0;2|0.7,0.3;2|0.6,0.4'"
-        required: true
-        default: "1|1.0;2|0.7,0.3;2|0.6,0.4"
-
-      max_leverage_pct:
-        description: "max leverage pct cap (1.0=100%)"
-        required: true
-        default: "1.0"
-
-      exclude_tickers:
-        description: "comma-separated tickers to exclude (e.g. SPY,^VIX)"
-        required: true
-        default: "SPY,^VIX"
-
-      # --- pipeline control ---
       rebuild_all:
         description: "true to rebuild prices/features/labels/models from scratch"
         required: true
         default: "false"
-
-      price_years:
-        description: "price history years to fetch (e.g. 10). (workflow sets start date)"
-        required: true
-        default: "10"
 
   schedule:
     # 매일 한국시간 08:10 (UTC 23:10)
@@ -131,11 +86,11 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts
 
-      - name: Build LABEL_KEY + PRICE_START
+      - name: Build LABEL_KEY + PRICE_START (10y)
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY' >> "$GITHUB_ENV"
+          python - <<'PY' >> $GITHUB_ENV
           from datetime import datetime, timedelta, timezone
           
           pt=float("${{ inputs.profit_target }}")
@@ -143,22 +98,16 @@ jobs:
           sl=float("${{ inputs.stop_level }}")
           ex=int("${{ inputs.max_extend_days }}")
           
-          years=int("${{ inputs.price_years }}")
-          if years <= 0:
-            years = 10
-          
           def pct(x): return int(round(abs(x)*100))
           LABEL_KEY=f"pt{pct(pt)}_h{h}_sl{pct(sl)}_ex{ex}"
           
-          # years + warmup(about +1y) to be safe for rolling 260
           today=datetime.now(timezone.utc).date()
-          price_start=(today - timedelta(days=365*(years+1))).strftime("%Y-%m-%d")
+          price_start=(today - timedelta(days=365*11)).strftime("%Y-%m-%d")
           
           print(f"LABEL_KEY={LABEL_KEY}")
           print(f"PRICE_START={price_start}")
           PY
 
-      # ---- PRICES cache
       - name: Restore cache (PRICES)
         uses: actions/cache@v4
         with:
@@ -170,37 +119,46 @@ jobs:
           restore-keys: |
             mumumeme-prices-v4-${{ runner.os }}-
 
-      # ---- FEATURES cache
-      - name: Restore cache (FEATURES_MODEL)
+      - name: Restore cache (FEATURES)
         uses: actions/cache@v4
         with:
           path: |
             data/features/features_model.parquet
             data/features/features_model.csv
-          key: mumumeme-features-v4-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py','scripts/build_features.py') }}
+            data/features/features_scored.parquet
+            data/features/features_scored.csv
+          key: mumumeme-features-v4-${{ runner.os }}-${{ hashFiles('scripts/build_features.py','scripts/score_models.py','scripts/universe.py','scripts/fetch_prices.py','data/universe.csv') }}
           restore-keys: |
             mumumeme-features-v4-${{ runner.os }}-
 
-      # ---- LABELS + MODEL cache
-      - name: Restore cache (MODEL)
+      - name: Restore cache (MODELS)
         uses: actions/cache@v4
         with:
           path: |
-            data/labels/labels_model.parquet
-            data/labels/labels_model.csv
-            app/model.pkl
-            app/scaler.pkl
-          key: mumumeme-model-v4-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py') }}
+            data/labels/labels_success.parquet
+            data/labels/labels_success.csv
+            data/labels/labels_tail.parquet
+            data/labels/labels_tail.csv
+            data/labels/labels_tau.parquet
+            data/labels/labels_tau.csv
+            app/success_model.pkl
+            app/success_scaler.pkl
+            app/tail_model.pkl
+            app/tail_scaler.pkl
+            app/tau_model.pkl
+            app/tau_scaler.pkl
+          key: mumumeme-models-v4-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_success_labels.py','scripts/build_tail_labels.py','scripts/build_tau_labels.py','scripts/train_success_model.py','scripts/train_tail_model.py','scripts/train_tau_model.py') }}
           restore-keys: |
-            mumumeme-model-v4-${{ runner.os }}-${{ env.LABEL_KEY }}-
+            mumumeme-models-v4-${{ runner.os }}-${{ env.LABEL_KEY }}-
 
-      - name: Build / Update pipeline (prices -> features -> labels -> model)
+      - name: Build / Update pipeline (prices -> features -> labels -> models -> score)
         shell: bash
         env:
           REBUILD_ALL: ${{ inputs.rebuild_all }}
           PROFIT_TARGET: ${{ inputs.profit_target }}
           MAX_DAYS: ${{ inputs.max_days }}
           STOP_LEVEL: ${{ inputs.stop_level }}
+          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
           PRICE_START: ${{ env.PRICE_START }}
         run: |
           set -euo pipefail
@@ -208,35 +166,65 @@ jobs:
           if [ "$REBUILD_ALL" = "true" ]; then
             rm -f data/raw/prices.parquet data/raw/prices.csv data/raw/prices_meta.json || true
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
-            rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
-            rm -f app/model.pkl app/scaler.pkl || true
+            rm -f data/features/features_scored.parquet data/features/features_scored.csv || true
+            rm -f data/labels/*.parquet data/labels/*.csv || true
+            rm -f app/*.pkl app/*.json || true
             rm -rf data/signals/* || true
           fi
 
-          # 1) Universe + Prices
+          # 1) Universe + Prices (10y+warmup window)
           python scripts/universe.py
-
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full --start "$PRICE_START"
           else
             python scripts/fetch_prices.py --include-extra --lookback-days 10
           fi
 
-          # 2) Features (rebuild)
+          # 2) features_model (always rebuild for robustness)
           python scripts/build_features.py
 
-          # 3) Labels (your base success label used by model training)
-          python scripts/build_labels.py \
+          # 3) labels (always rebuild: PT/H/SL/EX are inputs)
+          python scripts/build_success_labels.py \
+            --profit-target "$PROFIT_TARGET" \
+            --max-days "$MAX_DAYS"
+
+          python scripts/build_tail_labels.py \
+            --stop-level "$STOP_LEVEL" \
+            --max-extend-days "$MAX_EXTEND_DAYS"
+
+          python scripts/build_tau_labels.py \
             --profit-target "$PROFIT_TARGET" \
             --max-days "$MAX_DAYS" \
-            --stop-level "$STOP_LEVEL"
+            --stop-level "$STOP_LEVEL" \
+            --max-extend-days "$MAX_EXTEND_DAYS" \
+            --k1 10 \
+            --k2 20
 
-          # 4) Model
-          if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
-            python scripts/train_model.py
-          else
-            echo "[INFO] model exists -> reuse"
-          fi
+          # 4) models
+          python scripts/train_success_model.py
+          python scripts/train_tail_model.py
+          python scripts/train_tau_model.py
+
+          # 5) score_models -> features_scored (p_success/p_tail 포함)
+          python scripts/score_models.py
+
+          # Hard assertions (fail fast if something is still wrong)
+          python - <<'PY'
+import pandas as pd
+from pathlib import Path
+
+p=Path("data/features/features_scored.parquet")
+c=Path("data/features/features_scored.csv")
+if not p.exists() and not c.exists():
+    raise SystemExit("features_scored not created")
+
+df = pd.read_parquet(p) if p.exists() else pd.read_csv(c)
+need=["Date","Ticker","p_success","p_tail"]
+miss=[x for x in need if x not in df.columns]
+if miss:
+    raise SystemExit(f"features_scored missing cols: {miss}")
+print("[OK] features_scored ready:", df.shape, "range", df["Date"].min(), df["Date"].max())
+PY
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
@@ -246,24 +234,25 @@ jobs:
           STOP_LEVEL: ${{ inputs.stop_level }}
           MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
 
-          GATE_MODES: ${{ inputs.gate_modes }}
           P_TAIL_THRESHOLDS: ${{ inputs.p_tail_thresholds }}
           UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
           RANK_METRICS: ${{ inputs.rank_metrics }}
-          LAMBDA_TAIL: ${{ inputs.lambda_tail }}
-
           PS_MIN_THRESHOLDS: ${{ inputs.ps_min_thresholds }}
 
-          ENABLE_TRAILING: ${{ inputs.enable_trailing }}
-          TP1_FRAC: ${{ inputs.tp1_frac }}
-          TRAIL_STOPS: ${{ inputs.trail_stops }}
+          LAMBDA_TAIL: ${{ inputs.lambda_tail }}
+          GATE_MODES: "none,tail,utility,tail_utility"
 
-          TOPK_CONFIGS: ${{ inputs.topk_configs }}
+          # 수익률 점프 옵션
+          TP1_FRAC: "0.50"
+          TRAIL_STOPS: "0.08,0.10,0.12"
+          ENABLE_TRAILING: "true"
 
-          MAX_LEVERAGE_PCT: ${{ inputs.max_leverage_pct }}
-          EXCLUDE_TICKERS: ${{ inputs.exclude_tickers }}
+          # top1 vs top2 compare
+          TOPK_CONFIGS: "1|1.0;2|0.7,0.3;2|0.6,0.4"
 
           OUT_DIR: "data/signals"
+          EXCLUDE_TICKERS: "SPY,^VIX"
+          REQUIRE_FILES: "data/features/features_scored.parquet,app/success_model.pkl,app/tail_model.pkl,app/tau_model.pkl"
         run: |
           set -euo pipefail
           chmod +x scripts/run_grid_workflow.sh
