@@ -7,41 +7,31 @@ import numpy as np
 import pandas as pd
 
 DATA_DIR = Path("data")
-RAW_DIR = DATA_DIR / "raw"
+FEAT_DIR = DATA_DIR / "features"
 LBL_DIR = DATA_DIR / "labels"
 
-PRICES_PARQ = RAW_DIR / "prices.parquet"
-PRICES_CSV = RAW_DIR / "prices.csv"
+FEATS_PARQ = FEAT_DIR / "features_model.parquet"
+FEATS_CSV  = FEAT_DIR / "features_model.csv"
 
 OUT_PARQ = LBL_DIR / "labels_tail.parquet"
-OUT_CSV = LBL_DIR / "labels_tail.csv"
+OUT_CSV  = LBL_DIR / "labels_tail.csv"
 
 
-def read_prices() -> pd.DataFrame:
-    if PRICES_PARQ.exists():
-        df = pd.read_parquet(PRICES_PARQ)
-    elif PRICES_CSV.exists():
-        df = pd.read_csv(PRICES_CSV)
-    else:
-        raise FileNotFoundError(f"Missing prices: {PRICES_PARQ} (or {PRICES_CSV})")
+def read_table(parq: Path, csv: Path) -> pd.DataFrame:
+    if parq.exists():
+        return pd.read_parquet(parq)
+    if csv.exists():
+        return pd.read_csv(csv)
+    raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
 
-    df = df.copy()
-    if "Date" not in df.columns or "Ticker" not in df.columns:
-        raise ValueError("prices must include Date and Ticker columns")
-    for c in ["Open", "High", "Low", "Close", "Volume"]:
-        if c not in df.columns:
-            raise ValueError(f"prices missing required column: {c}")
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
-    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-    df = df.dropna(subset=["Date", "Ticker", "Close", "Low"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    return df
+def norm_date(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--max-days", required=True, type=int, help="horizon for tail check (e.g. 40)")
-    ap.add_argument("--stop-level", required=True, type=float, help="stop level (e.g. -0.10)")
+    ap = argparse.ArgumentParser(description="Build tail labels (TailTarget) from features_model.")
+    ap.add_argument("--stop-level", required=True, type=float, help="e.g. -0.10 (10% drop threshold)")
     ap.add_argument("--start-date", default=None, type=str, help="optional YYYY-MM-DD")
     ap.add_argument("--out-parq", default=str(OUT_PARQ), type=str)
     ap.add_argument("--out-csv", default=str(OUT_CSV), type=str)
@@ -49,50 +39,54 @@ def main() -> None:
 
     LBL_DIR.mkdir(parents=True, exist_ok=True)
 
-    df = read_prices()
+    df = read_table(FEATS_PARQ, FEATS_CSV).copy()
+
+    # required cols
+    required = ["Date", "Ticker", "Close", "Low"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"features_model missing required columns for tail labels: {missing}")
+
+    df["Date"] = norm_date(df["Date"])
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    low = pd.to_numeric(df["Low"], errors="coerce")
+
     if args.start_date:
         sd = pd.to_datetime(args.start_date, errors="coerce")
         if pd.isna(sd):
             raise ValueError(f"Invalid --start-date: {args.start_date}")
         df = df.loc[df["Date"] >= sd].copy()
+        close = pd.to_numeric(df["Close"], errors="coerce")
+        low = pd.to_numeric(df["Low"], errors="coerce")
 
-    H = int(args.max_days)
-    stop = float(args.stop_level)
+    stop_level = float(args.stop_level)  # negative number expected
+    thresh = close * (1.0 + stop_level)
 
-    # TailTarget definition:
-    # TailTarget=1 if within next H days, future MIN(LOW) <= Close * (1 + stop_level)
-    # else 0
-    def per_ticker(g: pd.DataFrame) -> pd.DataFrame:
-        g = g.sort_values("Date").copy()
-        close = pd.to_numeric(g["Close"], errors="coerce")
-        low = pd.to_numeric(g["Low"], errors="coerce")
+    # TailTarget: did we touch/violate stop threshold intraday?
+    tail = (low <= thresh).astype(int)
 
-        future_min_low = low.shift(-1).rolling(H, min_periods=H).min()
-        thr = close * (1.0 + stop)
+    out = pd.DataFrame({
+        "Date": df["Date"].values,
+        "Ticker": df["Ticker"].values,
+        "TailTarget": tail.values,
+    })
 
-        tail = (future_min_low <= thr).astype(float)
-        out = pd.DataFrame({
-            "Date": g["Date"].values,
-            "Ticker": g["Ticker"].values,
-            "TailTarget": tail.values,
-        })
-        return out
-
-    out = df.groupby("Ticker", group_keys=False).apply(per_ticker)
-    out = out.dropna(subset=["TailTarget"]).copy()
-    out["TailTarget"] = pd.to_numeric(out["TailTarget"], errors="coerce").fillna(0).astype(int)
-
-    out = out.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
+    out = out.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last")
 
     out_parq = Path(args.out_parq)
-    out_csv = Path(args.out_csvg) if hasattr(args, "out_csvg") else Path(args.out_csv)  # safety for typos
+    out_csv = Path(args.out_csv)
+    out_parq.parent.mkdir(parents=True, exist_ok=True)
 
     out.to_parquet(out_parq, index=False)
     out.to_csv(out_csv, index=False)
 
     print(f"[DONE] wrote: {out_parq} rows={len(out)}")
     if len(out):
-        print(f"[INFO] range: {out['Date'].min().date()}..{out['Date'].max().date()}")
+        dmin = pd.to_datetime(out["Date"]).min().date()
+        dmax = pd.to_datetime(out["Date"]).max().date()
+        print(f"[INFO] range: {dmin}..{dmax} stop_level={stop_level}")
 
 
 if __name__ == "__main__":
