@@ -180,7 +180,8 @@ jobs:
           # 3) labels (always rebuild: PT/H/SL are inputs)
           python scripts/build_success_labels.py \
             --profit-target "$PROFIT_TARGET" \
-            --max-days "$MAX_DAYS"
+            --max-days "$MAX_DAYS" \
+            --max-extend-days 999 
 
           python scripts/build_tail_labels.py \
             --stop-level "$STOP_LEVEL" \
@@ -190,6 +191,7 @@ jobs:
             --profit-target "$PROFIT_TARGET" \
             --max-days "$MAX_DAYS" \
             --stop-level "$STOP_LEVEL" \
+            --max-extend-days 999 \
             --k1 10 \
             --k2 20
 
