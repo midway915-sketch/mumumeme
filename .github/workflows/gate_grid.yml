@@ -15,40 +15,37 @@ on:
         description: "stop level (e.g. -0.10)"
         required: true
         default: "-0.10"
+      max_extend_days:
+        description: "tau/labels extend horizon tag (e.g. 30)"
+        required: true
+        default: "30"
 
-      # ✅ gate grid knobs
       p_tail_thresholds:
-        description: "comma-separated p_tail thresholds (e.g. 0.10,0.20,0.30)"
+        description: "comma-separated p_tail thresholds"
         required: true
         default: "0.10,0.20,0.30"
       utility_quantiles:
-        description: "comma-separated utility quantiles (e.g. 0.60,0.75,0.90)"
+        description: "comma-separated utility quantiles"
         required: true
         default: "0.60,0.75,0.90"
       rank_metrics:
-        description: "comma-separated rank metric (utility|ret_score|p_success). e.g. utility,ret_score"
+        description: "comma-separated rank metric (utility|ret_score|p_success)"
         required: true
         default: "utility,ret_score"
-
-      # ✅ ps_min grid (너 요청)
-      ps_min_thresholds:
-        description: "comma-separated p_success min thresholds (e.g. 0.00,0.05,0.10)"
-        required: true
-        default: "0.00,0.05,0.10"
-
       lambda_tail:
-        description: "utility tail penalty lambda (single float, e.g. 0.05)"
+        description: "utility tail penalty lambda"
         required: true
         default: "0.05"
 
+      ps_min_values:
+        description: "comma-separated p_success minimum thresholds (recommend: 0,0.05,0.10)"
+        required: true
+        default: "0,0.05,0.10"
+
       rebuild_all:
-        description: "true to rebuild prices/features/labels/models from scratch"
+        description: "true to rebuild everything"
         required: true
         default: "false"
-
-  schedule:
-    # 매일 한국시간 08:10 (UTC 23:10)
-    - cron: "10 23 * * *"
 
 jobs:
   grid:
@@ -80,79 +77,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p data/raw data/features data/labels data/signals data/meta app scripts
+          mkdir -p data/raw data/features data/labels data/signals app
 
-      - name: Build LABEL_KEY + PRICE_START (10y)
+      - name: Build PRICE_START (10y + warmup)
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY' >> $GITHUB_ENV
+          python - <<'PY' >> "$GITHUB_ENV"
           from datetime import datetime, timedelta, timezone
-          
-          pt=float("${{ inputs.profit_target }}")
-          h=int("${{ inputs.max_days }}")
-          sl=float("${{ inputs.stop_level }}")
-          
-          def pct(x): return int(round(abs(x)*100))
-          LABEL_KEY=f"pt{pct(pt)}_h{h}_sl{pct(sl)}"
-          
-          today=datetime.now(timezone.utc).date()
-          price_start=(today - timedelta(days=365*11)).strftime("%Y-%m-%d")
-          
-          print(f"LABEL_KEY={LABEL_KEY}")
+          today = datetime.now(timezone.utc).date()
+          price_start = (today - timedelta(days=365*11)).strftime("%Y-%m-%d")
           print(f"PRICE_START={price_start}")
           PY
-
-      - name: Restore cache (PRICES)
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/raw/prices.parquet
-            data/raw/prices.csv
-            data/raw/prices_meta.json
-          key: mumumeme-prices-v4-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
-          restore-keys: |
-            mumumeme-prices-v4-${{ runner.os }}-
-
-      - name: Restore cache (FEATURES)
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/features/features_model.parquet
-            data/features/features_model.csv
-            data/features/features_scored.parquet
-            data/features/features_scored.csv
-          key: mumumeme-features-v4-${{ runner.os }}-${{ hashFiles('scripts/build_features.py','scripts/score_models.py','scripts/universe.py','scripts/fetch_prices.py','data/universe.csv') }}
-          restore-keys: |
-            mumumeme-features-v4-${{ runner.os }}-
-
-      - name: Restore cache (MODELS)
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/labels/labels_success.parquet
-            data/labels/labels_success.csv
-            data/labels/labels_tail.parquet
-            data/labels/labels_tail.csv
-            data/labels/labels_tau.parquet
-            data/labels/labels_tau.csv
-            app/success_model.pkl
-            app/success_scaler.pkl
-            app/tail_model.pkl
-            app/tail_scaler.pkl
-            app/tau_model.pkl
-            app/tau_scaler.pkl
-          key: mumumeme-models-v4-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_success_labels.py','scripts/build_tail_labels.py','scripts/build_tau_labels.py','scripts/train_success_model.py','scripts/train_tail_model.py','scripts/train_tau_model.py') }}
-          restore-keys: |
-            mumumeme-models-v4-${{ runner.os }}-${{ env.LABEL_KEY }}-
-
-      - name: Build / Update pipeline (prices -> features -> labels -> models -> score)
+          
+      - name: Build / Update pipeline
         shell: bash
         env:
           REBUILD_ALL: ${{ inputs.rebuild_all }}
           PROFIT_TARGET: ${{ inputs.profit_target }}
           MAX_DAYS: ${{ inputs.max_days }}
           STOP_LEVEL: ${{ inputs.stop_level }}
+          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
           PRICE_START: ${{ env.PRICE_START }}
         run: |
           set -euo pipefail
@@ -166,7 +111,7 @@ jobs:
             rm -rf data/signals/* || true
           fi
 
-          # 1) Universe + Prices (10y+warmup window)
+          # 1) Universe + Prices
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full --start "$PRICE_START"
@@ -174,56 +119,21 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10
           fi
 
-          # 2) features_model (always rebuild for robustness)
+          # 2) Features
           python scripts/build_features.py
 
-          # 3) labels (always rebuild: PT/H/SL are inputs)
-          python scripts/build_labels.py \
-            --profit-target "$PROFIT_TARGET" \
-            --max-days "$MAX_DAYS" \
-            --stop-level "$STOP_LEVEL"
+          # 3) Labels
+          python scripts/build_success_labels.py --profit-target "$PROFIT_TARGET" --max-days "$MAX_DAYS"
+          python scripts/build_tail_labels.py --stop-level "$STOP_LEVEL"
+          python scripts/build_tau_labels.py --profit-target "$PROFIT_TARGET" --max-days "$MAX_DAYS" --stop-level "$STOP_LEVEL" --max-extend-days "$MAX_EXTEND_DAYS" --k1 10 --k2 20
 
-          python scripts/build_success_labels.py \
-            --profit-target "$PROFIT_TARGET" \
-            --max-days "$MAX_DAYS" \
-
-          python scripts/build_tail_labels.py \
-            --stop-level "$STOP_LEVEL" \
-    
-
-          python scripts/build_tau_labels.py \
-            --profit-target "$PROFIT_TARGET" \
-            --max-days "$MAX_DAYS" \
-            --stop-level "$STOP_LEVEL" \
-            --max-extend-days 999 \
-            --k1 10 \
-            --k2 20
-
-          # 4) models
+          # 4) Models (train if missing)
           python scripts/train_success_model.py
           python scripts/train_tail_model.py
           python scripts/train_tau_model.py
 
-          # 5) score_models -> features_scored (p_success/p_tail 포함)
+          # 5) Score -> features_scored (THIS CREATES p_tail/p_success)
           python scripts/score_models.py
-
-          # Hard assertions (fail fast if something is still wrong)
-          python - <<'PY'
-          import pandas as pd
-          from pathlib import Path
-          
-          p=Path("data/features/features_scored.parquet")
-          c=Path("data/features/features_scored.csv")
-          if not p.exists() and not c.exists():
-              raise SystemExit("features_scored not created")
-          
-          df = pd.read_parquet(p) if p.exists() else pd.read_csv(c)
-          need=["Date","Ticker","p_success","p_tail"]
-          miss=[x for x in need if x not in df.columns]
-          if miss:
-              raise SystemExit(f"features_scored missing cols: {miss}")
-          print("[OK] features_scored ready:", df.shape, "range", df["Date"].min(), df["Date"].max())
-          PY
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
@@ -231,41 +141,28 @@ jobs:
           PROFIT_TARGET: ${{ inputs.profit_target }}
           MAX_DAYS: ${{ inputs.max_days }}
           STOP_LEVEL: ${{ inputs.stop_level }}
+          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
 
           P_TAIL_THRESHOLDS: ${{ inputs.p_tail_thresholds }}
           UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
           RANK_METRICS: ${{ inputs.rank_metrics }}
-          PS_MIN_THRESHOLDS: ${{ inputs.ps_min_thresholds }}
-
           LAMBDA_TAIL: ${{ inputs.lambda_tail }}
+          PS_MIN_VALUES: ${{ inputs.ps_min_values }}
+
           GATE_MODES: "none,tail,utility,tail_utility"
 
-          # 수익률 점프 옵션
           TP1_FRAC: "0.50"
           TRAIL_STOPS: "0.08,0.10,0.12"
           ENABLE_TRAILING: "true"
 
-          # top1 vs top2 compare
           TOPK_CONFIGS: "1|1.0;2|0.7,0.3;2|0.6,0.4"
 
           OUT_DIR: "data/signals"
           EXCLUDE_TICKERS: "SPY,^VIX"
-          REQUIRE_FILES: "data/features/features_scored.parquet,app/success_model.pkl,app/tail_model.pkl,app/tau_model.pkl"
         run: |
           set -euo pipefail
           chmod +x scripts/run_grid_workflow.sh
           bash scripts/run_grid_workflow.sh
-
-      - name: Aggregate summaries
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/aggregate_gate_grid.py \
-            --signals-dir "data/signals" \
-            --out-aggregate "data/signals/gate_grid_aggregate.csv" \
-            --out-top "data/signals/gate_grid_top_by_recent10y.csv" \
-            --pattern "gate_summary_*.csv" \
-            --topn 50
 
       - name: Upload artifacts (signals)
         uses: actions/upload-artifact@v4
@@ -273,8 +170,6 @@ jobs:
           name: gate-grid-results
           path: |
             data/signals/gate_summary_*.csv
-            data/signals/gate_grid_aggregate.csv
-            data/signals/gate_grid_top_by_recent10y.csv
             data/signals/picks_*.csv
             data/signals/picks_meta_*.json
             data/signals/sim_engine_trades_*.parquet
