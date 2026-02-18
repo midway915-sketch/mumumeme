@@ -31,24 +31,29 @@ on:
       rank_metrics:
         description: "comma-separated rank metric (utility|ret_score|p_success)"
         required: true
-        default: "utility"
-
-      ps_min_thresholds:
-        description: "comma-separated p_success minimum thresholds (e.g. 0.0,0.4,0.5)"
-        required: true
-        default: "0.0,0.4,0.5"
+        default: "utility,ret_score"
 
       lambda_tail:
         description: "utility tail penalty lambda (e.g. 0.05)"
         required: true
         default: "0.05"
 
+      ps_min_thresholds:
+        description: "comma-separated p_success min thresholds (e.g. 0.0,0.05,0.10)"
+        required: true
+        default: "0.0,0.05,0.10"
+
+      max_leverage_pct:
+        description: "max leverage pct cap (1.0=100%)"
+        required: true
+        default: "1.0"
+
       enable_trailing:
-        description: "true to enable 2-step exit (TP1 + trailing stop)"
+        description: "true/false"
         required: true
         default: "true"
       tp1_frac:
-        description: "fraction to sell at profit target (e.g. 0.50)"
+        description: "TP1 fraction (e.g. 0.50)"
         required: true
         default: "0.50"
       trail_stops:
@@ -59,19 +64,15 @@ on:
       topk_configs:
         description: "TopK configs: '1|1.0;2|0.7,0.3;2|0.6,0.4'"
         required: true
-        default: "1|1.0;2|0.7,0.3;2|0.6,0.4"
-
-      exclude_tickers:
-        description: "comma-separated tickers to exclude (e.g. SPY,^VIX)"
-        required: true
-        default: "SPY,^VIX"
+        default: "1|1.0"
 
       rebuild_all:
-        description: "true to rebuild prices/features/labels/models from scratch"
+        description: "true to rebuild prices/features/models from scratch"
         required: true
         default: "false"
 
   schedule:
+    # 매일 한국시간 08:10 (UTC 23:10)
     - cron: "10 23 * * *"
 
 jobs:
@@ -104,43 +105,46 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
+          mkdir -p data/raw data/features data/labels data/signals data/meta app scripts
 
-      - name: Set label key
+      - name: Set LABEL_KEY env (safe)
         shell: bash
         run: |
           set -euo pipefail
-          echo "LABEL_KEY=pt$(python - <<'PY'
-          pt=float("${{ inputs.profit_target }}")
-          print(int(round(pt*100)))
+          pt="$(python - <<'PY'
+          s="${{ inputs.profit_target }}"
+          print(int(round(float(s)*100)))
           PY
-          )_h${{ inputs.max_days }}_sl$(python - <<'PY'
-          sl=float("${{ inputs.stop_level }}")
-          print(int(round(abs(sl)*100)))
+          )"
+                    md="${{ inputs.max_days }}"
+                    sl="$(python - <<'PY'
+          s="${{ inputs.stop_level }}"
+          print(int(round(abs(float(s))*100)))
           PY
-          )_ex${{ inputs.max_extend_days }}" >> $GITHUB_ENV
+          )"
+          ex="${{ inputs.max_extend_days }}"
+          echo "LABEL_KEY=pt${pt}_h${md}_sl${sl}_ex${ex}" >> "$GITHUB_ENV"
 
-      - name: Prepare required files
+      - name: Prepare (optional rebuild)
         shell: bash
         env:
           REBUILD_ALL: ${{ inputs.rebuild_all }}
-          PROFIT_TARGET: ${{ inputs.profit_target }}
-          MAX_DAYS: ${{ inputs.max_days }}
-          STOP_LEVEL: ${{ inputs.stop_level }}
-          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
         run: |
           set -euo pipefail
-
           if [ "$REBUILD_ALL" = "true" ]; then
             rm -f data/raw/prices.parquet data/raw/prices.csv data/raw/prices_meta.json || true
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
             rm -f data/features/features_scored.parquet data/features/features_scored.csv || true
-            rm -f data/labels/*.parquet data/labels/*.csv || true
-            rm -f app/model.pkl app/scaler.pkl app/tail_model.pkl app/tail_scaler.pkl || true
+            rm -f data/features/features_scored_meta.json || true
+            rm -f app/model.pkl app/scaler.pkl app/tail_model.pkl || true
             rm -rf data/signals/* || true
           fi
 
-          # 1) prices
+      # 1) prices
+      - name: Build prices (incremental)
+        shell: bash
+        run: |
+          set -euo pipefail
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full
@@ -148,54 +152,45 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10
           fi
 
-          # 2) features_model
+      # 2) features_model
+      - name: Build features_model (if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             python scripts/build_features.py
           else
             echo "[INFO] features_model exists -> reuse"
           fi
 
-          # ✅ 2.5) labels_model (SUCCESS labels)  <<<<<< 여기 추가됨
-          if [ ! -f data/labels/labels_model.parquet ] && [ ! -f data/labels/labels_model.csv ]; then
-            python scripts/build_success_labels.py \
-              --profit-target "$PROFIT_TARGET" \
-              --max-days "$MAX_DAYS"
-          else
-            echo "[INFO] labels_model exists -> reuse"
-          fi
-
-          # 3) tail labels (없으면 생성)
-          if [ ! -f data/labels/labels_tail.parquet ] && [ ! -f data/labels/labels_tail.csv ]; then
-            python scripts/build_tail_labels.py \
-              --stop-level "$STOP_LEVEL"
-          else
-            echo "[INFO] labels_tail exists -> reuse"
-          fi
-
-          if [ ! -f app/tail_model.pkl ] || [ ! -f app/tail_scaler.pkl ]; then
-            python scripts/train_tail_model.py
-          else
-            echo "[INFO] tail model exists -> reuse"
-          fi
-
-          # 4) score -> features_scored (p_success/p_tail)
+      # 3) (optional) build/train models (you already have scripts; keep as-is or add your own)
+      # NOTE: 여기서는 "존재하면 재사용"만 함. 없으면 터지지 않게 score_features에서 require 플래그를 조절 가능.
+      - name: Score features -> features_scored
+        shell: bash
+        run: |
+          set -euo pipefail
           python scripts/score_features.py \
-            --in-parq data/features/features_model.parquet \
-            --in-csv  data/features/features_model.csv \
+            --features-parq data/features/features_model.parquet \
+            --features-csv data/features/features_model.csv \
             --out-parq data/features/features_scored.parquet \
-            --out-csv  data/features/features_scored.csv \
+            --out-csv data/features/features_scored.csv \
             --success-model app/model.pkl \
             --success-scaler app/scaler.pkl \
             --tail-model app/tail_model.pkl \
-            --tail-scaler app/tail_scaler.pkl \
-            --require-success \
-            --require-tail
+            --lambda-tail "${{ inputs.lambda_tail }}" \
+            --meta-out data/features/features_scored_meta.json
 
-      - name: Run gate grid (predict + simulate)
+      - name: Validate pipeline (fail fast)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/validate_pipeline.py \
+            --require-scored
+
+      - name: Run gate grid (predict + simulate + summarize)
         shell: bash
         env:
           LABEL_KEY: ${{ env.LABEL_KEY }}
-
           PROFIT_TARGET: ${{ inputs.profit_target }}
           MAX_DAYS: ${{ inputs.max_days }}
           STOP_LEVEL: ${{ inputs.stop_level }}
@@ -204,36 +199,46 @@ jobs:
           P_TAIL_THRESHOLDS: ${{ inputs.p_tail_thresholds }}
           UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
           RANK_METRICS: ${{ inputs.rank_metrics }}
-          PS_MIN_THRESHOLDS: ${{ inputs.ps_min_thresholds }}
           LAMBDA_TAIL: ${{ inputs.lambda_tail }}
-          GATE_MODES: "none,tail,utility,tail_utility"
+          PS_MIN_THRESHOLDS: ${{ inputs.ps_min_thresholds }}
+
+          MAX_LEVERAGE_PCT: ${{ inputs.max_leverage_pct }}
 
           ENABLE_TRAILING: ${{ inputs.enable_trailing }}
           TP1_FRAC: ${{ inputs.tp1_frac }}
           TRAIL_STOPS: ${{ inputs.trail_stops }}
 
           TOPK_CONFIGS: ${{ inputs.topk_configs }}
-          EXCLUDE_TICKERS: ${{ inputs.exclude_tickers }}
+          GATE_MODES: "none,tail,utility,tail_utility"
 
           OUT_DIR: "data/signals"
-
-          REQUIRE_FILES: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl,app/tail_model.pkl,app/tail_scaler.pkl"
+          EXCLUDE_TICKERS: "SPY,^VIX"
         run: |
           set -euo pipefail
           chmod +x scripts/run_grid_workflow.sh
           bash scripts/run_grid_workflow.sh
 
-      - name: Upload artifacts (signals + meta)
+      - name: Aggregate summaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/aggregate_gate_grid.py \
+            --signals-dir "data/signals" \
+            --out-aggregate "data/signals/gate_grid_aggregate.csv" \
+            --out-top "data/signals/gate_grid_top_by_recent10y.csv" \
+            --pattern "gate_summary_*.csv" \
+            --topn 50
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: gate-grid-results
           path: |
-            data/labels/labels_model.parquet
-            data/labels/labels_model.csv
-            data/features/features_scored.parquet
-            data/features/features_scored.csv
+            data/features/features_scored_meta.json
+            data/signals/gate_summary_*.csv
+            data/signals/gate_grid_aggregate.csv
+            data/signals/gate_grid_top_by_recent10y.csv
             data/signals/picks_*.csv
-            data/signals/picks_meta_*.json
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
           if-no-files-found: error
