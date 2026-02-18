@@ -1,121 +1,120 @@
 #!/usr/bin/env bash
-# scripts/run_grid_workflow.sh
 set -euo pipefail
 
-OUT_DIR="${OUT_DIR:-data/signals}"
-mkdir -p "$OUT_DIR"
+# Required envs (from workflow)
+: "${PROFIT_TARGET:?}"
+: "${MAX_DAYS:?}"
+: "${STOP_LEVEL:?}"
+: "${MAX_EXTEND_DAYS:?}"
 
-TAG="${LABEL_KEY:-pt10_h40_sl10_ex30}"
+: "${P_TAIL_THRESHOLDS:?}"
+: "${UTILITY_QUANTILES:?}"
+: "${RANK_METRICS:?}"
+: "${LAMBDA_TAIL:?}"
+: "${GATE_MODES:?}"
 
-# Required base params
-PROFIT_TARGET="${PROFIT_TARGET:-0.10}"
-MAX_DAYS="${MAX_DAYS:-40}"
-STOP_LEVEL="${STOP_LEVEL:--0.10}"
+: "${TP1_FRAC:?}"
+: "${TRAIL_STOPS:?}"
+: "${ENABLE_TRAILING:?}"
+: "${TOPK_CONFIGS:?}"
 
-P_TAIL_THRESHOLDS="${P_TAIL_THRESHOLDS:-0.10,0.20,0.30}"
-UTILITY_QUANTILES="${UTILITY_QUANTILES:-0.60,0.75,0.90}"
-RANK_METRICS="${RANK_METRICS:-utility,ret_score}"
-LAMBDA_TAIL="${LAMBDA_TAIL:-0.05}"
-GATE_MODES="${GATE_MODES:-none,tail,utility,tail_utility}"
+: "${OUT_DIR:=data/signals}"
+: "${EXCLUDE_TICKERS:=SPY,^VIX}"
 
-# NEW: p_success min grid
-PS_MIN_THRESHOLDS="${PS_MIN_THRESHOLDS:-0.0,0.05,0.10}"
+# Optional
+: "${PS_MIN_VALUES:=0}"
 
-# topk configs: "topk|w1,w2;topk|w1,w2"
-TOPK_CONFIGS="${TOPK_CONFIGS:-1|1.0}"
-
-# trailing config (engine controls this)
-ENABLE_TRAILING="${ENABLE_TRAILING:-true}"
-TP1_FRAC="${TP1_FRAC:-0.50}"
-TRAIL_STOPS="${TRAIL_STOPS:-0.10}"
-
-EXCLUDE_TICKERS="${EXCLUDE_TICKERS:-SPY,^VIX}"
+TAG="pt$(python - <<PY
+pt=float("$PROFIT_TARGET")
+print(int(round(abs(pt)*100)))
+PY)_h${MAX_DAYS}_sl$(python - <<PY
+sl=float("$STOP_LEVEL")
+print(int(round(abs(sl)*100)))
+PY)_ex${MAX_EXTEND_DAYS}"
 
 echo "[INFO] TAG=$TAG"
 echo "[INFO] OUT_DIR=$OUT_DIR"
 echo "[INFO] TOPK_CONFIGS=$TOPK_CONFIGS"
-echo "[INFO] PS_MIN_THRESHOLDS=$PS_MIN_THRESHOLDS"
 echo "[INFO] TRAIL_STOPS=$TRAIL_STOPS TP1_FRAC=$TP1_FRAC ENABLE_TRAILING=$ENABLE_TRAILING"
+echo "[INFO] PS_MIN_VALUES=$PS_MIN_VALUES"
 
-# split csv helper (bash-safe)
-csv_to_array() {
-  local s="$1"
-  s="${s// /}"
-  IFS=',' read -r -a _ARR <<< "$s"
-  for x in "${_ARR[@]}"; do
-    [[ -n "$x" ]] && echo "$x"
-  done
-}
+mkdir -p "$OUT_DIR"
 
-# split semicolon helper
-sc_to_array() {
-  local s="$1"
-  s="${s// /}"
-  IFS=';' read -r -a _ARR <<< "$s"
-  for x in "${_ARR[@]}"; do
-    [[ -n "$x" ]] && echo "$x"
-  done
-}
+# Split helpers
+IFS=',' read -r -a TAILS <<< "$P_TAIL_THRESHOLDS"
+IFS=',' read -r -a QS <<< "$UTILITY_QUANTILES"
+IFS=',' read -r -a RANKS <<< "$RANK_METRICS"
+IFS=',' read -r -a MODES <<< "$GATE_MODES"
+IFS=',' read -r -a TRS <<< "$TRAIL_STOPS"
+IFS=',' read -r -a PSMINS <<< "$PS_MIN_VALUES"
 
-# ensure scripts exist
-if [[ ! -f "scripts/predict_gate.py" ]]; then
-  echo "[ERROR] scripts/predict_gate.py not found" >&2
-  exit 1
-fi
-if [[ ! -f "scripts/simulate_single_position_engine.py" ]]; then
-  echo "[ERROR] scripts/simulate_single_position_engine.py not found" >&2
-  exit 1
-fi
-if [[ ! -f "scripts/summarize_sim_trades.py" ]]; then
-  echo "[ERROR] scripts/summarize_sim_trades.py not found" >&2
-  exit 1
+IFS=';' read -r -a TOPKS <<< "$TOPK_CONFIGS"
+
+# NOTE: predict_gate.py in your repo reads features_model by default,
+# but we WANT p_tail/p_success => use features_scored explicitly.
+FEATURES_PARQ="data/features/features_scored.parquet"
+FEATURES_CSV="data/features/features_scored.csv"
+
+if [ ! -f "$FEATURES_PARQ" ] && [ ! -f "$FEATURES_CSV" ]; then
+  echo "[FATAL] missing features_scored. Did you run scripts/score_models.py?"
+  exit 2
 fi
 
-# loops
-for mode in $(csv_to_array "$GATE_MODES"); do
-  for tail in $(csv_to_array "$P_TAIL_THRESHOLDS"); do
-    for uq in $(csv_to_array "$UTILITY_QUANTILES"); do
-      for rank_by in $(csv_to_array "$RANK_METRICS"); do
-        for ps_min in $(csv_to_array "$PS_MIN_THRESHOLDS"); do
-          for topk_cfg in $(sc_to_array "$TOPK_CONFIGS"); do
-            topk="${topk_cfg%%|*}"
-            weights="${topk_cfg#*|}"
+for mode in "${MODES[@]}"; do
+  mode="$(echo "$mode" | xargs)"
+  for tail in "${TAILS[@]}"; do
+    tail="$(echo "$tail" | xargs)"
+    for q in "${QS[@]}"; do
+      q="$(echo "$q" | xargs)"
+      for rank in "${RANKS[@]}"; do
+        rank="$(echo "$rank" | xargs)"
+        for psmin in "${PSMINS[@]}"; do
+          psmin="$(echo "$psmin" | xargs)"
+          for topk_cfg in "${TOPKS[@]}"; do
+            # topk_cfg = "1|1.0" or "2|0.7,0.3"
+            topk="$(echo "$topk_cfg" | cut -d'|' -f1)"
+            weights="$(echo "$topk_cfg" | cut -d'|' -f2)"
 
-            for tr in $(csv_to_array "$TRAIL_STOPS"); do
-              suffix="${mode}_t${tail}_q${uq}_r${rank_by}_lam${LAMBDA_TAIL}_ps${ps_min}_k${topk}_w${weights}_tp${TP1_FRAC}_tr${tr}"
-              # sanitize for filenames
+            for tr in "${TRS[@]}"; do
+              tr="$(echo "$tr" | xargs)"
+
+              suffix="${mode}_t${tail}_q${q}_r${rank}_lam${LAMBDA_TAIL}_ps${psmin}_k${topk}_w$(echo "$weights" | tr ',' '_')_tp$(echo "$TP1_FRAC" | sed 's/0\.//')_tr$(echo "$tr" | sed 's/0\.//')"
               suffix="${suffix//./p}"
-              suffix="${suffix//,/}"
-              suffix="${suffix//|/}"
+              suffix="${suffix//-/_}"
 
               echo "=============================="
-              echo "[RUN] mode=$mode tail_max=$tail u_q=$uq rank_by=$rank_by ps_min=$ps_min topk=$topk weights=$weights trail=$tr suffix=$suffix"
+              echo "[RUN] mode=$mode tail_max=$tail u_q=$q rank_by=$rank lambda=$LAMBDA_TAIL ps_min=$psmin topk=$topk weights=$weights trail=$tr suffix=$suffix"
               echo "=============================="
 
+              # 1) predict picks (topk rows per day will be sliced inside simulate)
               python scripts/predict_gate.py \
                 --profit-target "$PROFIT_TARGET" \
                 --max-days "$MAX_DAYS" \
                 --stop-level "$STOP_LEVEL" \
+                --max-extend-days "$MAX_EXTEND_DAYS" \
                 --mode "$mode" \
                 --tag "$TAG" \
                 --suffix "$suffix" \
                 --out-dir "$OUT_DIR" \
+                --features-parq "$FEATURES_PARQ" \
+                --features-csv "$FEATURES_CSV" \
+                --exclude-tickers "$EXCLUDE_TICKERS" \
                 --tail-threshold "$tail" \
-                --utility-quantile "$uq" \
-                --rank-by "$rank_by" \
+                --utility-quantile "$q" \
+                --rank-by "$rank" \
                 --lambda-tail "$LAMBDA_TAIL" \
-                --ps-min "$ps_min" \
-                --topk "$topk" \
-                --exclude-tickers "$EXCLUDE_TICKERS"
+                --ps-min "$psmin" \
+                --topk "$topk"
 
               picks_path="$OUT_DIR/picks_${TAG}_gate_${suffix}.csv"
 
+              # 2) simulate
               python scripts/simulate_single_position_engine.py \
                 --picks-path "$picks_path" \
                 --profit-target "$PROFIT_TARGET" \
                 --max-days "$MAX_DAYS" \
                 --stop-level "$STOP_LEVEL" \
-                --max-leverage-pct "${MAX_LEVERAGE_PCT:-1.0}" \
+                --max-extend-days "$MAX_EXTEND_DAYS" \
                 --enable-trailing "$ENABLE_TRAILING" \
                 --tp1-frac "$TP1_FRAC" \
                 --trail-stop "$tr" \
@@ -125,16 +124,12 @@ for mode in $(csv_to_array "$GATE_MODES"); do
                 --suffix "$suffix" \
                 --out-dir "$OUT_DIR"
 
-              trades_parq="$OUT_DIR/sim_engine_trades_${TAG}_gate_${suffix}.parquet"
+              # 3) summarize
+              python scripts/summarize_gate_run.py \
+                --curve-parq "$OUT_DIR/sim_engine_curve_${TAG}_gate_${suffix}.parquet" \
+                --trades-parq "$OUT_DIR/sim_engine_trades_${TAG}_gate_${suffix}.parquet" \
+                --out-csv "$OUT_DIR/gate_summary_${TAG}_gate_${suffix}.csv"
 
-              python scripts/summarize_sim_trades.py \
-                --trades-path "$trades_parq" \
-                --tag "$TAG" \
-                --suffix "$suffix" \
-                --profit-target "$PROFIT_TARGET" \
-                --max-days "$MAX_DAYS" \
-                --stop-level "$STOP_LEVEL" \
-                --out-dir "$OUT_DIR"
             done
           done
         done
@@ -143,4 +138,4 @@ for mode in $(csv_to_array "$GATE_MODES"); do
   done
 done
 
-echo "[DONE] grid run complete"
+echo "[DONE] grid finished."
