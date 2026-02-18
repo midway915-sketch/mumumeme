@@ -1,93 +1,101 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Required envs (from workflow)
+PRED="scripts/predict_gate.py"
+SIM="scripts/simulate_single_position_engine.py"
+SUM="scripts/summarize_sim_trades.py"
+
+OUT_DIR="${OUT_DIR:-data/signals}"
+mkdir -p "$OUT_DIR"
+
+TAG="${LABEL_KEY:-run}"
+echo "[INFO] TAG=$TAG"
+echo "[INFO] OUT_DIR=$OUT_DIR"
+
+# Required envs
 : "${PROFIT_TARGET:?}"
 : "${MAX_DAYS:?}"
 : "${STOP_LEVEL:?}"
 : "${MAX_EXTEND_DAYS:?}"
-
 : "${P_TAIL_THRESHOLDS:?}"
 : "${UTILITY_QUANTILES:?}"
 : "${RANK_METRICS:?}"
 : "${LAMBDA_TAIL:?}"
 : "${GATE_MODES:?}"
-
-: "${TP1_FRAC:?}"
 : "${TRAIL_STOPS:?}"
+: "${TP1_FRAC:?}"
 : "${ENABLE_TRAILING:?}"
 : "${TOPK_CONFIGS:?}"
+: "${PS_MINS:?}"
+: "${MAX_LEVERAGE_PCT:?}"
+: "${EXCLUDE_TICKERS:?}"
+: "${REQUIRE_FILES:?}"
 
-: "${OUT_DIR:=data/signals}"
-: "${EXCLUDE_TICKERS:=SPY,^VIX}"
+# ----- helpers
+split_csv() {
+  local s="$1"
+  python - <<PY
+s = """$s"""
+parts=[p.strip() for p in s.split(",") if p.strip()]
+for p in parts:
+  print(p)
+PY
+}
 
-# Optional
-: "${PS_MIN_VALUES:=0}"
+split_scsv() {
+  local s="$1"
+  python - <<PY
+s = """$s"""
+parts=[p.strip() for p in s.split(";") if p.strip()]
+for p in parts:
+  print(p)
+PY
+}
 
-TAG="pt$(python - <<PY
-pt=float("$PROFIT_TARGET")
-print(int(round(abs(pt)*100)))
-PY)_h${MAX_DAYS}_sl$(python - <<PY
-sl=float("$STOP_LEVEL")
-print(int(round(abs(sl)*100)))
-PY)_ex${MAX_EXTEND_DAYS}"
+suffix_float() {
+  python - <<PY
+x=float("$1")
+print(str(x).replace(".","p").replace("-","m"))
+PY
+}
 
-echo "[INFO] TAG=$TAG"
-echo "[INFO] OUT_DIR=$OUT_DIR"
+# ----- print config
 echo "[INFO] TOPK_CONFIGS=$TOPK_CONFIGS"
 echo "[INFO] TRAIL_STOPS=$TRAIL_STOPS TP1_FRAC=$TP1_FRAC ENABLE_TRAILING=$ENABLE_TRAILING"
-echo "[INFO] PS_MIN_VALUES=$PS_MIN_VALUES"
+echo "[INFO] PS_MINS=$PS_MINS MAX_LEVERAGE_PCT=$MAX_LEVERAGE_PCT"
 
-mkdir -p "$OUT_DIR"
+# ----- main loops
+while read -r mode; do
+  while read -r tmax; do
+    while read -r uq; do
+      while read -r rank_by; do
+        while read -r psmin; do
+          while read -r topk_line; do
+            # topk_line format: "K|w1,w2"
+            K="${topk_line%%|*}"
+            W="${topk_line#*|}"
 
-# Split helpers
-IFS=',' read -r -a TAILS <<< "$P_TAIL_THRESHOLDS"
-IFS=',' read -r -a QS <<< "$UTILITY_QUANTILES"
-IFS=',' read -r -a RANKS <<< "$RANK_METRICS"
-IFS=',' read -r -a MODES <<< "$GATE_MODES"
-IFS=',' read -r -a TRS <<< "$TRAIL_STOPS"
-IFS=',' read -r -a PSMINS <<< "$PS_MIN_VALUES"
+            while read -r trail; do
+              # suffix compose
+              t_s="$(suffix_float "$tmax")"
+              uq_s="$(suffix_float "$uq")"
+              lam_s="$(suffix_float "$LAMBDA_TAIL")"
+              ps_s="$(suffix_float "$psmin")"
+              tr_s="$(suffix_float "$trail")"
+              tp_pct="$(python - <<PY
+f=float("$TP1_FRAC")
+print(int(round(f*100)))
+PY
+)"
 
-IFS=';' read -r -a TOPKS <<< "$TOPK_CONFIGS"
-
-# NOTE: predict_gate.py in your repo reads features_model by default,
-# but we WANT p_tail/p_success => use features_scored explicitly.
-FEATURES_PARQ="data/features/features_scored.parquet"
-FEATURES_CSV="data/features/features_scored.csv"
-
-if [ ! -f "$FEATURES_PARQ" ] && [ ! -f "$FEATURES_CSV" ]; then
-  echo "[FATAL] missing features_scored. Did you run scripts/score_models.py?"
-  exit 2
-fi
-
-for mode in "${MODES[@]}"; do
-  mode="$(echo "$mode" | xargs)"
-  for tail in "${TAILS[@]}"; do
-    tail="$(echo "$tail" | xargs)"
-    for q in "${QS[@]}"; do
-      q="$(echo "$q" | xargs)"
-      for rank in "${RANKS[@]}"; do
-        rank="$(echo "$rank" | xargs)"
-        for psmin in "${PSMINS[@]}"; do
-          psmin="$(echo "$psmin" | xargs)"
-          for topk_cfg in "${TOPKS[@]}"; do
-            # topk_cfg = "1|1.0" or "2|0.7,0.3"
-            topk="$(echo "$topk_cfg" | cut -d'|' -f1)"
-            weights="$(echo "$topk_cfg" | cut -d'|' -f2)"
-
-            for tr in "${TRS[@]}"; do
-              tr="$(echo "$tr" | xargs)"
-
-              suffix="${mode}_t${tail}_q${q}_r${rank}_lam${LAMBDA_TAIL}_ps${psmin}_k${topk}_w$(echo "$weights" | tr ',' '_')_tp$(echo "$TP1_FRAC" | sed 's/0\.//')_tr$(echo "$tr" | sed 's/0\.//')"
-              suffix="${suffix//./p}"
-              suffix="${suffix//-/_}"
+              suffix="${mode}_t${t_s}_q${uq_s}_r${rank_by}_lam${lam_s}_ps${ps_s}_k${K}_w$(echo "$W" | tr ',' '_')_tp${tp_pct}_tr${tr_s}"
 
               echo "=============================="
-              echo "[RUN] mode=$mode tail_max=$tail u_q=$q rank_by=$rank lambda=$LAMBDA_TAIL ps_min=$psmin topk=$topk weights=$weights trail=$tr suffix=$suffix"
+              echo "[RUN] mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin topk=$K weights=$W trail=$trail suffix=$suffix"
               echo "=============================="
 
-              # 1) predict picks (topk rows per day will be sliced inside simulate)
-              python scripts/predict_gate.py \
+              # 1) predict picks (TopK rows per date)
+              python "$PRED" \
                 --profit-target "$PROFIT_TARGET" \
                 --max-days "$MAX_DAYS" \
                 --stop-level "$STOP_LEVEL" \
@@ -95,47 +103,55 @@ for mode in "${MODES[@]}"; do
                 --mode "$mode" \
                 --tag "$TAG" \
                 --suffix "$suffix" \
-                --out-dir "$OUT_DIR" \
-                --features-parq "$FEATURES_PARQ" \
-                --features-csv "$FEATURES_CSV" \
-                --exclude-tickers "$EXCLUDE_TICKERS" \
-                --tail-threshold "$tail" \
-                --utility-quantile "$q" \
-                --rank-by "$rank" \
+                --tail-threshold "$tmax" \
+                --utility-quantile "$uq" \
+                --rank-by "$rank_by" \
                 --lambda-tail "$LAMBDA_TAIL" \
+                --topk "$K" \
                 --ps-min "$psmin" \
-                --topk "$topk"
+                --exclude-tickers "$EXCLUDE_TICKERS" \
+                --out-dir "$OUT_DIR" \
+                --require-files "$REQUIRE_FILES"
 
               picks_path="$OUT_DIR/picks_${TAG}_gate_${suffix}.csv"
 
-              # 2) simulate
-              python scripts/simulate_single_position_engine.py \
+              # 2) simulate (Top-1 or Top-2) + TP1 + trailing + leverage cap
+              python "$SIM" \
                 --picks-path "$picks_path" \
                 --profit-target "$PROFIT_TARGET" \
                 --max-days "$MAX_DAYS" \
                 --stop-level "$STOP_LEVEL" \
                 --max-extend-days "$MAX_EXTEND_DAYS" \
+                --max-leverage-pct "$MAX_LEVERAGE_PCT" \
                 --enable-trailing "$ENABLE_TRAILING" \
                 --tp1-frac "$TP1_FRAC" \
-                --trail-stop "$tr" \
-                --topk "$topk" \
-                --weights "$weights" \
+                --trail-stop "$trail" \
+                --topk "$K" \
+                --weights "$W" \
                 --tag "$TAG" \
                 --suffix "$suffix" \
                 --out-dir "$OUT_DIR"
 
-              # 3) summarize
-              python scripts/summarize_gate_run.py \
-                --curve-parq "$OUT_DIR/sim_engine_curve_${TAG}_gate_${suffix}.parquet" \
-                --trades-parq "$OUT_DIR/sim_engine_trades_${TAG}_gate_${suffix}.parquet" \
-                --out-csv "$OUT_DIR/gate_summary_${TAG}_gate_${suffix}.csv"
+              trades_path="$OUT_DIR/sim_engine_trades_${TAG}_gate_${suffix}.parquet"
 
-            done
-          done
-        done
-      done
-    done
-  done
-done
+              # 3) summarize -> gate_summary_*.csv
+              python "$SUM" \
+                --trades-path "$trades_path" \
+                --tag "$TAG" \
+                --suffix "$suffix" \
+                --profit-target "$PROFIT_TARGET" \
+                --max-days "$MAX_DAYS" \
+                --stop-level "$STOP_LEVEL" \
+                --max-extend-days "$MAX_EXTEND_DAYS" \
+                --out-dir "$OUT_DIR"
 
-echo "[DONE] grid finished."
+            done < <(split_csv "$TRAIL_STOPS")
+          done < <(split_scsv "$TOPK_CONFIGS")
+        done < <(split_csv "$PS_MINS")
+      done < <(split_csv "$RANK_METRICS")
+    done < <(split_csv "$UTILITY_QUANTILES")
+  done < <(split_csv "$P_TAIL_THRESHOLDS")
+done < <(split_csv "$GATE_MODES")
+
+echo "[DONE] grid finished"
+ls -la "$OUT_DIR" | sed -n '1,200p'

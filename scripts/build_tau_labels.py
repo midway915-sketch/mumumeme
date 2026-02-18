@@ -6,17 +6,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DATA_DIR = Path("data")
-RAW_DIR = DATA_DIR / "raw"
-LBL_DIR = DATA_DIR / "labels"
 
-PRICES_PARQ = RAW_DIR / "prices.parquet"
-PRICES_CSV = RAW_DIR / "prices.csv"
-
-OUT_PARQ = LBL_DIR / "labels_tau.parquet"
-OUT_CSV = LBL_DIR / "labels_tau.csv"
-
-
+# -----------------------------
+# IO helpers
+# -----------------------------
 def read_table(parq: str, csv: str) -> pd.DataFrame:
     p = Path(parq)
     c = Path(csv)
@@ -31,139 +24,161 @@ def norm_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
-def build_tau_labels(
-    prices: pd.DataFrame,
+def ensure_cols(df: pd.DataFrame, cols: list[str], name: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"{name} missing required columns: {missing}. cols={list(df.columns)[:50]}")
+
+
+# -----------------------------
+# Core: compute time-to-success
+# -----------------------------
+def compute_tau_days_for_ticker(
+    df_t: pd.DataFrame,
     profit_target: float,
     max_days: int,
-    stop_level: float,
-    max_extend_days: int,
-    k1: int,
-    k2: int,
 ) -> pd.DataFrame:
     """
-    TauClass:
-      0: no success within max_days (or within extend horizon; you can define)
-      1: success within k1 days
-      2: success within k2 days
-      3: success within max_days
+    For each row (Date), compute earliest day d in [1..max_days] such that
+    future High (within d days ahead, inclusive of day d) >= entry_close*(1+profit_target).
+
+    Returns columns: Date, Ticker, TauDays (float), SuccessWithinMaxDays (int)
     """
-    df = prices.copy()
-    df["Date"] = norm_date(df["Date"])
-    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-    df = df.sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    df_t = df_t.sort_values("Date").reset_index(drop=True)
+    n = len(df_t)
+    if n == 0:
+        return df_t.assign(TauDays=np.nan, SuccessWithinMaxDays=0)[["Date", "Ticker", "TauDays", "SuccessWithinMaxDays"]]
 
-    out_rows = []
+    close0 = pd.to_numeric(df_t["Close"], errors="coerce").to_numpy(dtype=float)
+    high = pd.to_numeric(df_t["High"], errors="coerce").to_numpy(dtype=float)
 
+    tau = np.full(n, np.nan, dtype=float)
+    success = np.zeros(n, dtype=int)
+
+    # For each start i, find smallest d where max(high[i+1:i+d]) >= close0[i]*(1+pt)
+    # Note: we start counting from "next day" as day 1. If you want same-day fill, change start offset to 0.
     pt = float(profit_target)
-    H = int(max_days)
+    target = close0 * (1.0 + pt)
 
-    for t, g in df.groupby("Ticker", sort=False):
-        g = g.sort_values("Date").reset_index(drop=True)
-        close = pd.to_numeric(g["Close"], errors="coerce").to_numpy(dtype=float)
+    for i in range(n):
+        if not np.isfinite(close0[i]) or close0[i] <= 0:
+            continue
+        thr = target[i]
+        end = min(n - 1, i + max_days)
+        # search forward days 1..max_days
+        found = False
+        for j in range(i + 1, end + 1):
+            if np.isfinite(high[j]) and high[j] >= thr:
+                tau[i] = float(j - i)  # days-to-hit
+                success[i] = 1
+                found = True
+                break
+        if not found:
+            tau[i] = np.nan
+            success[i] = 0
 
-        # future max over next H days (shift -1 so "after today")
-        fut_max = pd.Series(close).shift(-1).rolling(H, min_periods=H).max().to_numpy()
-
-        # success happens if fut_max >= close*(1+pt)
-        success = (fut_max >= close * (1.0 + pt)).astype(int)
-
-        # time-to-success (first day in [1..H] where High/Close hits target)
-        # Simple approximation: use Close series next H days (consistent with your existing approach style)
-        tau = np.full(len(g), np.nan, dtype=float)
-
-        for i in range(len(g) - H - 1):
-            base = close[i]
-            target = base * (1.0 + pt)
-            window = close[i+1:i+H+1]
-            hit = np.where(window >= target)[0]
-            if hit.size > 0:
-                tau[i] = float(hit[0] + 1)
-
-        # TauClass
-        tau_class = np.full(len(g), np.nan, dtype=float)
-        for i in range(len(g)):
-            if not np.isfinite(tau[i]):
-                tau_class[i] = 0.0
-            else:
-                d = int(tau[i])
-                if d <= int(k1):
-                    tau_class[i] = 1.0
-                elif d <= int(k2):
-                    tau_class[i] = 2.0
-                elif d <= int(H):
-                    tau_class[i] = 3.0
-                else:
-                    tau_class[i] = 0.0
-
-        tmp = pd.DataFrame({
-            "Date": g["Date"].values,
-            "Ticker": g["Ticker"].values,
-            "Tau": tau,
-            "TauClass": tau_class,
-        })
-        out_rows.append(tmp)
-
-    out = pd.concat(out_rows, ignore_index=True)
-    out = out.dropna(subset=["Date", "Ticker", "TauClass"]).copy()
-    out["TauClass"] = pd.to_numeric(out["TauClass"], errors="coerce").fillna(0).astype(int)
-
+    out = pd.DataFrame({
+        "Date": df_t["Date"].to_numpy(),
+        "Ticker": df_t["Ticker"].to_numpy(),
+        "TauDays": tau,
+        "SuccessWithinMaxDays": success,
+    })
     return out
 
 
+def tau_class_from_tau_days(tau_days: float | None, success: int, k1: int, k2: int, max_days: int) -> int:
+    """
+    0=FAST, 1=MID, 2=SLOW
+    - FAST: success and tau<=k1
+    - MID : success and k1<tau<=k2
+    - SLOW: everything else (including failures)
+    """
+    if success != 1 or tau_days is None or not np.isfinite(tau_days):
+        return 2
+    d = int(round(float(tau_days)))
+    if d <= int(k1):
+        return 0
+    if d <= int(k2):
+        return 1
+    if d <= int(max_days):
+        return 2
+    return 2
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--prices-parq", default=str(PRICES_PARQ), type=str)
-    ap.add_argument("--prices-csv", default=str(PRICES_CSV), type=str)
+    ap = argparse.ArgumentParser(description="Build tau labels (FAST/MID/SLOW) for buy-sizing.")
+    ap.add_argument("--prices-parq", default="data/raw/prices.parquet", type=str)
+    ap.add_argument("--prices-csv", default="data/raw/prices.csv", type=str)
 
     ap.add_argument("--profit-target", required=True, type=float)
     ap.add_argument("--max-days", required=True, type=int)
+
+    # keep interface consistent with your workflow even if tau labeling itself doesn't need stop/extend
     ap.add_argument("--stop-level", required=True, type=float)
     ap.add_argument("--max-extend-days", required=True, type=int)
 
-    ap.add_argument("--k1", default=10, type=int)
-    ap.add_argument("--k2", default=20, type=int)
-    ap.add_argument("--start-date", default=None, type=str)
+    ap.add_argument("--k1", default=10, type=int, help="FAST cutoff (days)")
+    ap.add_argument("--k2", default=20, type=int, help="MID cutoff (days)")
 
-    ap.add_argument("--out-parq", default=str(OUT_PARQ), type=str)
-    ap.add_argument("--out-csv", default=str(OUT_CSV), type=str)
+    ap.add_argument("--start-date", default="", type=str, help="optional: only label rows with Date >= start-date")
+    ap.add_argument("--out-parq", default="data/labels/labels_tau.parquet", type=str)
+    ap.add_argument("--out-csv", default="data/labels/labels_tau.csv", type=str)
 
     args = ap.parse_args()
 
-    prices = read_table(args.prices_parq, args.prices_csv).copy()
-    for c in ["Date", "Ticker", "Close"]:
-        if c not in prices.columns:
-            raise ValueError(f"prices missing required column: {c}")
+    prices = read_table(args.prices_parq, args.prices_c_csv if hasattr(args, "prices_c_csv") else args.prices_c_csv if False else args.prices_csv)
+    prices = prices.copy()
+
+    ensure_cols(prices, ["Date", "Ticker", "High", "Close"], "prices")
 
     prices["Date"] = norm_date(prices["Date"])
     prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
-    prices = prices.dropna(subset=["Date", "Ticker", "Close"]).copy()
+    prices = prices.dropna(subset=["Date", "Ticker", "Close", "High"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
     if args.start_date:
         sd = pd.to_datetime(args.start_date, errors="coerce")
         if pd.isna(sd):
             raise ValueError(f"Invalid --start-date: {args.start_date}")
-        prices = prices.loc[prices["Date"] >= sd].copy()
+        # We still need history BEFORE start-date for forward scanning? Actually tau scans forward, so it's ok.
+        prices = prices[prices["Date"] >= sd].copy()
 
-    out = build_tau_labels(
-        prices=prices,
-        profit_target=float(args.profit_target),
-        max_days=int(args.max_days),
-        stop_level=float(args.stop_level),
-        max_extend_days=int(args.max_extend_days),
-        k1=int(args.k1),
-        k2=int(args.k2),
-    )
+    out_parts = []
+    for t, df_t in prices.groupby("Ticker", sort=True):
+        out_parts.append(compute_tau_days_for_ticker(df_t, args.profit_target, args.max_days))
 
-    out_p = Path(args.out_parq)
-    out_c = Path(args.out_csv)
-    out_p.parent.mkdir(parents=True, exist_ok=True)
+    out = pd.concat(out_parts, ignore_index=True) if out_parts else pd.DataFrame(columns=["Date", "Ticker", "TauDays", "SuccessWithinMaxDays"])
 
-    out.to_parquet(out_p, index=False)
-    out.to_csv(out_c, index=False)
+    # TauClass
+    k1 = int(args.k1)
+    k2 = int(args.k2)
+    md = int(args.max_days)
+    out["TauClass"] = [
+        tau_class_from_tau_days(td, int(s), k1, k2, md)
+        for td, s in zip(out["TauDays"].tolist(), out["SuccessWithinMaxDays"].tolist())
+    ]
 
-    print(f"[DONE] wrote: {out_p} rows={len(out)}")
-    if len(out):
-        print(f"[INFO] range: {out['Date'].min()}..{out['Date'].max()}")
+    # store params for traceability
+    out["ProfitTarget"] = float(args.profit_target)
+    out["MaxDays"] = int(args.max_days)
+    out["StopLevel"] = float(args.stop_level)
+    out["MaxExtendDaysParam"] = int(args.max_extend_days)
+    out["K1"] = int(k1)
+    out["K2"] = int(k2)
+
+    # save
+    Path(args.out_parq).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        out.to_parquet(args.out_parq, index=False)
+        print(f"[DONE] wrote: {args.out_parq} rows={len(out)}")
+    except Exception as e:
+        print(f"[WARN] parquet write failed: {e}")
+
+    out.to_csv(args.out_c_csv if hasattr(args, "out_c_csv") else args.out_csv, index=False)
+    print(f"[DONE] wrote: {args.out_csv} rows={len(out)}")
+
+    # quick stats
+    vc = out["TauClass"].value_counts(dropna=False).to_dict() if "TauClass" in out.columns else {}
+    print(f"[INFO] TauClass counts: {vc}")
 
 
 if __name__ == "__main__":
