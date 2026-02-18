@@ -40,17 +40,20 @@ def coerce_num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
 
 
 def _model_predict_proba(model, X: pd.DataFrame) -> np.ndarray:
-    # calibrated model / sklearn classifier
     if hasattr(model, "predict_proba"):
         p = model.predict_proba(X)
         if isinstance(p, np.ndarray) and p.ndim == 2 and p.shape[1] >= 2:
             return p[:, 1]
-    # fallback: decision_function -> sigmoid-ish
     if hasattr(model, "decision_function"):
-        z = model.decision_function(X)
-        z = np.asarray(z, dtype=float)
+        z = np.asarray(model.decision_function(X), dtype=float)
         return 1.0 / (1.0 + np.exp(-z))
     raise TypeError("Model does not support probability prediction")
+
+
+def load_joblib(path: str):
+    if joblib is None:
+        raise RuntimeError("joblib is not available. pip install joblib")
+    return joblib.load(path)
 
 
 def main() -> None:
@@ -70,6 +73,7 @@ def main() -> None:
     ap.add_argument("--require-tail", action="store_true", help="Fail if tail model missing.")
 
     ap.add_argument("--lambda-tail", default=0.05, type=float, help="utility = ret_score - lambda_tail*p_tail")
+    ap.add_argument("--meta-out", default="data/features/features_scored_meta.json", type=str)
     args = ap.parse_args()
 
     feats = read_table(args.features_parq, args.features_cvv if False else args.features_cvv)  # noqa
