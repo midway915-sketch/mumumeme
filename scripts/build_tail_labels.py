@@ -1,248 +1,139 @@
-# scripts/build_tail_labels.py
+# scripts/build_tau_labels.py
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
 
-DATA_DIR = Path("data")
-RAW_DIR = DATA_DIR / "raw"
-FEAT_DIR = DATA_DIR / "features"
-LABEL_DIR = DATA_DIR / "labels"
-META_DIR = DATA_DIR / "meta"
+FEATURES_PARQ = "data/features/features_model.parquet"
+FEATURES_CSV  = "data/features/features_model.csv"
+
+PRICES_PARQ = "data/raw/prices.parquet"
+PRICES_CSV  = "data/raw/prices.csv"
+
+OUT_PARQ = "data/labels/labels_tau.parquet"
+OUT_CSV  = "data/labels/labels_tau.csv"
 
 
-def read_table(parq: Path, csv: Path) -> pd.DataFrame:
-    if parq.exists():
-        return pd.read_parquet(parq)
-    if csv.exists():
-        return pd.read_csv(csv)
+def read_table(parq: str, csv: str) -> pd.DataFrame:
+    p = Path(parq)
+    c = Path(csv)
+    if p.exists():
+        return pd.read_parquet(p)
+    if c.exists():
+        return pd.read_csv(c)
     raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
 
 
-def _to_dt(x):
-    return pd.to_datetime(x, errors="coerce")
+def norm_date(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
-def forward_min(s: pd.Series, window: int) -> pd.Series:
-    return s.iloc[::-1].rolling(window, min_periods=window).min().iloc[::-1]
-
-
-def forward_max(s: pd.Series, window: int) -> pd.Series:
-    return s.iloc[::-1].rolling(window, min_periods=window).max().iloc[::-1]
-
-
-def make_tag(profit_target: float, max_days: int, stop_level: float, max_extend_days: int) -> str:
-    pt_tag = int(round(profit_target * 100))
-    sl_tag = int(round(abs(stop_level) * 100))
-    return f"pt{pt_tag}_h{max_days}_sl{sl_tag}_ex{max_extend_days}"
-
-
-def normalize_prices_schema(df: pd.DataFrame) -> pd.DataFrame:
+def compute_tau_labels(prices: pd.DataFrame, profit_target: float, max_days: int, k1: int, k2: int) -> pd.DataFrame:
     """
-    Ensure prices has: Date, Ticker, High, Low, Close
-    Accepts variants: date/Datetime, ticker, AdjClose/Adj Close, close, high, low
+    τ 라벨(구간 분류):
+      - TauClass=0: k1일 이내 +PT 도달
+      - TauClass=1: k2일 이내 +PT 도달 (단, k1은 실패)
+      - TauClass=2: max_days 이내 +PT 도달 (단, k2는 실패)
+      - TauClass=3: max_days 이내 미도달(실패/매우 느림)
+
+    성공 판정은 "미래 High가 Close*(1+PT) 이상이었는가"로 단순화.
+    (엔진의 intraday TP 가정과 일치)
     """
-    df = df.copy()
 
-    # flatten multiindex cols
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # Date
-    if "Date" not in df.columns:
-        if "Datetime" in df.columns:
-            df = df.rename(columns={"Datetime": "Date"})
-        elif "date" in df.columns:
-            df = df.rename(columns={"date": "Date"})
-        elif isinstance(df.index, pd.DatetimeIndex) or df.index.name in ("Date", "Datetime"):
-            idx_name = df.index.name or "Date"
-            df = df.reset_index().rename(columns={idx_name: "Date"})
-
-    # Ticker
-    if "Ticker" not in df.columns:
-        if "ticker" in df.columns:
-            df = df.rename(columns={"ticker": "Ticker"})
-
-    # Common OHLC renames
-    rename_map = {}
-    for c in df.columns:
-        cl = c.lower()
-        if cl == "high":
-            rename_map[c] = "High"
-        elif cl == "low":
-            rename_map[c] = "Low"
-        elif cl == "close":
-            rename_map[c] = "Close"
-        elif cl in ("adj close", "adjclose", "adj_close"):
-            rename_map[c] = "AdjClose"
-        elif cl == "open":
-            rename_map[c] = "Open"
-        elif cl == "volume":
-            rename_map[c] = "Volume"
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # If Close missing but AdjClose exists, use AdjClose as Close (strategy uses Close)
-    if "Close" not in df.columns and "AdjClose" in df.columns:
-        df["Close"] = df["AdjClose"]
-
-    # If still missing, hard fail with diagnostic
-    needed = {"Date", "Ticker", "High", "Low", "Close"}
-    missing = needed - set(df.columns)
-    if missing:
-        raise ValueError(f"prices missing columns: {sorted(missing)}; cols={list(df.columns)[:40]}")
-
-    df["Date"] = _to_dt(df["Date"])
+    df = prices.copy()
+    df["Date"] = norm_date(df["Date"])
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
 
-    # numeric coercion
-    for c in ["High", "Low", "Close"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    need_cols = ["Date", "Ticker", "Close", "High"]
+    for c in need_cols:
+        if c not in df.columns:
+            raise KeyError(f"prices missing required column: {c}")
 
-    return df
+    df = df.dropna(subset=["Date", "Ticker", "Close", "High"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
+    # target price per row
+    df["TargetPx"] = df["Close"] * (1.0 + float(profit_target))
 
-def normalize_features_schema(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    if "Date" not in df.columns or "Ticker" not in df.columns:
-        raise ValueError("features_model must contain Date and Ticker")
-    df["Date"] = _to_dt(df["Date"])
-    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-    return df
+    # groupwise rolling forward max of High for horizons
+    def fwd_max_high(x: pd.Series, horizon: int) -> np.ndarray:
+        # forward window: [t+1, ..., t+horizon]
+        # implement via reverse rolling max
+        a = x.to_numpy(dtype=float)
+        n = len(a)
+        out = np.full(n, np.nan, dtype=float)
+        # reverse
+        rev = a[::-1]
+        # rolling max on reverse corresponds to forward max
+        s = pd.Series(rev)
+        # include current index in window, so we shift by 1 to exclude "today" if you want.
+        # We'll include today as well (conservative? actually slightly optimistic).
+        # To exclude today, use s.shift(1).rolling(h).max()
+        rmax = s.shift(1).rolling(window=horizon, min_periods=1).max().to_numpy()
+        out = rmax[::-1]
+        return out
+
+    k1 = int(k1)
+    k2 = int(k2)
+    max_days = int(max_days)
+
+    g = df.groupby("Ticker", sort=False)
+
+    df[f"FwdMaxHigh_{k1}"] = g["High"].transform(lambda s: fwd_max_high(s, k1))
+    df[f"FwdMaxHigh_{k2}"] = g["High"].transform(lambda s: fwd_max_high(s, k2))
+    df[f"FwdMaxHigh_{max_days}"] = g["High"].transform(lambda s: fwd_max_high(s, max_days))
+
+    hit1 = (df[f"FwdMaxHigh_{k1}"] >= df["TargetPx"])
+    hit2 = (df[f"FwdMaxHigh_{k2}"] >= df["TargetPx"])
+    hitH = (df[f"FwdMaxHigh_{max_days}"] >= df["TargetPx"])
+
+    tau = np.full(len(df), 3, dtype=int)
+    tau[hitH.to_numpy()] = 2
+    tau[hit2.to_numpy()] = 1
+    tau[hit1.to_numpy()] = 0
+
+    df["TauClass"] = tau
+    df["TauHit_k1"] = hit1.astype(int)
+    df["TauHit_k2"] = hit2.astype(int)
+    df["TauHit_H"]  = hitH.astype(int)
+
+    out = df[["Date", "Ticker", "TauClass", "TauHit_k1", "TauHit_k2", "TauHit_H"]].copy()
+    return out
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build tail labels aligned with the infinite DCA strategy.")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--profit-target", required=True, type=float)
     ap.add_argument("--max-days", required=True, type=int)
-    ap.add_argument("--stop-level", required=True, type=float)
-    ap.add_argument("--max-extend-days", required=True, type=int)
-
-    ap.add_argument("--tail-horizon-days", default=None, type=int,
-                    help="Tail check horizon in days. Default: max-days (strategy-aligned).")
-    ap.add_argument("--start-date", default=None, type=str)
-    ap.add_argument("--buffer-days", default=0, type=int)
-
-    ap.add_argument("--prices-parq", default=str(RAW_DIR / "prices.parquet"), type=str)
-    ap.add_argument("--prices-csv", default=str(RAW_DIR / "prices.csv"), type=str)
-
-    ap.add_argument("--features-parq", default=str(FEAT_DIR / "features_model.parquet"), type=str)
-    ap.add_argument("--features-csv", default=str(FEAT_DIR / "features_model.csv"), type=str)
-
-    ap.add_argument("--out-parq", default=None, type=str)
-    ap.add_argument("--out-csv", default=None, type=str)
-
+    ap.add_argument("--k1", default=10, type=int)
+    ap.add_argument("--k2", default=20, type=int)
+    ap.add_argument("--start-date", default="", type=str)
     args = ap.parse_args()
 
-    max_days = int(args.max_days)
-    tail_h = int(args.tail_horizon_days) if args.tail_horizon_days is not None else max_days
-    stop_level = float(args.stop_level)
-    profit_target = float(args.profit_target)
+    prices = read_table(PRICES_PARQ, PRICES_CSV)
 
-    tag = make_tag(profit_target, max_days, stop_level, int(args.max_extend_days))
+    labels = compute_tau_labels(
+        prices=prices,
+        profit_target=float(args.profit_target),
+        max_days=int(args.max_days),
+        k1=int(args.k1),
+        k2=int(args.k2),
+    )
 
-    prices = normalize_prices_schema(read_table(Path(args.prices_parq), Path(args.prices_csv)))
-    feats = normalize_features_schema(read_table(Path(args.features_parq), Path(args.features_csv)))
-
-    prices = prices.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    feats = feats.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-    # incremental window (optional)
     if args.start_date:
-        start = pd.to_datetime(args.start_date)
-        if int(args.buffer_days) > 0:
-            start = start - pd.Timedelta(days=int(args.buffer_days))
-        prices = prices.loc[prices["Date"] >= start].copy()
-        feats = feats.loc[feats["Date"] >= start].copy()
+        sd = pd.to_datetime(args.start_date, errors="coerce")
+        if pd.notna(sd):
+            labels = labels[labels["Date"] >= sd].copy()
 
-    # forward stats computed on full price (per ticker)
-    forward_stats = []
-    for t, df_t in prices.groupby("Ticker", sort=False):
-        df_t = df_t.sort_values("Date").reset_index(drop=True)
+    Path("data/labels").mkdir(parents=True, exist_ok=True)
+    labels.to_parquet(OUT_PARQ, index=False)
+    labels.to_csv(OUT_CSV, index=False)
 
-        close = df_t["Close"]
-        high = df_t["High"]
-        low = df_t["Low"]
-
-        max_high_h = forward_max(high, max_days)
-        min_low_tail = forward_min(low, tail_h)
-
-        out = pd.DataFrame({
-            "Date": df_t["Date"],
-            "Ticker": t,
-            "FWD_MAX_HIGH_H": max_high_h,
-            "FWD_MIN_LOW_TAIL": min_low_tail,
-            "ENTRY_CLOSE": close,
-        })
-        forward_stats.append(out)
-
-    fwd = pd.concat(forward_stats, ignore_index=True)
-    fwd = fwd.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-    base = feats.merge(fwd, on=["Date", "Ticker"], how="left", validate="1:1")
-
-    entry = pd.to_numeric(base["ENTRY_CLOSE"], errors="coerce")
-
-    succ_thr = entry * (1.0 + profit_target)
-    tail_thr = entry * (1.0 + stop_level)
-
-    fwd_max_high = pd.to_numeric(base["FWD_MAX_HIGH_H"], errors="coerce")
-    fwd_min_low = pd.to_numeric(base["FWD_MIN_LOW_TAIL"], errors="coerce")
-
-    base["Success"] = ((fwd_max_high >= succ_thr) & np.isfinite(fwd_max_high) & np.isfinite(succ_thr)).astype(int)
-    base["TailHit"] = ((fwd_min_low <= tail_thr) & np.isfinite(fwd_min_low) & np.isfinite(tail_thr)).astype(int)
-    base["TailTarget"] = ((base["TailHit"] == 1) & (base["Success"] == 0)).astype(int)
-
-    # drop rows without full forward windows
-    base = base.loc[np.isfinite(fwd_max_high) & np.isfinite(fwd_min_low) & np.isfinite(entry)].copy()
-
-    keep_cols = [c for c in feats.columns] + ["Success", "TailHit", "TailTarget"]
-    out_df = base[keep_cols].copy()
-
-    LABEL_DIR.mkdir(parents=True, exist_ok=True)
-    META_DIR.mkdir(parents=True, exist_ok=True)
-
-    out_parq = Path(args.out_parq) if args.out_parq else (LABEL_DIR / f"labels_tail_{tag}.parquet")
-    out_csv = Path(args.out_csv) if args.out_csv else (LABEL_DIR / f"labels_tail_{tag}.csv")
-
-    saved_parq = None
-    try:
-        out_df.to_parquet(out_parq, index=False)
-        saved_parq = str(out_parq)
-    except Exception as e:
-        print(f"[WARN] parquet write failed: {e}")
-
-    out_df.to_csv(out_csv, index=False)
-
-    meta = {
-        "tag": tag,
-        "profit_target": profit_target,
-        "max_days": max_days,
-        "stop_level": stop_level,
-        "tail_horizon_days": tail_h,
-        "rows": int(len(out_df)),
-        "saved_parquet": saved_parq,
-        "saved_csv": str(out_csv),
-        "label_def": {
-            "Success": "FWD(max_days) max High >= entry Close*(1+profit_target)",
-            "TailHit": "FWD(tail_horizon_days) min Low <= entry Close*(1+stop_level)",
-            "TailTarget": "TailHit==1 AND Success==0 (strategy-aligned bad tail path)",
-        },
-    }
-    (META_DIR / f"build_tail_labels_{tag}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    print(f"[DONE] build_tail_labels.py tag={tag} rows={len(out_df)}")
-    if saved_parq:
-        print(f"[OK] {saved_parq}")
-    print(f"[OK] {out_csv}")
+    print(f"[DONE] wrote: {OUT_PARQ} rows={len(labels)}")
+    vc = labels["TauClass"].value_counts(dropna=False).sort_index()
+    print("[INFO] TauClass counts:", vc.to_dict())
 
 
 if __name__ == "__main__":
