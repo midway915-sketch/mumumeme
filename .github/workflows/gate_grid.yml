@@ -1,4 +1,4 @@
-ㅢname: gate-grid
+name: gate-grid
 
 on:
   workflow_dispatch:
@@ -35,6 +35,14 @@ on:
         description: "utility tail penalty lambda (e.g. 0.05)"
         required: true
         default: "0.05"
+      max_leverage_pct:
+        description: "max leverage pct cap (1.0 => 100% borrow cap, total up to ~2x S0)"
+        required: true
+        default: "1.0"
+      p_success_mins:
+        description: "comma-separated p_success minimum gate (e.g. 0.45,0.55). Empty disables."
+        required: false
+        default: ""
       rebuild_all:
         description: "true to rebuild prices/features/labels/models from scratch"
         required: true
@@ -76,18 +84,16 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      - name: Set LABEL_SPEC / LABEL_KEY env (safe for cache keys)
+      - name: Set LABEL_SPEC env (sanitized for cache keys)
         shell: bash
         run: |
           set -euo pipefail
-          LABEL_SPEC="pt=${{ inputs.profit_target }},h=${{ inputs.max_days }},sl=${{ inputs.stop_level }},ex=${{ inputs.max_extend_days }}"
-          # cache key는 콤마/등호/마이너스 등에 민감할 수 있어서 안전한 형태로 변환
-          LABEL_KEY="pt${{ inputs.profit_target }}_h${{ inputs.max_days }}_sl${{ inputs.stop_level }}_ex${{ inputs.max_extend_days }}"
-          LABEL_KEY="$(echo "$LABEL_KEY" | sed 's/[=,]//g' | tr -d ' ' | tr ',' '_' )"
-          echo "LABEL_SPEC=$LABEL_SPEC" >> "$GITHUB_ENV"
-          echo "LABEL_KEY=$LABEL_KEY" >> "$GITHUB_ENV"
-          echo "[INFO] LABEL_SPEC=$LABEL_SPEC"
-          echo "[INFO] LABEL_KEY=$LABEL_KEY"
+          # cache key에 콤마/공백 들어가면 터질 수 있어서 '_'로 sanitize
+          RAW="pt=${{ inputs.profit_target }},h=${{ inputs.max_days }},sl=${{ inputs.stop_level }},ex=${{ inputs.max_extend_days }}"
+          SAFE="$(echo "$RAW" | tr ', ' '__')"
+          echo "LABEL_SPEC_RAW=$RAW" >> $GITHUB_ENV
+          echo "LABEL_SPEC_SAFE=$SAFE" >> $GITHUB_ENV
+          echo "LABEL_SPEC=$RAW" >> $GITHUB_ENV
 
       # ---- PRICES cache
       - name: Restore cache (PRICES)
@@ -97,9 +103,9 @@ jobs:
             data/raw/prices.parquet
             data/raw/prices.csv
             data/raw/prices_meta.json
-          key: mumumeme-prices-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
+          key: mumumeme-prices-v2-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
           restore-keys: |
-            mumumeme-prices-v3-${{ runner.os }}-
+            mumumeme-prices-v2-${{ runner.os }}-
 
       # ---- FEATURES cache
       - name: Restore cache (FEATURES_MODEL)
@@ -108,12 +114,12 @@ jobs:
           path: |
             data/features/features_model.parquet
             data/features/features_model.csv
-          key: mumumeme-features-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py','scripts/build_features.py','scripts/build_ev_features.py','scripts/merge_incremental_table.py') }}
+          key: mumumeme-features-v2-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py','scripts/build_features.py','scripts/build_ev_features.py','scripts/merge_incremental_table.py') }}
           restore-keys: |
-            mumumeme-features-v3-${{ runner.os }}-
+            mumumeme-features-v2-${{ runner.os }}-
 
-      # ---- MODEL cache (p_success)
-      - name: Restore cache (MODEL p_success)
+      # ---- MODEL cache
+      - name: Restore cache (MODEL + LABELS)
         uses: actions/cache@v4
         with:
           path: |
@@ -122,22 +128,9 @@ jobs:
             app/model.pkl
             app/scaler.pkl
             data/meta/build_fingerprint.json
-          key: mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/check_rebuild.py','scripts/merge_incremental_table.py') }}
+          key: mumumeme-model-v2-${{ runner.os }}-${{ env.LABEL_SPEC_SAFE }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/check_rebuild.py','scripts/merge_incremental_table.py') }}
           restore-keys: |
-            mumumeme-model-v3-${{ runner.os }}-
-
-      # ---- TAU cache
-      - name: Restore cache (TAU)
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/labels/labels_tau.parquet
-            data/labels/labels_tau.csv
-            app/tau_model.pkl
-            app/tau_scaler.pkl
-          key: mumumeme-tau-v2-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_tau_labels.py','scripts/train_tau_model.py') }}
-          restore-keys: |
-            mumumeme-tau-v2-${{ runner.os }}-
+            mumumeme-model-v2-${{ runner.os }}-
 
       - name: Fingerprint check (partial rebuild flags)
         shell: bash
@@ -145,16 +138,17 @@ jobs:
           set -euo pipefail
           out="$(python scripts/check_rebuild.py \
             --fingerprint-path data/meta/build_fingerprint.json \
-            --label-spec "${{ env.LABEL_SPEC }}" \
+            --label-spec "${{ env.LABEL_SPEC_RAW }}" \
             --features-files "scripts/build_features.py,scripts/build_ev_features.py,scripts/merge_incremental_table.py" \
             --labels-files "scripts/build_labels.py,scripts/train_model.py,scripts/merge_incremental_table.py" \
             --universe-files "scripts/universe.py,data/universe.csv" \
-            --strategy-files "scripts/predict_gate.py,scripts/simulate_single_position_engine.py,scripts/run_grid_workflow.sh,scripts/summarize_sim_trades.py,scripts/aggregate_gate_grid.py" \
+            --strategy-files "scripts/predict_gate.py,scripts/simulate_single_position_engine.py,scripts/gate_grid_lib.sh,scripts/run_grid_workflow.sh,scripts/summarize_sim_trades.py,scripts/aggregate_gate_grid.py,scripts/build_tau_labels.py" \
           )"
           echo "$out"
-          echo "$out" | tail -n 4 >> "$GITHUB_ENV"
+          # check_rebuild.py가 마지막에 "REBUILD_PRICES=1" 같은 줄을 출력한다는 가정
+          echo "$out" | tail -n 8 >> $GITHUB_ENV
 
-      - name: Prepare required files (daily incremental)
+      - name: Prepare required files (daily incremental + partial rebuild)
         shell: bash
         env:
           REBUILD_ALL: ${{ inputs.rebuild_all }}
@@ -167,8 +161,18 @@ jobs:
           MAX_DAYS: ${{ inputs.max_days }}
           STOP_LEVEL: ${{ inputs.stop_level }}
           MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
+
         run: |
           set -euo pipefail
+
+          # ---- unbound 방지 (set -u 대응)
+          : "${PROFIT_TARGET:=${{ inputs.profit_target }}}"
+          : "${MAX_DAYS:=${{ inputs.max_days }}}"
+          : "${STOP_LEVEL:=${{ inputs.stop_level }}}"
+          : "${MAX_EXTEND_DAYS:=${{ inputs.max_extend_days }}}"
+
+          echo "[INFO] LABEL_SPEC=${{ env.LABEL_SPEC_RAW }}"
+          echo "[INFO] PROFIT_TARGET=$PROFIT_TARGET MAX_DAYS=$MAX_DAYS STOP_LEVEL=$STOP_LEVEL MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS"
 
           if [ "$REBUILD_ALL" = "true" ]; then
             REBUILD_PRICES="1"; REBUILD_FEATURES="1"; REBUILD_MODEL="1"; CLEAR_SIGNALS="1"
@@ -178,65 +182,63 @@ jobs:
             rm -rf data/signals/* || true
           fi
 
-          # upstream 삭제
+          # upstream 삭제 (의존성 순서 보장)
           if [ "${REBUILD_PRICES:-0}" = "1" ]; then
             rm -f data/raw/prices.parquet data/raw/prices.csv data/raw/prices_meta.json || true
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
-            rm -f app/model.pkl app/scaler.pkl || true
             rm -f data/labels/labels_tau.parquet data/labels/labels_tau.csv || true
-            rm -f app/tau_model.pkl app/tau_scaler.pkl || true
+            rm -f app/model.pkl app/scaler.pkl || true
           elif [ "${REBUILD_FEATURES:-0}" = "1" ]; then
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
-            rm -f app/model.pkl app/scaler.pkl || true
             rm -f data/labels/labels_tau.parquet data/labels/labels_tau.csv || true
-            rm -f app/tau_model.pkl app/tau_scaler.pkl || true
+            rm -f app/model.pkl app/scaler.pkl || true
           elif [ "${REBUILD_MODEL:-0}" = "1" ]; then
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
-            rm -f app/model.pkl app/scaler.pkl || true
             rm -f data/labels/labels_tau.parquet data/labels/labels_tau.csv || true
-            rm -f app/tau_model.pkl app/tau_scaler.pkl || true
+            rm -f app/model.pkl app/scaler.pkl || true
           fi
 
-          # 1) prices: 매일 증분 갱신
+          # 1) prices
           python scripts/universe.py
+
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full
           else
             python scripts/fetch_prices.py --include-extra --lookback-days 10
           fi
 
-          # 2) START_DATE 자동 산출 (features 마지막 날짜 기준)
+          # 2) incremental start-date (features last date - 20d)
           RECOMPUTE_DAYS=20
           START_DATE=""
           if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
             START_DATE="$(python - <<'PY'
-          import pandas as pd
-          from pathlib import Path
-          p=Path("data/features/features_model.parquet")
-          c=Path("data/features/features_model.csv")
-          df=None
-          if p.exists():
-            df=pd.read_parquet(p)
-          elif c.exists():
-            df=pd.read_csv(c)
-          if df is None or len(df)==0 or "Date" not in df.columns:
-            print("")
-          else:
-            d=pd.to_datetime(df["Date"], errors="coerce").dropna()
-            if len(d)==0:
-              print("")
-            else:
-              last=d.max()
-              start=last - pd.Timedelta(days=20)
-              print(start.strftime("%Y-%m-%d"))
-          PY
-          )"
+import pandas as pd
+from pathlib import Path
+p=Path("data/features/features_model.parquet")
+c=Path("data/features/features_model.csv")
+df=None
+if p.exists():
+  df=pd.read_parquet(p)
+elif c.exists():
+  df=pd.read_csv(c)
+if df is None or len(df)==0 or "Date" not in df.columns:
+  print("")
+else:
+  d=pd.to_datetime(df["Date"], errors="coerce").dropna()
+  if len(d)==0:
+    print("")
+  else:
+    last=d.max()
+    start=last - pd.Timedelta(days=20)
+    print(start.strftime("%Y-%m-%d"))
+PY
+)"
           fi
           echo "[INFO] START_DATE=$START_DATE"
 
-          # 3) features: backup -> build recent -> merge
+          # 3) features (backup -> recent -> merge)
           if [ -n "$START_DATE" ] && { [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; }; then
             rm -rf data/_backup/features || true
             mkdir -p data/_backup/features
@@ -262,7 +264,7 @@ jobs:
             python scripts/build_features.py
           fi
 
-          # 4) p_success labels
+          # 4) labels_model (backup -> recent -> merge)
           if [ -n "$START_DATE" ] && { [ -f data/labels/labels_model.parquet ] || [ -f data/labels/labels_model.csv ]; }; then
             rm -rf data/_backup/labels || true
             mkdir -p data/_backup/labels
@@ -296,24 +298,14 @@ jobs:
               --stop-level "$STOP_LEVEL"
           fi
 
-          # 5) p_success model
+          # 5) model (p_success) - 없으면 학습
           if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
             python scripts/train_model.py
           else
             echo "[INFO] model exists -> reuse"
           fi
 
-          set -euo pipefail
-
-          # ---- Inputs/env normalize (unbound 방지)
-          : "${PROFIT_TARGET:=${{ inputs.profit_target }}}"
-          : "${MAX_DAYS:=${{ inputs.max_days }}}"
-          : "${STOP_LEVEL:=${{ inputs.stop_level }}}"
-          : "${MAX_EXTEND_DAYS:=${{ inputs.max_extend_days }}}"
-          
-          echo "[INFO] PROFIT_TARGET=$PROFIT_TARGET MAX_DAYS=$MAX_DAYS STOP_LEVEL=$STOP_LEVEL MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS"
-          
-          # 6) tau labels/model (optional but recommended for buy sizing)
+          # 6) tau labels (optional but recommended for buy sizing)
           if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
             python scripts/build_tau_labels.py \
               --profit-target "$PROFIT_TARGET" \
@@ -324,17 +316,6 @@ jobs:
               --k2 20
           else
             echo "[INFO] labels_tau exists -> reuse"
-          fi
-
-          if [ ! -f app/tau_model.pkl ] || [ ! -f app/tau_scaler.pkl ]; then
-            # train_tau_model.py가 없으면 여기서 실패하니, 파일이 있는지부터 체크
-            if [ -f scripts/train_tau_model.py ]; then
-              python scripts/train_tau_model.py
-            else
-              echo "[WARN] scripts/train_tau_model.py not found -> tau model will be skipped (tau_pred will be NaN)"
-            fi
-          else
-            echo "[INFO] tau model exists -> reuse"
           fi
 
       - name: Run gate grid (predict + simulate + summarize)
@@ -350,23 +331,21 @@ jobs:
           RANK_METRICS: ${{ inputs.rank_metrics }}
           LAMBDA_TAIL: ${{ inputs.lambda_tail }}
 
-          # ✅ τ 기반 매수금 조절 ON
-          TAU_GAMMA: "1.0"
+          MAX_LEVERAGE_PCT: ${{ inputs.max_leverage_pct }}
+          P_SUCCESS_MINS: ${{ inputs.p_success_mins }}
 
-          # ✅ p_success 최소 기준 내부 그리드(스키마 변경 없이 내부에서만 사용)
-          P_SUCCESS_MINS: "0.0,0.1,0.2"
-
-          # gate modes
+          # modes: baseline + gates
           GATE_MODES: "none,tail,utility,tail_utility"
-
-          # leverage cap (100% = seed의 2배까지 총 투입 가능)
-          MAX_LEVERAGE_PCT: "1.0"
         run: |
           set -euo pipefail
-          if [ ! -f scripts/run_grid_workflow.sh ]; then
-            echo "[ERROR] scripts/run_grid_workflow.sh not found"
-            exit 1
-          fi
+
+          # ---- unbound 방지
+          : "${PROFIT_TARGET:=${{ inputs.profit_target }}}"
+          : "${MAX_DAYS:=${{ inputs.max_days }}}"
+          : "${STOP_LEVEL:=${{ inputs.stop_level }}}"
+          : "${MAX_EXTEND_DAYS:=${{ inputs.max_extend_days }}}"
+          : "${MAX_LEVERAGE_PCT:=${{ inputs.max_leverage_pct }}}"
+
           chmod +x scripts/run_grid_workflow.sh || true
           bash scripts/run_grid_workflow.sh
 
@@ -388,6 +367,14 @@ jobs:
           path: |
             data/meta/build_fingerprint.json
             data/raw/prices_meta.json
+            data/features/features_model.parquet
+            data/features/features_model.csv
+            data/labels/labels_model.parquet
+            data/labels/labels_model.csv
+            data/labels/labels_tau.parquet
+            data/labels/labels_tau.csv
+            app/model.pkl
+            app/scaler.pkl
             data/signals/gate_summary_*.csv
             data/signals/gate_grid_aggregate.csv
             data/signals/gate_grid_top_by_recent10y.csv
