@@ -38,7 +38,7 @@ echo "[INFO] OUT_DIR=${OUT_DIR}"
 echo "[INFO] TOPK_CONFIGS=${TOPK_CONFIGS}"
 echo "[INFO] TRAIL_STOPS=${TRAIL_STOPS} TP1_FRAC=${TP1_FRAC} ENABLE_TRAILING=${ENABLE_TRAILING}"
 
-# pick script paths
+# script paths
 PRED="scripts/predict_gate.py"
 SIM="scripts/simulate_single_position_engine.py"
 SUM="scripts/summarize_sim_trades.py"
@@ -62,31 +62,34 @@ if [ -n "${REQUIRE_FILES}" ]; then
   [ "$missing" -eq 1 ] && exit 1
 fi
 
-# helpers
+# ----------------------------
+# helpers (NO heredoc)
+# ----------------------------
 to_suffix_num() {
   # 0.10 -> 0p10, -0.10 -> m0p10
-  python - <<'PY'
-import os, sys
-s=sys.argv[1]
-x=float(s)
-t=("m" if x<0 else "")
-x=abs(x)
-out=f"{t}{x:.4f}".rstrip("0").rstrip(".")
-out=out.replace(".","p")
-print(out)
-PY "$1"
+  python -c "import sys; x=float(sys.argv[1]); s=('m' if x<0 else ''); x=abs(x); out=f'{s}{x:.4f}'.rstrip('0').rstrip('.').replace('.','p'); print(out)" "$1"
 }
 
-# iterate
+tp_frac_pct() {
+  # 0.50 -> 50
+  python -c "import sys; x=float(sys.argv[1]); print(str(int(round(x*100))))" "$1"
+}
+
+# ----------------------------
+# parse lists
+# ----------------------------
 IFS=',' read -r -a MODES <<< "${GATE_MODES}"
 IFS=',' read -r -a TAILS <<< "${P_TAIL_THRESHOLDS}"
 IFS=',' read -r -a UQS   <<< "${UTILITY_QUANTILES}"
 IFS=',' read -r -a RANKS <<< "${RANK_METRICS}"
 IFS=',' read -r -a TRS   <<< "${TRAIL_STOPS}"
-
-# TOPK_CONFIGS split by ';'
 IFS=';' read -r -a TOPKS <<< "${TOPK_CONFIGS}"
 
+TPP="$(tp_frac_pct "${TP1_FRAC}")"
+
+# ----------------------------
+# run grid
+# ----------------------------
 for mode in "${MODES[@]}"; do
   mode="$(echo "$mode" | xargs)"
   [ -z "$mode" ] && continue
@@ -108,6 +111,10 @@ for mode in "${MODES[@]}"; do
           [ -z "$topk_spec" ] && continue
 
           # parse "K|w1,w2"
+          if [[ "$topk_spec" != *"|"* ]]; then
+            echo "[ERROR] TOPK_CONFIGS element must contain '|': $topk_spec"
+            exit 1
+          fi
           K="${topk_spec%%|*}"
           W="${topk_spec#*|}"
 
@@ -120,16 +127,11 @@ for mode in "${MODES[@]}"; do
             sm_q="$(to_suffix_num "${uq}")"
             sm_l="$(to_suffix_num "${LAMBDA_TAIL}")"
             sm_tr="$(to_suffix_num "${tr}")"
-            sm_tp="$(python - <<PY
-import sys
-x=float(sys.argv[1])
-print(str(int(round(x*100))))
-PY "${TP1_FRAC}")"
 
             # weights suffix
             w_sfx="$(echo "${W}" | tr ',' '_' | tr '.' 'p')"
 
-            SUFFIX="${mode}_t${sm_t}_q${sm_q}_r${rnk}_lam${sm_l}_k${K}_w${w_sfx}_tp${sm_tp}_tr${sm_tr}"
+            SUFFIX="${mode}_t${sm_t}_q${sm_q}_r${rnk}_lam${sm_l}_k${K}_w${w_sfx}_tp${TPP}_tr${sm_tr}"
 
             echo "=============================="
             echo "[RUN] mode=${mode} tail_max=${tmax} u_q=${uq} rank_by=${rnk} lambda=${LAMBDA_TAIL} topk=${K} weights=${W} trail=${tr} suffix=${SUFFIX}"
@@ -153,7 +155,7 @@ PY "${TP1_FRAC}")"
 
             PICKS_PATH="${OUT_DIR}/picks_${TAG}_gate_${SUFFIX}.csv"
 
-            # 2) simulate (Top-k bundle)
+            # 2) simulate (Top-k bundle + trailing + leverage cap)
             python "${SIM}" \
               --picks-path "${PICKS_PATH}" \
               --profit-target "${PROFIT_TARGET}" \
