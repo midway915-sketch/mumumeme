@@ -11,7 +11,6 @@ TAG="${LABEL_KEY:-pt10_h40_sl10_ex30}"
 PROFIT_TARGET="${PROFIT_TARGET:-0.10}"
 MAX_DAYS="${MAX_DAYS:-40}"
 STOP_LEVEL="${STOP_LEVEL:--0.10}"
-MAX_EXTEND_DAYS="${MAX_EXTEND_DAYS:-30}"
 
 P_TAIL_THRESHOLDS="${P_TAIL_THRESHOLDS:-0.10,0.20,0.30}"
 UTILITY_QUANTILES="${UTILITY_QUANTILES:-0.60,0.75,0.90}"
@@ -116,7 +115,6 @@ for mode in $(csv_to_array "$GATE_MODES"); do
                 --profit-target "$PROFIT_TARGET" \
                 --max-days "$MAX_DAYS" \
                 --stop-level "$STOP_LEVEL" \
-                --max-extend-days "$MAX_EXTEND_DAYS" \
                 --max-leverage-pct "${MAX_LEVERAGE_PCT:-1.0}" \
                 --enable-trailing "$ENABLE_TRAILING" \
                 --tp1-frac "$TP1_FRAC" \
@@ -136,7 +134,6 @@ for mode in $(csv_to_array "$GATE_MODES"); do
                 --profit-target "$PROFIT_TARGET" \
                 --max-days "$MAX_DAYS" \
                 --stop-level "$STOP_LEVEL" \
-                --max-extend-days "$MAX_EXTEND_DAYS" \
                 --out-dir "$OUT_DIR"
             done
           done
