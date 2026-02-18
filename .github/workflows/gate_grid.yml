@@ -15,10 +15,6 @@ on:
         description: "stop level (e.g. -0.10)"
         required: true
         default: "-0.10"
-      max_extend_days:
-        description: "extend horizon tag + strategy label horizon add (e.g. 30)"
-        required: true
-        default: "30"
 
       # ✅ gate grid knobs
       p_tail_thresholds:
