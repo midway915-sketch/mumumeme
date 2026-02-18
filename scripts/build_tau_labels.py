@@ -7,9 +7,16 @@ import numpy as np
 import pandas as pd
 
 
-# -----------------------------
-# IO helpers
-# -----------------------------
+FEATURES_PARQ = "data/features/features_model.parquet"
+FEATURES_CSV  = "data/features/features_model.csv"
+
+PRICES_PARQ = "data/raw/prices.parquet"
+PRICES_CSV  = "data/raw/prices.csv"
+
+OUT_PARQ = "data/labels/labels_tau.parquet"
+OUT_CSV  = "data/labels/labels_tau.csv"
+
+
 def read_table(parq: str, csv: str) -> pd.DataFrame:
     p = Path(parq)
     c = Path(csv)
@@ -24,224 +31,180 @@ def norm_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
-def read_universe(universe_csv: str) -> list[str]:
-    path = Path(universe_csv)
-    if not path.exists():
-        raise FileNotFoundError(f"Missing universe file: {universe_csv}")
-    uni = pd.read_csv(path)
-    if "Ticker" not in uni.columns:
-        raise ValueError("universe.csv must contain 'Ticker' column")
-    if "Enabled" in uni.columns:
-        uni = uni[uni["Enabled"] == True]  # noqa: E712
-    return (
-        uni["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
-    )
+def ensure_cols(df: pd.DataFrame, cols: list[str], name: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"{name} missing required columns: {missing}")
 
 
-# -----------------------------
-# τ label computation
-# -----------------------------
-def compute_tau_for_ticker(
-    px: pd.DataFrame,
+def compute_tau_labels(
+    prices: pd.DataFrame,
     profit_target: float,
-    horizon_days: int,
+    max_days: int,
+    max_extend_days: int,
+    k1: int,
+    k2: int,
 ) -> pd.DataFrame:
     """
-    For a single ticker price frame sorted by Date:
-      entry at Close[t]
-      success if any future High within horizon satisfies: High >= Close[t]*(1+profit_target)
-      tau_days = first hit day distance in trading days (inclusive: entry day counts as 1 if hit on same day)
-      If never hits within horizon => tau_days = NaN
-    Returns: DataFrame with Date, Ticker, tau_days
+    TauDays: entry day(0) 포함하여 '목표가(PT) 도달까지 걸린 거래일 수' (1..H)
+    TauClass:
+      0 = within horizon(=max_days) 성공 못함
+      1 = <= k1 일 이내 성공
+      2 = k1 < tau <= k2
+      3 = k2 < tau <= max_days
     """
-    if px.empty:
-        return px
+    H = int(max_days)
+    if H <= 1:
+        raise ValueError("max_days must be >= 2")
+    if not (1 <= k1 < k2 <= H):
+        raise ValueError(f"Require 1 <= k1 < k2 <= max_days. got k1={k1}, k2={k2}, max_days={H}")
 
-    px = px.sort_values("Date").reset_index(drop=True)
+    # 정렬/정규화
+    p = prices.copy()
+    p["Date"] = norm_date(p["Date"])
+    p["Ticker"] = p["Ticker"].astype(str).str.upper().str.strip()
+    p = p.dropna(subset=["Date", "Ticker", "Close", "High"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-    close = pd.to_numeric(px["Close"], errors="coerce").to_numpy(dtype=float)
-    high = pd.to_numeric(px["High"], errors="coerce").to_numpy(dtype=float)
+    out_rows = []
 
-    n = len(px)
-    tau = np.full(n, np.nan, dtype=float)
+    # ticker별로 forward high를 rolling 해서 "최초 도달일" 찾기
+    for t, g in p.groupby("Ticker", sort=False):
+        g = g.reset_index(drop=True)
+        close = pd.to_numeric(g["Close"], errors="coerce").to_numpy(dtype=float)
+        high = pd.to_numeric(g["High"], errors="coerce").to_numpy(dtype=float)
 
-    # if Close is missing, tau remains NaN
-    valid_close = np.isfinite(close) & (close > 0)
-
-    # horizon in trading steps (index distance). if horizon_days=0 => no future considered
-    H = int(max(horizon_days, 0))
-
-    for i in range(n):
-        if not valid_close[i]:
+        n = len(g)
+        if n < H + 5:
             continue
 
-        thr = close[i] * (1.0 + float(profit_target))
+        # 각 i에서 목표가 = close[i]*(1+PT)
+        # tau = min d in [1..H] s.t. high[i+d] >= target
+        tau_days = np.full(n, np.nan, dtype=float)
+        success = np.zeros(n, dtype=int)
 
-        # search in [i, i+H] inclusive, clipped
-        j_end = min(n - 1, i + H)
-        if j_end < i:
-            continue
+        for i in range(0, n - 1):
+            c0 = close[i]
+            if not np.isfinite(c0) or c0 <= 0:
+                continue
+            target = c0 * (1.0 + float(profit_target))
 
-        seg = high[i : j_end + 1]
-        # find first index where seg >= thr
-        hit = np.where(np.isfinite(seg) & (seg >= thr))[0]
-        if hit.size:
-            # inclusive trading-day count
-            tau[i] = float(hit[0] + 1)
+            # lookahead 범위: i+1 .. i+H (거래일 기준)
+            j_end = min(n - 1, i + H)
+            # high가 target 넘는 첫 지점 찾기
+            # (i+1부터)
+            window = high[i + 1 : j_end + 1]
+            if window.size == 0:
+                continue
 
-    out = px[["Date", "Ticker"]].copy()
-    out["tau_days"] = tau
+            hit = np.where(np.isfinite(window) & (window >= target))[0]
+            if hit.size > 0:
+                d = int(hit[0] + 1)  # +1 because window starts at i+1
+                tau_days[i] = float(d)
+                success[i] = 1
+
+        # TauClass 만들기
+        tau_class = np.zeros(n, dtype=int)
+        # 성공한 애들만 분류
+        mask = np.isfinite(tau_days)
+        td = tau_days[mask].astype(int)
+
+        # 1/2/3 bucket
+        cls = np.zeros_like(td, dtype=int)
+        cls[(td >= 1) & (td <= k1)] = 1
+        cls[(td > k1) & (td <= k2)] = 2
+        cls[(td > k2) & (td <= H)] = 3
+        # (이론상 td>H는 없음)
+        tau_class[mask] = cls
+
+        tmp = pd.DataFrame({
+            "Date": g["Date"],
+            "Ticker": t,
+            "TauDays": tau_days,      # float (NaN 가능)
+            "TauClass": tau_class,    # int (0..3)
+            "TauSuccess": success,    # 0/1
+            "ProfitTarget": float(profit_target),
+            "MaxDays": int(max_days),
+            "StopLevel": np.nan,      # 참고용(계산에는 안 씀)
+            "MaxExtendDays": int(max_extend_days),  # 참고용(계산에는 안 씀)
+            "K1": int(k1),
+            "K2": int(k2),
+        })
+        out_rows.append(tmp)
+
+    if not out_rows:
+        raise RuntimeError("No tau labels produced. Check price history length and tickers.")
+
+    out = pd.concat(out_rows, ignore_index=True)
+    out = out.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
     return out
 
 
-def add_bucket_cols(df: pd.DataFrame, ks: list[int]) -> pd.DataFrame:
-    df = df.copy()
-    tau = pd.to_numeric(df["tau_days"], errors="coerce")
-    for k in ks:
-        k = int(k)
-        if k <= 0:
-            continue
-        df[f"tau_le_{k}"] = ((tau <= k) & np.isfinite(tau)).astype(int)
-    return df
-
-
-# -----------------------------
-# main
-# -----------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build τ labels (time-to-profit-target) from prices.")
-
+    ap = argparse.ArgumentParser(description="Build tau classification labels (TauClass) from prices.")
     ap.add_argument("--profit-target", required=True, type=float)
     ap.add_argument("--max-days", required=True, type=int)
+    ap.add_argument("--stop-level", required=True, type=float)         # ✅ CLI 호환 (tau 계산엔 미사용)
+    ap.add_argument("--max-extend-days", required=True, type=int)      # ✅ CLI 호환 (tau 계산엔 미사용)
 
-    # required in your pipeline for spec consistency (not used in τ calc directly)
-    ap.add_argument("--stop-level", required=True, type=float)
-    ap.add_argument("--max-extend-days", required=True, type=int)
+    ap.add_argument("--k1", default=10, type=int)
+    ap.add_argument("--k2", default=20, type=int)
 
-    # bucket cutoffs (your yml uses these)
-    ap.add_argument("--k1", type=int, default=10)
-    ap.add_argument("--k2", type=int, default=20)
+    ap.add_argument("--features-parq", default=FEATURES_PARQ, type=str)
+    ap.add_argument("--features-csv", default=FEATURES_CSV, type=str)
+    ap.add_argument("--prices-parq", default=PRICES_PARQ, type=str)
+    ap.add_argument("--prices-csv", default=PRICES_CSV, type=str)
 
-    # IO
-    ap.add_argument("--features-parq", default="data/features/features_model.parquet", type=str)
-    ap.add_argument("--features-csv", default="data/features/features_model.csv", type=str)
-    ap.add_argument("--prices-parq", default="data/raw/prices.parquet", type=str)
-    ap.add_argument("--prices-csv", default="data/raw/prices.csv", type=str)
-    ap.add_argument("--universe-csv", default="data/universe.csv", type=str)
-    ap.add_argument("--exclude-tickers", default="SPY,^VIX", type=str)
-
-    ap.add_argument("--out-parq", default="data/labels/labels_tau.parquet", type=str)
-    ap.add_argument("--out-csv", default="data/labels/labels_tau.csv", type=str)
-
-    # optional incremental slice
-    ap.add_argument("--start-date", default="", type=str)
-    ap.add_argument("--buffer-days", default=120, type=int)
+    ap.add_argument("--out-parq", default=OUT_PARQ, type=str)
+    ap.add_argument("--out-csv", default=OUT_CSV, type=str)
 
     args = ap.parse_args()
 
-    # -------------------------
-    # load minimal features index (Date/Ticker universe)
-    # (we trust features_model as the master calendar for gating days)
-    # -------------------------
-    feats = read_table(args.features_parq, args.features_csv).copy()
-    if "Date" not in feats.columns or "Ticker" not in feats.columns:
-        raise ValueError("features_model must contain Date and Ticker columns")
+    # prices로 tau 만들고, features 존재하면 Date/Ticker로 intersect만 남김(누수/정합성 방지)
+    prices = read_table(args.prices_parq, args.prices_csv)
+    ensure_cols(prices, ["Date", "Ticker", "Close", "High"], "prices")
 
-    feats["Date"] = norm_date(feats["Date"])
-    feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
-    feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    tau = compute_tau_labels(
+        prices=prices,
+        profit_target=args.profit_target,
+        max_days=args.max_days,
+        max_extend_days=args.max_extend_days,
+        k1=args.k1,
+        k2=args.k2,
+    )
 
-    # optional slice for speed (keep buffer for forward window stability)
-    if args.start_date:
-        start = pd.to_datetime(args.start_date, errors="coerce")
-        if pd.isna(start):
-            raise ValueError(f"Invalid --start-date: {args.start_date}")
-        cut = start - pd.Timedelta(days=int(args.buffer_days))
-        feats = feats[feats["Date"] >= cut].reset_index(drop=True)
+    # features_model이 있으면 그 (Date,Ticker)만 유지
+    try:
+        feats = read_table(args.features_parq, args.features_csv)
+        ensure_cols(feats, ["Date", "Ticker"], "features_model")
+        feats = feats.copy()
+        feats["Date"] = norm_date(feats["Date"])
+        feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
+        feats = feats.dropna(subset=["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"])
+        tau = tau.merge(feats[["Date", "Ticker"]], on=["Date", "Ticker"], how="inner")
+    except FileNotFoundError:
+        pass
 
-    # -------------------------
-    # load prices (need Close/High)
-    # -------------------------
-    prices = read_table(args.prices_parq, args.prices_csv).copy()
-    if "Date" not in prices.columns or "Ticker" not in prices.columns:
-        raise ValueError("prices must contain Date and Ticker columns")
-    for c in ["Close", "High"]:
-        if c not in prices.columns:
-            raise ValueError(f"prices missing required column: {c}")
+    # ✅ 최종 필수 컬럼 보장
+    ensure_cols(tau, ["Date", "Ticker", "TauClass"], "labels_tau")
 
-    prices["Date"] = norm_date(prices["Date"])
-    prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
-    prices = prices.dropna(subset=["Date", "Ticker"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-    # universe-only + exclude extra tickers
-    universe = set(read_universe(args.universe_csv))
-    excludes = set([t.strip().upper() for t in str(args.exclude_tickers).split(",") if t.strip()])
-
-    prices = prices[prices["Ticker"].isin(universe)].copy()
-    prices = prices[~prices["Ticker"].isin(excludes)].copy()
-
-    feats = feats[feats["Ticker"].isin(universe)].copy()
-    feats = feats[~feats["Ticker"].isin(excludes)].copy()
-
-    if feats.empty:
-        raise RuntimeError("No feature rows after universe/exclude filter. Check universe.csv and exclude tickers.")
-    if prices.empty:
-        raise RuntimeError("No price rows after universe/exclude filter. Check prices fetch and universe.")
-
-    # -------------------------
-    # compute tau on price calendar
-    # horizon = max_days + max_extend_days (tag semantics)
-    # -------------------------
-    horizon = int(args.max_days) + int(args.max_extend_days)
-    if horizon <= 0:
-        raise ValueError("horizon (max_days + max_extend_days) must be > 0")
-
-    out_list = []
-    for t, px_t in prices.groupby("Ticker", sort=False):
-        px_t = px_t[["Date", "Ticker", "Close", "High"]].copy()
-        tau_t = compute_tau_for_ticker(px_t, profit_target=float(args.profit_target), horizon_days=horizon)
-        out_list.append(tau_t)
-
-    tau_all = pd.concat(out_list, ignore_index=True)
-    tau_all = tau_all.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-    # -------------------------
-    # align τ back to features dates only (master calendar)
-    # -------------------------
-    base = feats[["Date", "Ticker"]].drop_duplicates(["Date", "Ticker"]).copy()
-    base = base.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-
-    merged = base.merge(tau_all, on=["Date", "Ticker"], how="left")
-
-    # buckets: k1,k2 plus max_days and horizon
-    ks = sorted(set([int(args.k1), int(args.k2), int(args.max_days), int(horizon)]))
-    merged = add_bucket_cols(merged, ks)
-
-    # traceability columns
-    merged["profit_target"] = float(args.profit_target)
-    merged["max_days"] = int(args.max_days)
-    merged["stop_level"] = float(args.stop_level)
-    merged["max_extend_days"] = int(args.max_extend_days)
-    merged["tau_horizon_days"] = int(horizon)
-
-    # Save
     out_parq = Path(args.out_parq)
     out_csv = Path(args.out_csv)
     out_parq.parent.mkdir(parents=True, exist_ok=True)
 
-    # parquet preferred
+    # parquet 우선 저장
     try:
-        merged.to_parquet(out_parq, index=False)
-        print(f"[DONE] wrote {out_parq} rows={len(merged)}")
+        tau.to_parquet(out_parq, index=False)
+        print(f"[DONE] wrote {out_parq} rows={len(tau)}")
     except Exception as e:
         print(f"[WARN] parquet save failed: {e}")
 
-    merged.to_csv(out_csv, index=False)
-    print(f"[DONE] wrote {out_csv} rows={len(merged)}")
+    tau.to_csv(out_csv, index=False)
+    print(f"[DONE] wrote {out_csv} rows={len(tau)}")
 
-    # quick sanity
-    non_na = int(pd.to_numeric(merged["tau_days"], errors="coerce").notna().sum())
-    print(f"[INFO] tau non-NaN rows: {non_na}/{len(merged)} horizon={horizon} k1={args.k1} k2={args.k2}")
+    # sanity
+    vc = tau["TauClass"].value_counts(dropna=False).sort_index()
+    print("[INFO] TauClass counts:")
+    print(vc.to_string())
 
 
 if __name__ == "__main__":
