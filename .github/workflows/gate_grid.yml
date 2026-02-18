@@ -94,7 +94,7 @@ jobs:
           sl=float("${{ inputs.stop_level }}")
           
           def pct(x): return int(round(abs(x)*100))
-          LABEL_KEY=f"pt{pct(pt)}_h{h}_sl{pct(sl)}_ex{ex}"
+          LABEL_KEY=f"pt{pct(pt)}_h{h}_sl{pct(sl)}"
           
           today=datetime.now(timezone.utc).date()
           price_start=(today - timedelta(days=365*11)).strftime("%Y-%m-%d")
@@ -177,7 +177,7 @@ jobs:
           # 2) features_model (always rebuild for robustness)
           python scripts/build_features.py
 
-          # 3) labels (always rebuild: PT/H/SL/EX are inputs)
+          # 3) labels (always rebuild: PT/H/SL are inputs)
           python scripts/build_success_labels.py \
             --profit-target "$PROFIT_TARGET" \
             --max-days "$MAX_DAYS"
