@@ -97,7 +97,6 @@ for mode in $(csv_to_array "$GATE_MODES"); do
                 --profit-target "$PROFIT_TARGET" \
                 --max-days "$MAX_DAYS" \
                 --stop-level "$STOP_LEVEL" \
-                --max-extend-days "$MAX_EXTEND_DAYS" \
                 --mode "$mode" \
                 --tag "$TAG" \
                 --suffix "$suffix" \
