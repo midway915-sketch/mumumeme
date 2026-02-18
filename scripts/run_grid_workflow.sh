@@ -29,8 +29,11 @@ if [ ! -f "$PRED" ]; then echo "[ERROR] $PRED not found"; exit 1; fi
 if [ ! -f "$SIM" ]; then echo "[ERROR] $SIM not found"; exit 1; fi
 if [ ! -f "$SUM" ]; then echo "[ERROR] $SUM not found"; exit 1; fi
 
-# tag e.g. pt10_h40_sl10_ex30
-pt_tag="$(python - <<'PY'
+# ----------------------------
+# TAG e.g. pt10_h40_sl10_ex30
+# IMPORTANT: heredoc must allow bash var expansion -> <<PY (NO quotes)
+# ----------------------------
+pt_tag="$(python - <<PY
 pt=float("${PROFIT_TARGET}")
 md=int("${MAX_DAYS}")
 sl=float("${STOP_LEVEL}")
@@ -135,7 +138,6 @@ else:
     df["p_success"] = pd.to_numeric(df["p_success"], errors="coerce").fillna(0.0)
     df = df[df["p_success"] >= ps_min].copy()
 
-    # keep 1 per day after filtering
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.sort_values(["Date", "p_success"], ascending=[True, False]).drop_duplicates(["Date"], keep="first")
