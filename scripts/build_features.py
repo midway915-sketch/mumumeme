@@ -122,10 +122,15 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
     g = g.sort_values("Date").copy()
     dt = pd.to_datetime(g["Date"], errors="coerce").dt.tz_localize(None)
 
+    # ✅ keep OHLC numeric (for tail labels & downstream diagnostics)
+    o = pd.to_numeric(g["Open"], errors="coerce")
+    h = pd.to_numeric(g["High"], errors="coerce")
+    l = pd.to_numeric(g["Low"], errors="coerce")
+
     c = pd.to_numeric(g["Close"], errors="coerce")
     v = pd.to_numeric(g["Volume"], errors="coerce")
 
-    # ----- base features
+    # ----- base features (existing)
     roll_max_252 = c.rolling(252, min_periods=252).max()
     dd_252 = (c / roll_max_252) - 1.0
 
@@ -146,11 +151,13 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
 
     ma20_slope = (ma20 / ma20.shift(5)) - 1.0
 
-    # returns
-    ret_5 = (c / c.shift(5)) - 1.0
-    ret_10 = (c / c.shift(10)) - 1.0
+    # existing "ret_score" kept as 20d return (used by utility)
     ret_20 = (c / c.shift(20)) - 1.0
     ret_score = ret_20.copy()
+
+    # ----- NEW: TP1+trailing friendly features
+    ret_5 = (c / c.shift(5)) - 1.0
+    ret_10 = (c / c.shift(10)) - 1.0
 
     # breakout: close vs 20d rolling max
     roll_max_20 = c.rolling(20, min_periods=20).max()
@@ -164,20 +171,24 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
     ema50 = ema(c, 50)
     trend_align = (c / ema50) - 1.0
 
-    # -------- FIXED beta_60 (length-safe)
+    # beta_60: cov(ret, market_ret) / var(market_ret)
     r = c.pct_change()
-    mret = pd.to_numeric(market_ret_by_date.reindex(dt), errors="coerce")  # same length as dt
-    tmp = pd.DataFrame({"r": r.values, "mret": mret.values}, index=g.index)
-
-    cov = tmp["r"].rolling(60, min_periods=60).cov(tmp["mret"])
-    var = tmp["mret"].rolling(60, min_periods=60).var()
+    mret = market_ret_by_date.reindex(dt).astype(float)
+    cov = r.rolling(60, min_periods=60).cov(mret)
+    var = mret.rolling(60, min_periods=60).var()
     beta_60 = cov / var
 
-    # ---- build output (ALL columns guaranteed same length)
     out = pd.DataFrame({
         "Date": dt.values,
         "Ticker": g["Ticker"].values,
 
+        # ✅ OHLC passthrough (for tail labels)
+        "Open": o.values,
+        "High": h.values,
+        "Low": l.values,
+        "Close": c.values,
+
+        # base
         "Drawdown_252": dd_252.values,
         "Drawdown_60": dd_60.values,
         "ATR_ratio": atr_ratio.values,
@@ -186,6 +197,7 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
         "MA20_slope": ma20_slope.values,
         "ret_score": ret_score.values,
 
+        # new
         "ret_5": ret_5.values,
         "ret_10": ret_10.values,
         "ret_20": ret_20.values,
@@ -194,8 +206,8 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
         "trend_align": trend_align.values,
         "beta_60": beta_60.values,
 
+        # basics
         "Volume": v.values,
-        "Close": c.values,
     })
 
     return out
@@ -226,6 +238,7 @@ def add_sector_strength(feats: pd.DataFrame, ticker_to_group: dict[str, str]) ->
     )
     x = x.merge(sector_ret, on=["Date", "Group"], how="left")
     x["RelStrength"] = pd.to_numeric(x["ret_20"], errors="coerce") - pd.to_numeric(x["Sector_Ret_20"], errors="coerce")
+
     return x
 
 
@@ -235,15 +248,16 @@ def main() -> None:
     ap.add_argument("--max-window", type=int, default=260, help="max rolling window used (controls lookback)")
     ap.add_argument("--buffer-days", type=int, default=40, help="extra days added to lookback for safety")
     ap.add_argument("--min-volume", type=float, default=0.0, help="optional: drop rows with Volume < min-volume")
+
     ap.add_argument("--enable-sector-strength", action="store_true", help="add sector strength features (needs universe.csv Group)")
     ap.add_argument("--disable-sector-strength", action="store_true", help="force disable sector strength")
+
     args = ap.parse_args()
 
     FEAT_DIR.mkdir(parents=True, exist_ok=True)
 
     prices = read_prices()
 
-    # start-date handling: include lookback
     start_date = None
     if args.start_date:
         start_date = pd.to_datetime(args.start_date, errors="coerce")
@@ -254,20 +268,18 @@ def main() -> None:
         compute_start = start_date - pd.Timedelta(days=lookback_days)
         prices = prices.loc[prices["Date"] >= compute_start].copy()
 
-    # market features + market returns index
-    market = compute_market_features(prices).sort_values("Date").reset_index(drop=True)
+    market = compute_market_features(prices)
+    market = market.sort_values("Date").reset_index(drop=True)
     market_ret_by_date = pd.Series(
         market["Market_ret_1d"].values,
         index=pd.to_datetime(market["Date"]).dt.tz_localize(None)
     )
 
-    # per-ticker features
     feats_list = []
     for _, g in prices.groupby("Ticker", sort=False):
         feats_list.append(compute_ticker_features(g, market_ret_by_date=market_ret_by_date))
     feats = pd.concat(feats_list, ignore_index=True)
 
-    # merge market regime features
     feats = feats.copy()
     feats["Date"] = pd.to_datetime(feats["Date"], errors="coerce").dt.tz_localize(None)
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
@@ -275,11 +287,9 @@ def main() -> None:
     market_merge_cols = ["Date", "Market_Drawdown", "Market_ATR_ratio"]
     feats = feats.merge(market[market_merge_cols], on="Date", how="left")
 
-    # optional volume filter
     if args.min_volume and args.min_volume > 0:
         feats = feats.loc[pd.to_numeric(feats["Volume"], errors="coerce") >= float(args.min_volume)].copy()
 
-    # sector strength toggle (default ON unless forced off)
     enable_sector = True
     if args.disable_sector_strength:
         enable_sector = False
@@ -290,20 +300,25 @@ def main() -> None:
         ticker_to_group = read_universe_groups()
         feats = add_sector_strength(feats, ticker_to_group=ticker_to_group)
 
-    # strict NaN drop (feature completeness)
     FEATURE_COLS = [
+        # base
         "Drawdown_252", "Drawdown_60", "ATR_ratio", "Z_score",
         "MACD_hist", "MA20_slope", "Market_Drawdown", "Market_ATR_ratio",
         "ret_score",
+
+        # new core
         "ret_5", "ret_10", "ret_20",
         "breakout_20", "vol_surge", "trend_align", "beta_60",
+
+        # ✅ for tail labels & sanity checks
+        "Open", "High", "Low", "Close",
     ]
+
     if "Sector_Ret_20" in feats.columns:
         FEATURE_COLS += ["Sector_Ret_20", "RelStrength"]
 
     feats = feats.dropna(subset=FEATURE_COLS + ["Date", "Ticker"]).copy()
 
-    # output filter to start-date
     if start_date is not None:
         feats = feats.loc[pd.to_datetime(feats["Date"], errors="coerce") >= start_date].copy()
 
