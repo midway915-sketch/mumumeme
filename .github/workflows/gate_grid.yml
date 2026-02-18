@@ -164,11 +164,12 @@ jobs:
             echo "[INFO] labels_model exists -> reuse"
           fi
 
-          # 3) train models (success / tail)
-          if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
-            python scripts/train_model.py
+          # 3) tail labels (없으면 생성)
+          if [ ! -f data/labels/labels_tail.parquet ] && [ ! -f data/labels/labels_tail.csv ]; then
+            python scripts/build_tail_labels.py \
+              --stop-level "$STOP_LEVEL"
           else
-            echo "[INFO] success model exists -> reuse"
+            echo "[INFO] labels_tail exists -> reuse"
           fi
 
           if [ ! -f app/tail_model.pkl ] || [ ! -f app/tail_scaler.pkl ]; then
