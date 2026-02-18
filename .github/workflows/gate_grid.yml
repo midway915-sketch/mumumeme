@@ -181,7 +181,6 @@ jobs:
           python scripts/build_success_labels.py \
             --profit-target "$PROFIT_TARGET" \
             --max-days "$MAX_DAYS" \
-            --max-extend-days 999 
 
           python scripts/build_tail_labels.py \
             --stop-level "$STOP_LEVEL" \
