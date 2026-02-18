@@ -30,23 +30,28 @@ def per_ticker(g: pd.DataFrame, pt: float, max_days: int) -> pd.DataFrame:
     future_max_high = high.shift(-1).rolling(int(max_days), min_periods=int(max_days)).max()
     thr = close * (1.0 + float(pt))
 
-    y = (future_max_high >= thr).astype("float")  # float so NaN handling is easy
+    success = (future_max_high >= thr).astype("float")  # float so NaN handling is easy
+
     out = pd.DataFrame(
         {
             "Date": g["Date"].values,
             "Ticker": g["Ticker"].values,
-            "Target": y.values,
+            # train_model.py 호환: Success 컬럼
+            "Success": success.values,
+            # 혹시 기존 코드가 Target을 기대해도 같이 둠
+            "Target": success.values,
         }
     )
 
     # drop tail rows where we don't have full future window
-    out = out.dropna(subset=["Target"]).copy()
+    out = out.dropna(subset=["Success"]).copy()
+    out["Success"] = out["Success"].astype(int)
     out["Target"] = out["Target"].astype(int)
     return out
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build success labels_model (Target) from raw prices.")
+    ap = argparse.ArgumentParser(description="Build labels_model with Success (and Target) from raw prices.")
     ap.add_argument("--prices-parq", default="data/raw/prices.parquet", type=str)
     ap.add_argument("--prices-csv", default="data/raw/prices.csv", type=str)
 
@@ -76,7 +81,7 @@ def main() -> None:
         df = df.loc[df["Date"] >= sd].copy()
 
     outs = []
-    for t, g in df.groupby("Ticker", sort=False):
+    for _, g in df.groupby("Ticker", sort=False):
         outs.append(per_ticker(g, pt=float(args.profit_target), max_days=int(args.max_days)))
 
     labels = pd.concat(outs, ignore_index=True)
