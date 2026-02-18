@@ -210,21 +210,21 @@ jobs:
 
           # Hard assertions (fail fast if something is still wrong)
           python - <<'PY'
-import pandas as pd
-from pathlib import Path
-
-p=Path("data/features/features_scored.parquet")
-c=Path("data/features/features_scored.csv")
-if not p.exists() and not c.exists():
-    raise SystemExit("features_scored not created")
-
-df = pd.read_parquet(p) if p.exists() else pd.read_csv(c)
-need=["Date","Ticker","p_success","p_tail"]
-miss=[x for x in need if x not in df.columns]
-if miss:
-    raise SystemExit(f"features_scored missing cols: {miss}")
-print("[OK] features_scored ready:", df.shape, "range", df["Date"].min(), df["Date"].max())
-PY
+          import pandas as pd
+          from pathlib import Path
+          
+          p=Path("data/features/features_scored.parquet")
+          c=Path("data/features/features_scored.csv")
+          if not p.exists() and not c.exists():
+              raise SystemExit("features_scored not created")
+          
+          df = pd.read_parquet(p) if p.exists() else pd.read_csv(c)
+          need=["Date","Ticker","p_success","p_tail"]
+          miss=[x for x in need if x not in df.columns]
+          if miss:
+              raise SystemExit(f"features_scored missing cols: {miss}")
+          print("[OK] features_scored ready:", df.shape, "range", df["Date"].min(), df["Date"].max())
+          PY
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
