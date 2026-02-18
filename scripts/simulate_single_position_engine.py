@@ -498,4 +498,129 @@ def main() -> None:
                 # allocate total buy based on portfolio condition:
                 # If ANY remaining leg close <= its avg => unit, else if ANY close <= avg*1.05 => unit/2, else 0
                 desire = 0.0
-                any_b
+                any_below_avg = False
+                any_near = False
+                for leg in pos.legs:
+                    if leg.shares <= 0:
+                        continue
+                    close_px = px_close.get(leg.ticker)
+                    if close_px is None or close_px <= 0:
+                        continue
+                    avg = leg.avg_price()
+                    if np.isfinite(avg):
+                        if close_px <= avg:
+                            any_below_avg = True
+                        elif close_px <= avg * 1.05:
+                            any_near = True
+                if any_below_avg:
+                    desire = float(pos.unit)
+                elif any_near:
+                    desire = float(pos.unit) / 2.0
+
+                invest_total = clamp_invest_by_leverage(pos.seed, pos.entry_seed, desire, args.max_leverage_pct)
+                if invest_total > 0:
+                    wsum = sum(max(0.0, l.weight) for l in pos.legs) or 1.0
+                    for leg in pos.legs:
+                        if leg.ticker not in day_df.index:
+                            continue
+                        close_px = px_close.get(leg.ticker)
+                        if close_px is None or close_px <= 0:
+                            continue
+                        alloc = invest_total * (max(0.0, leg.weight) / wsum)
+                        buy_leg(pos, leg, alloc, float(close_px))
+                    update_max_leverage_pct(pos, args.max_leverage_pct)
+
+            # ---- update drawdown
+            if pos.in_pos:
+                pos.update_drawdown(px_close)
+            else:
+                pos.update_drawdown({})
+
+        # -------------------------
+        # If NOT in position: entry (but not on sell-day)
+        # -------------------------
+        if (not pos.in_pos) and (not cooldown_today):
+            day_picks = picks_by_date.get(date, None)
+            if day_picks is not None and len(day_picks) > 0:
+                # entry legs are whatever picks provides that day (Top-1 or Top-2)
+                legs = []
+                for _, r in day_picks.iterrows():
+                    t = str(r["Ticker"]).upper().strip()
+                    w = float(r.get("Weight", 0.0))
+                    if t in day_df.index and w > 0:
+                        legs.append(Leg(ticker=t, weight=w))
+
+                if legs:
+                    S0 = float(pos.seed)
+                    unit = (S0 / float(args.max_days)) if args.max_days > 0 else 0.0
+
+                    desired_total = float(unit)
+                    invest_total = clamp_invest_by_leverage(pos.seed, S0, desired_total, args.max_leverage_pct)
+
+                    if invest_total > 0:
+                        pos.in_pos = True
+                        pos.entry_seed = S0
+                        pos.unit = unit
+                        pos.entry_date = date
+                        pos.holding_days = 1
+                        pos.extending = False
+                        pos.legs = legs
+                        pos.max_leverage_pct = 0.0
+
+                        wsum = sum(l.weight for l in legs) or 1.0
+                        for leg in legs:
+                            close_px = px_close.get(leg.ticker)
+                            if close_px is None or close_px <= 0:
+                                continue
+                            alloc = invest_total * (leg.weight / wsum)
+                            buy_leg(pos, leg, alloc, float(close_px))
+
+                        update_max_leverage_pct(pos, args.max_leverage_pct)
+                        pos.update_drawdown(px_close)
+                    else:
+                        pos.update_drawdown({})
+                else:
+                    pos.update_drawdown({})
+            else:
+                pos.update_drawdown({})
+
+        # -------------------------
+        # Record daily curve
+        # -------------------------
+        eq = pos.equity(px_close)
+        curve.append({
+            "Date": date,
+            "Equity": eq,
+            "Seed": pos.seed,
+            "InPosition": int(pos.in_pos),
+            "Tickers": ",".join([l.ticker for l in pos.legs]) if pos.in_pos else "",
+            "Weights": ",".join([f"{l.weight:.4f}" for l in pos.legs]) if pos.in_pos else "",
+            "HoldingDays": pos.holding_days if pos.in_pos else 0,
+            "Extending": int(pos.extending) if pos.in_pos else 0,
+            "MaxLeveragePctCycle": pos.max_leverage_pct if pos.in_pos else 0.0,
+            "MaxDrawdownPortfolio": pos.max_dd,
+            "PositionValue": pos.total_value(px_close) if pos.in_pos else 0.0,
+            "Invested": pos.total_invested() if pos.in_pos else 0.0,
+        })
+
+    trades_df = pd.DataFrame(trades)
+    curve_df = pd.DataFrame(curve)
+
+    if not curve_df.empty:
+        curve_df["SeedMultiple"] = curve_df["Equity"] / float(args.initial_seed)
+
+    trades_path = out_dir / f"sim_engine_trades_{tag}_gate_{suffix}.parquet"
+    curve_path = out_dir / f"sim_engine_curve_{tag}_gate_{suffix}.parquet"
+    trades_df.to_parquet(trades_path, index=False)
+    curve_df.to_parquet(curve_path, index=False)
+
+    print(f"[DONE] wrote trades: {trades_path} rows={len(trades_df)}")
+    print(f"[DONE] wrote curve : {curve_path} rows={len(curve_df)}")
+
+    if not curve_df.empty:
+        final_mult = float(curve_df["SeedMultiple"].iloc[-1])
+        print(f"[INFO] final SeedMultiple={final_mult:.4f} maxDD={float(pos.max_dd):.4f}")
+
+
+if __name__ == "__main__":
+    main()
