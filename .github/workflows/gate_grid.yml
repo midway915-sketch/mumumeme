@@ -92,7 +92,6 @@ jobs:
           pt=float("${{ inputs.profit_target }}")
           h=int("${{ inputs.max_days }}")
           sl=float("${{ inputs.stop_level }}")
-          ex=int("${{ inputs.max_extend_days }}")
           
           def pct(x): return int(round(abs(x)*100))
           LABEL_KEY=f"pt{pct(pt)}_h{h}_sl{pct(sl)}_ex{ex}"
@@ -154,7 +153,6 @@ jobs:
           PROFIT_TARGET: ${{ inputs.profit_target }}
           MAX_DAYS: ${{ inputs.max_days }}
           STOP_LEVEL: ${{ inputs.stop_level }}
-          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
           PRICE_START: ${{ env.PRICE_START }}
         run: |
           set -euo pipefail
@@ -186,13 +184,12 @@ jobs:
 
           python scripts/build_tail_labels.py \
             --stop-level "$STOP_LEVEL" \
-            --max-extend-days "$MAX_EXTEND_DAYS"
+    
 
           python scripts/build_tau_labels.py \
             --profit-target "$PROFIT_TARGET" \
             --max-days "$MAX_DAYS" \
             --stop-level "$STOP_LEVEL" \
-            --max-extend-days "$MAX_EXTEND_DAYS" \
             --k1 10 \
             --k2 20
 
@@ -228,7 +225,6 @@ jobs:
           PROFIT_TARGET: ${{ inputs.profit_target }}
           MAX_DAYS: ${{ inputs.max_days }}
           STOP_LEVEL: ${{ inputs.stop_level }}
-          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
 
           P_TAIL_THRESHOLDS: ${{ inputs.p_tail_thresholds }}
           UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
