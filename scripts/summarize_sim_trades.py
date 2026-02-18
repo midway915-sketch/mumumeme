@@ -19,7 +19,6 @@ def _read_any(path: Path) -> pd.DataFrame:
 
 
 def _infer_curve_from_trades(trades_path: Path) -> Path:
-    # data/signals/sim_engine_trades_...parquet -> sim_engine_curve_...parquet
     name = trades_path.name.replace("sim_engine_trades_", "sim_engine_curve_")
     return trades_path.with_name(name)
 
@@ -31,48 +30,50 @@ def _safe_num(s: pd.Series, default=np.nan) -> pd.Series:
 def _seed_multiple_from_curve(curve: pd.DataFrame) -> float | None:
     if curve is None or curve.empty:
         return None
+
     for c in ["SeedMultiple", "seed_multiple"]:
         if c in curve.columns:
             v = _safe_num(curve[c]).dropna()
             if len(v):
                 return float(v.iloc[-1])
-    # fallback: Equity / first Equity
+
     if "Equity" in curve.columns:
         eq = _safe_num(curve["Equity"]).dropna()
         if len(eq) >= 2 and float(eq.iloc[0]) != 0:
             return float(eq.iloc[-1] / eq.iloc[0])
+
     return None
 
 
 def _recent10y_seed_multiple_from_curve(curve: pd.DataFrame) -> float | None:
-    if curve is None or curve.empty:
+    if curve is None or curve.empty or "Date" not in curve.columns:
         return None
-    if "Date" not in curve.columns:
-        return None
+
     d = _to_dt(curve["Date"])
     if d.isna().all():
         return None
+
     last = d.max()
     start = last - pd.Timedelta(days=365 * 10)
     sub = curve.loc[d >= start].copy()
     if sub.empty:
         return None
 
-    # prefer SeedMultiple if present
     for c in ["SeedMultiple", "seed_multiple"]:
         if c in sub.columns:
             v = _safe_num(sub[c]).dropna()
             if len(v):
-                # 최근 10년 구간의 시작 시드를 1로 보고 곱(=끝/시작)
                 first = float(v.iloc[0])
                 lastv = float(v.iloc[-1])
                 if first != 0:
                     return float(lastv / first)
                 return float(lastv)
+
     if "Equity" in sub.columns:
         eq = _safe_num(sub["Equity"]).dropna()
         if len(eq) >= 2 and float(eq.iloc[0]) != 0:
             return float(eq.iloc[-1] / eq.iloc[0])
+
     return None
 
 
@@ -89,15 +90,16 @@ def _cycle_stats(trades: pd.DataFrame) -> tuple[int, float, float | None, float 
         wins = (_safe_num(trades["CycleReturn"], 0.0) > 0).astype(int)
     else:
         wins = pd.Series([0] * cycle_cnt)
+
     success_rate = float(wins.sum() / cycle_cnt) if cycle_cnt > 0 else 0.0
 
-    # max holding
+    # max holding observed
     max_hold = None
     if "HoldingDays" in trades.columns:
         mh = _safe_num(trades["HoldingDays"]).max()
         max_hold = float(mh) if np.isfinite(mh) else None
 
-    # max leverage pct
+    # max leverage pct (cycle max among cycles)
     max_lev = None
     for c in ["MaxLeveragePct", "max_leverage_pct", "LeveragePct", "leverage_pct"]:
         if c in trades.columns:
