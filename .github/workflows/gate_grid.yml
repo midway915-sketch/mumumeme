@@ -50,23 +50,6 @@ jobs:
     permissions:
       contents: read
 
-    # ✅ schedule에서도 inputs가 비어있을 수 있으니 기본값 fallback
-    env:
-      PROFIT_TARGET: ${{ github.event.inputs.profit_target || '0.10' }}
-      MAX_DAYS: ${{ github.event.inputs.max_days || '40' }}
-      STOP_LEVEL: ${{ github.event.inputs.stop_level || '-0.10' }}
-      MAX_EXTEND_DAYS: ${{ github.event.inputs.max_extend_days || '30' }}
-
-      P_TAIL_THRESHOLDS: ${{ github.event.inputs.p_tail_thresholds || '0.20,0.30' }}
-      UTILITY_QUANTILES: ${{ github.event.inputs.utility_quantiles || '0.75,0.90' }}
-      RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility' }}
-      LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.05' }}
-      REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'false' }}
-
-      # Gate 모드 기본
-      GATE_MODES: "none,tail,utility,tail_utility"
-      TAU_GAMMA: "0.0"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,35 +74,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p data/raw data/features data/labels data/signals data/meta data/_backup app scripts
+          mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      - name: Build TAG + LABEL_SPEC (safe for cache keys)
+      - name: Set LABEL_SPEC / LABEL_KEY env (safe for cache keys)
         shell: bash
         run: |
           set -euo pipefail
-
-          # PT=0.10 -> PT10, SL=-0.10 -> SL10
-          PT100="$(python - <<'PY'
-          import os
-          pt=float(os.environ["PROFIT_TARGET"])
-          print(int(round(pt*100)))
-          PY
-          )"
-                    SL100="$(python - <<'PY'
-          import os
-          sl=float(os.environ["STOP_LEVEL"])
-          print(int(round(abs(sl)*100)))
-          PY
-          )"
-
-          TAG="pt${PT100}_h${MAX_DAYS}_sl${SL100}_ex${MAX_EXTEND_DAYS}"
-
-          # ✅ cache key에 콤마 들어가면 터짐 -> LABEL_SPEC_SAFE는 콤마 없이
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "LABEL_SPEC_SAFE=$TAG" >> $GITHUB_ENV
-
-          echo "[INFO] PROFIT_TARGET=$PROFIT_TARGET MAX_DAYS=$MAX_DAYS STOP_LEVEL=$STOP_LEVEL MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS"
-          echo "[INFO] TAG=$TAG"
+          LABEL_SPEC="pt=${{ inputs.profit_target }},h=${{ inputs.max_days }},sl=${{ inputs.stop_level }},ex=${{ inputs.max_extend_days }}"
+          # cache key는 콤마/등호/마이너스 등에 민감할 수 있어서 안전한 형태로 변환
+          LABEL_KEY="pt${{ inputs.profit_target }}_h${{ inputs.max_days }}_sl${{ inputs.stop_level }}_ex${{ inputs.max_extend_days }}"
+          LABEL_KEY="$(echo "$LABEL_KEY" | sed 's/[=,]//g' | tr -d ' ' | tr ',' '_' )"
+          echo "LABEL_SPEC=$LABEL_SPEC" >> "$GITHUB_ENV"
+          echo "LABEL_KEY=$LABEL_KEY" >> "$GITHUB_ENV"
+          echo "[INFO] LABEL_SPEC=$LABEL_SPEC"
+          echo "[INFO] LABEL_KEY=$LABEL_KEY"
 
       # ---- PRICES cache
       - name: Restore cache (PRICES)
@@ -144,8 +112,8 @@ jobs:
           restore-keys: |
             mumumeme-features-v3-${{ runner.os }}-
 
-      # ---- MODEL cache
-      - name: Restore cache (MODEL)
+      # ---- MODEL cache (p_success)
+      - name: Restore cache (MODEL p_success)
         uses: actions/cache@v4
         with:
           path: |
@@ -154,10 +122,22 @@ jobs:
             app/model.pkl
             app/scaler.pkl
             data/meta/build_fingerprint.json
-          key: mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_SPEC_SAFE }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/check_rebuild.py','scripts/merge_incremental_table.py') }}
+          key: mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py','scripts/check_rebuild.py','scripts/merge_incremental_table.py') }}
           restore-keys: |
-            mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_SPEC_SAFE }}-
             mumumeme-model-v3-${{ runner.os }}-
+
+      # ---- TAU cache
+      - name: Restore cache (TAU)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/labels/labels_tau.parquet
+            data/labels/labels_tau.csv
+            app/tau_model.pkl
+            app/tau_scaler.pkl
+          key: mumumeme-tau-v2-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_tau_labels.py','scripts/train_tau_model.py') }}
+          restore-keys: |
+            mumumeme-tau-v2-${{ runner.os }}-
 
       - name: Fingerprint check (partial rebuild flags)
         shell: bash
@@ -165,28 +145,32 @@ jobs:
           set -euo pipefail
           out="$(python scripts/check_rebuild.py \
             --fingerprint-path data/meta/build_fingerprint.json \
-            --label-spec "${LABEL_SPEC_SAFE}" \
+            --label-spec "${{ env.LABEL_SPEC }}" \
             --features-files "scripts/build_features.py,scripts/build_ev_features.py,scripts/merge_incremental_table.py" \
             --labels-files "scripts/build_labels.py,scripts/train_model.py,scripts/merge_incremental_table.py" \
             --universe-files "scripts/universe.py,data/universe.csv" \
-            --strategy-files "scripts/predict_gate.py,scripts/simulate_single_position_engine.py,scripts/gate_grid_lib.sh,scripts/run_grid_workflow.sh,scripts/summarize_sim_trades.py,scripts/aggregate_gate_grid.py,scripts/build_tau_labels.py" \
+            --strategy-files "scripts/predict_gate.py,scripts/simulate_single_position_engine.py,scripts/run_grid_workflow.sh,scripts/summarize_sim_trades.py,scripts/aggregate_gate_grid.py" \
           )"
           echo "$out"
-          echo "$out" | tail -n 4 >> $GITHUB_ENV
+          echo "$out" | tail -n 4 >> "$GITHUB_ENV"
 
       - name: Prepare required files (daily incremental)
         shell: bash
+        env:
+          REBUILD_ALL: ${{ inputs.rebuild_all }}
+          REBUILD_PRICES: ${{ env.REBUILD_PRICES }}
+          REBUILD_FEATURES: ${{ env.REBUILD_FEATURES }}
+          REBUILD_MODEL: ${{ env.REBUILD_MODEL }}
+          CLEAR_SIGNALS: ${{ env.CLEAR_SIGNALS }}
+
+          PROFIT_TARGET: ${{ inputs.profit_target }}
+          MAX_DAYS: ${{ inputs.max_days }}
+          STOP_LEVEL: ${{ inputs.stop_level }}
+          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
         run: |
           set -euo pipefail
 
-          # ✅ unbound 방지(혹시라도 env가 비면 기본값)
-          : "${PROFIT_TARGET:=0.10}"
-          : "${MAX_DAYS:=40}"
-          : "${STOP_LEVEL:=-0.10}"
-          : "${MAX_EXTEND_DAYS:=30}"
-          : "${REBUILD_ALL:=false}"
-
-          if [ "${REBUILD_ALL}" = "true" ]; then
+          if [ "$REBUILD_ALL" = "true" ]; then
             REBUILD_PRICES="1"; REBUILD_FEATURES="1"; REBUILD_MODEL="1"; CLEAR_SIGNALS="1"
           fi
 
@@ -200,24 +184,26 @@ jobs:
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
             rm -f app/model.pkl app/scaler.pkl || true
+            rm -f data/labels/labels_tau.parquet data/labels/labels_tau.csv || true
+            rm -f app/tau_model.pkl app/tau_scaler.pkl || true
           elif [ "${REBUILD_FEATURES:-0}" = "1" ]; then
             rm -f data/features/features_model.parquet data/features/features_model.csv || true
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
             rm -f app/model.pkl app/scaler.pkl || true
+            rm -f data/labels/labels_tau.parquet data/labels/labels_tau.csv || true
+            rm -f app/tau_model.pkl app/tau_scaler.pkl || true
           elif [ "${REBUILD_MODEL:-0}" = "1" ]; then
             rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
             rm -f app/model.pkl app/scaler.pkl || true
+            rm -f data/labels/labels_tau.parquet data/labels/labels_tau.csv || true
+            rm -f app/tau_model.pkl app/tau_scaler.pkl || true
           fi
 
-          # 1) prices
+          # 1) prices: 매일 증분 갱신
           python scripts/universe.py
-
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
-            # ✅ 10년 유효 + 워밍업(기본 11년)으로 제한하고 싶으면 fetch_prices.py에 --max-years 옵션 추가한 버전 사용
-            # python scripts/fetch_prices.py --include-extra --reset --force-full --max-years 11
             python scripts/fetch_prices.py --include-extra --reset --force-full
           else
-            # python scripts/fetch_prices.py --include-extra --lookback-days 10 --max-years 11
             python scripts/fetch_prices.py --include-extra --lookback-days 10
           fi
 
@@ -276,7 +262,7 @@ jobs:
             python scripts/build_features.py
           fi
 
-          # 4) labels (p_success용)
+          # 4) p_success labels
           if [ -n "$START_DATE" ] && { [ -f data/labels/labels_model.parquet ] || [ -f data/labels/labels_model.csv ]; }; then
             rm -rf data/_backup/labels || true
             mkdir -p data/_backup/labels
@@ -317,7 +303,7 @@ jobs:
             echo "[INFO] model exists -> reuse"
           fi
 
-          # 6) tau labels (✅ stop/max_extend 넘김 + unbound 방지)
+          # 6) tau labels/model (optional but recommended for buy sizing)
           if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
             python scripts/build_tau_labels.py \
               --profit-target "$PROFIT_TARGET" \
@@ -326,12 +312,51 @@ jobs:
               --max-extend-days "$MAX_EXTEND_DAYS" \
               --k1 10 \
               --k2 20
+          else
+            echo "[INFO] labels_tau exists -> reuse"
+          fi
+
+          if [ ! -f app/tau_model.pkl ] || [ ! -f app/tau_scaler.pkl ]; then
+            # train_tau_model.py가 없으면 여기서 실패하니, 파일이 있는지부터 체크
+            if [ -f scripts/train_tau_model.py ]; then
+              python scripts/train_tau_model.py
+            else
+              echo "[WARN] scripts/train_tau_model.py not found -> tau model will be skipped (tau_pred will be NaN)"
+            fi
+          else
+            echo "[INFO] tau model exists -> reuse"
           fi
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
+        env:
+          PROFIT_TARGET: ${{ inputs.profit_target }}
+          MAX_DAYS: ${{ inputs.max_days }}
+          STOP_LEVEL: ${{ inputs.stop_level }}
+          MAX_EXTEND_DAYS: ${{ inputs.max_extend_days }}
+
+          P_TAIL_THRESHOLDS: ${{ inputs.p_tail_thresholds }}
+          UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
+          RANK_METRICS: ${{ inputs.rank_metrics }}
+          LAMBDA_TAIL: ${{ inputs.lambda_tail }}
+
+          # ✅ τ 기반 매수금 조절 ON
+          TAU_GAMMA: "1.0"
+
+          # ✅ p_success 최소 기준 내부 그리드(스키마 변경 없이 내부에서만 사용)
+          P_SUCCESS_MINS: "0.0,0.1,0.2"
+
+          # gate modes
+          GATE_MODES: "none,tail,utility,tail_utility"
+
+          # leverage cap (100% = seed의 2배까지 총 투입 가능)
+          MAX_LEVERAGE_PCT: "1.0"
         run: |
           set -euo pipefail
+          if [ ! -f scripts/run_grid_workflow.sh ]; then
+            echo "[ERROR] scripts/run_grid_workflow.sh not found"
+            exit 1
+          fi
           chmod +x scripts/run_grid_workflow.sh || true
           bash scripts/run_grid_workflow.sh
 
@@ -352,6 +377,7 @@ jobs:
           name: gate-grid-results
           path: |
             data/meta/build_fingerprint.json
+            data/raw/prices_meta.json
             data/signals/gate_summary_*.csv
             data/signals/gate_grid_aggregate.csv
             data/signals/gate_grid_top_by_recent10y.csv
@@ -359,6 +385,4 @@ jobs:
             data/signals/picks_meta_*.json
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
-            data/labels/labels_tau.parquet
-            data/labels/labels_tau.csv
           if-no-files-found: error
