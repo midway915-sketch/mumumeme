@@ -1,4 +1,4 @@
-name: gate-grid
+ㅢname: gate-grid
 
 on:
   workflow_dispatch:
@@ -303,6 +303,16 @@ jobs:
             echo "[INFO] model exists -> reuse"
           fi
 
+          set -euo pipefail
+
+          # ---- Inputs/env normalize (unbound 방지)
+          : "${PROFIT_TARGET:=${{ inputs.profit_target }}}"
+          : "${MAX_DAYS:=${{ inputs.max_days }}}"
+          : "${STOP_LEVEL:=${{ inputs.stop_level }}}"
+          : "${MAX_EXTEND_DAYS:=${{ inputs.max_extend_days }}}"
+          
+          echo "[INFO] PROFIT_TARGET=$PROFIT_TARGET MAX_DAYS=$MAX_DAYS STOP_LEVEL=$STOP_LEVEL MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS"
+          
           # 6) tau labels/model (optional but recommended for buy sizing)
           if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
             python scripts/build_tau_labels.py \
