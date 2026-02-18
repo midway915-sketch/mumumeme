@@ -139,9 +139,9 @@ jobs:
           # 1) prices
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
-            python scripts/fetch_prices.py --include-extra --reset --force-full
+            python scripts/fetch_prices.py --include-extra --reset --force-full --max-years 11
           else
-            python scripts/fetch_prices.py --include-extra --lookback-days 10
+            python scripts/fetch_prices.py --include-extra --lookback-days 10 --max-years 11
           fi
 
           # 2) features (없으면 full)
