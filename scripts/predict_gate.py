@@ -73,17 +73,13 @@ def coerce_num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
 def build_utility(df: pd.DataFrame, lambda_tail: float) -> pd.Series:
     """
     Utility = ret_score - lambda_tail * p_tail
-    (Simple and stable. Gate threshold is applied separately.)
     """
     ret_score = coerce_num(df, "ret_score", 0.0)
     p_tail = coerce_num(df, "p_tail", 0.0)
     return (ret_score - float(lambda_tail) * p_tail).astype(float)
 
 
-def rank_pick_one_per_day(
-    df: pd.DataFrame,
-    rank_by: str,
-) -> pd.DataFrame:
+def rank_pick_one_per_day(df: pd.DataFrame, rank_by: str) -> pd.DataFrame:
     """
     df must be already filtered to eligible candidates.
     Returns one row per Date (top-1).
@@ -91,14 +87,10 @@ def rank_pick_one_per_day(
     if df.empty:
         return df
 
-    # normalize rank column: higher is better for all supported
     if rank_by not in ("utility", "ret_score", "p_success"):
         raise ValueError(f"rank_by must be one of utility|ret_score|p_success (got {rank_by})")
 
     # stable tie-breakers
-    # - prefer higher rank metric
-    # - then higher EV if present
-    # - then higher Close if present
     if "EV" in df.columns:
         ev = coerce_num(df, "EV", 0.0)
     else:
@@ -143,12 +135,14 @@ def main() -> None:
     ap.add_argument("--rank-by", required=True, choices=["utility", "ret_score", "p_success"])
     ap.add_argument("--lambda-tail", required=True, type=float)
 
+    # ✅ NEW: success minimum gate (independent from mode)
+    ap.add_argument("--p-success-min", default=0.0, type=float, help="Optional gate: require p_success >= this threshold")
+
     # optional: fail early if some files must exist
     ap.add_argument("--require-files", default="", type=str, help="comma-separated file paths that must exist")
 
     args = ap.parse_args()
 
-    # fail early if user wants strict file checking
     if args.require_files:
         require_files(args.require_files)
 
@@ -162,7 +156,7 @@ def main() -> None:
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
-    # ---------- universe-only filter (THIS FIXES ^VIX/SPY leaking into candidates)
+    # ---------- universe-only filter
     universe = set(read_universe(args.universe_csv))
     excludes = set([t.strip().upper() for t in args.exclude_tickers.split(",") if t.strip()])
 
@@ -177,42 +171,41 @@ def main() -> None:
             f"Check universe.csv and features_model tickers. before={before} after={after}"
         )
 
-    # ---------- compute utility + sanitize numeric columns we might use
+    # ---------- compute numeric cols
     feats["p_tail"] = coerce_num(feats, "p_tail", 0.0)
     feats["p_success"] = coerce_num(feats, "p_success", 0.0)
     feats["ret_score"] = coerce_num(feats, "ret_score", 0.0)
     feats["utility"] = build_utility(feats, lambda_tail=float(args.lambda_tail))
 
-    # ---------- gate conditions
-    # tail gate: p_tail <= tail_threshold
+    # ---------- gates
     tail_ok = feats["p_tail"] <= float(args.tail_threshold)
 
-    # utility gate: per-date quantile cutoff (stable across regime changes)
-    # (If a date has too few rows, quantile is still well-defined; NaN -> fail safe)
     q = float(args.utility_quantile)
     if not (0.0 <= q <= 1.0):
         raise ValueError("--utility-quantile must be in [0,1]")
 
     util_cut = feats.groupby("Date")["utility"].transform(lambda s: float(s.quantile(q)) if len(s) else np.nan)
-    util_ok = feats["utility"] >= util_cut
-    util_ok = util_ok.fillna(False)
+    util_ok = (feats["utility"] >= util_cut).fillna(False)
+
+    # ✅ NEW: p_success minimum gate
+    ps_min = float(args.p_success_min)
+    success_ok = feats["p_success"] >= ps_min if ps_min > 0 else pd.Series([True] * len(feats), index=feats.index)
 
     if args.mode == "none":
-        eligible = feats
+        eligible = feats[success_ok].copy()
     elif args.mode == "tail":
-        eligible = feats[tail_ok].copy()
+        eligible = feats[tail_ok & success_ok].copy()
     elif args.mode == "utility":
-        eligible = feats[util_ok].copy()
+        eligible = feats[util_ok & success_ok].copy()
     elif args.mode == "tail_utility":
-        eligible = feats[tail_ok & util_ok].copy()
+        eligible = feats[tail_ok & util_ok & success_ok].copy()
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
-    # if no eligible rows on some dates, that date will simply have no pick (safer than forcing)
+    # one pick per day (Top-1)
     picks = rank_pick_one_per_day(eligible, rank_by=args.rank_by)
 
-    # ---------- output file
-    # IMPORTANT: simulate_single_position_engine.py expects Date/Ticker columns
+    # output
     out_cols = ["Date", "Ticker", "p_tail", "p_success", "ret_score", "utility"]
     extra_cols = [c for c in ["EV", "Close", "Volume"] if c in picks.columns]
     keep = [c for c in out_cols + extra_cols if c in picks.columns]
@@ -229,17 +222,22 @@ def main() -> None:
         "tail_threshold": float(args.tail_threshold),
         "utility_quantile": float(args.utility_quantile),
         "lambda_tail": float(args.lambda_tail),
+        "p_success_min": float(ps_min),
+
         "universe_csv": args.universe_csv,
         "universe_size": int(len(universe)),
         "excluded": sorted(list(excludes)),
+
         "rows_features_after_filter": int(len(feats)),
         "rows_eligible": int(len(eligible)),
         "picks_days": int(picks_out["Date"].nunique()) if not picks_out.empty else 0,
         "picks_rows": int(len(picks_out)),
+
         "profit_target": float(args.profit_target),
         "max_days": int(args.max_days),
         "stop_level": float(args.stop_level),
         "max_extend_days": int(args.max_extend_days),
+
         "features_src": args.features_parq if Path(args.features_parq).exists() else args.features_csv,
     }
     meta_path = out_dir / f"picks_meta_{args.tag}_gate_{args.suffix}.json"
@@ -248,12 +246,11 @@ def main() -> None:
     print("=" * 60)
     print(f"[DONE] wrote picks: {picks_path} rows={len(picks_out)} days={meta['picks_days']}")
     print(f"[DONE] wrote meta : {meta_path}")
-    print(f"[INFO] mode={args.mode} tail_max={args.tail_threshold} u_q={args.utility_quantile} rank_by={args.rank_by} lambda_tail={args.lambda_tail}")
+    print(f"[INFO] mode={args.mode} tail_max={args.tail_threshold} u_q={args.utility_quantile} rank_by={args.rank_by} lambda_tail={args.lambda_tail} p_success_min={ps_min}")
     print(f"[INFO] universe_only rows: {before} -> {after} (excluded {sorted(list(excludes))})")
     if picks_out.empty:
         print("[WARN] picks_out is empty. Gate may be too strict for this period.")
     else:
-        # quick sanity: ensure no SPY/^VIX leak
         bad = set(picks_out["Ticker"].astype(str).str.upper().unique().tolist()) & excludes
         if bad:
             raise RuntimeError(f"[BUG] excluded tickers still present in picks: {sorted(list(bad))}")
