@@ -22,81 +22,87 @@ def read_table(parq: str, csv: str) -> pd.DataFrame:
     raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
 
 
-def _norm_date(s: pd.Series) -> pd.Series:
+def _norm_date_series(s: pd.Series) -> pd.Series:
+    # robust datetime normalize (no tz)
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
-def _force_columns_from_index(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_col(df: pd.DataFrame, want: str) -> pd.DataFrame:
     """
-    If Date/Ticker are in index (including MultiIndex), reset_index().
+    Ensure df has column `want` by:
+    - if it exists -> ok
+    - else if index name matches -> reset_index
+    - else if lower/alt names exist -> rename
     """
-    out = df
-    if isinstance(out.index, pd.MultiIndex):
-        out = out.reset_index()
-    else:
-        if getattr(out.index, "name", None) in ("Date", "Ticker"):
-            out = out.reset_index()
-    return out
+    if want in df.columns:
+        return df
 
+    # if it's index
+    if df.index.name == want:
+        df = df.reset_index()
+        if want in df.columns:
+            return df
 
-def _canonicalize_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Guarantee columns 'Date' and 'Ticker' exist by:
-    - resetting index if needed
-    - renaming common variants (date/Datetime/index/level_0 etc.)
-    - renaming ticker variants (ticker/symbol/level_1 etc.)
-    """
-    out = _force_columns_from_index(df).copy()
+    # common alternates
+    alt = {
+        "Date": ["date", "datetime", "Datetime", "TradeDate", "trade_date", "Day"],
+        "Ticker": ["ticker", "symbol", "Symbol"],
+    }
+    for a in alt.get(want, []):
+        if a in df.columns:
+            df = df.rename(columns={a: want})
+            return df
 
-    # ---- Date
-    if "Date" not in out.columns:
-        for c in ["date", "Datetime", "datetime", "DATE", "index", "level_0"]:
-            if c in out.columns:
-                out = out.rename(columns={c: "Date"})
-                break
+    # sometimes date saved as unnamed first column
+    if want == "Date":
+        for c in df.columns:
+            if str(c).strip().lower() in ("date", "datetime"):
+                df = df.rename(columns={c: "Date"})
+                return df
 
-    # ---- Ticker
-    if "Ticker" not in out.columns:
-        for c in ["ticker", "TICKER", "Symbol", "symbol", "SYMBOL", "level_1"]:
-            if c in out.columns:
-                out = out.rename(columns={c: "Ticker"})
-                break
-
-    if "Date" not in out.columns or "Ticker" not in out.columns:
-        raise ValueError(
-            "[sim_engine] Cannot find required columns Date/Ticker.\n"
-            f"Columns={list(out.columns)[:80]}\n"
-            f"IndexType={type(out.index)} IndexName={getattr(out.index,'name',None)}"
-        )
-    return out
+    return df
 
 
 def _pick_default_out_tag(picks_path: str, tag: str | None, suffix: str | None) -> tuple[str, str]:
-    """
-    Try to infer tag/suffix from picks filename. Fallback to passed values.
-    """
     if tag and suffix:
         return tag, suffix
-
     name = Path(picks_path).name
-    # e.g. picks_pt10_h40_sl10_ex30_gate_none_t0p20_q0p75_rutility.csv
     m = re.search(r"picks_(pt\d+_h\d+_sl\d+_ex\d+)_gate_(.+)\.(csv|parquet)$", name)
     if m:
         inferred_tag = m.group(1)
         inferred_suffix = m.group(2)
         return (tag or inferred_tag), (suffix or inferred_suffix)
-
     inferred_tag = tag or "run"
     inferred_suffix = suffix or Path(picks_path).stem.replace("picks_", "")
     return inferred_tag, inferred_suffix
 
 
-def _coerce_num(s: pd.Series, default: float = 0.0) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").fillna(default).astype(float)
+# -----------------------------
+# Leverage cap
+# -----------------------------
+def clamp_invest_by_leverage(seed: float, entry_seed: float, desired: float, max_leverage_pct: float) -> float:
+    """
+    Enforce: seed_after >= - entry_seed * max_leverage_pct
+
+    desired : intended spend today (>=0)
+    returns : allowed spend (>=0)
+    """
+    if desired <= 0:
+        return 0.0
+    if not np.isfinite(entry_seed) or entry_seed <= 0:
+        # no borrowing if entry_seed invalid
+        return float(min(desired, max(seed, 0.0)))
+
+    borrow_limit = float(entry_seed) * float(max_leverage_pct)  # 1.0 => 100%
+    floor_seed = -borrow_limit
+    room = float(seed) - float(floor_seed)  # seed + borrow_limit
+    if room <= 0:
+        return 0.0
+    return float(min(desired, room))
 
 
 # -----------------------------
-# Strategy state
+# Position & Bundle (Top-k)
 # -----------------------------
 @dataclass
 class Leg:
@@ -104,153 +110,167 @@ class Leg:
     weight: float
 
     shares: float = 0.0
-    invested: float = 0.0  # cost basis (remaining)
+    invested: float = 0.0
 
-    tp1_done: bool = False
-    peak_after_tp1: float = 0.0  # for trailing stop on remaining shares
-
-    def avg_price(self) -> float:
-        return (self.invested / self.shares) if (self.shares > 0 and self.invested > 0) else np.nan
-
-    def value(self, px_close: float | None) -> float:
-        if self.shares <= 0 or px_close is None or not np.isfinite(px_close):
-            return 0.0
-        return float(self.shares) * float(px_close)
-
-
-@dataclass
-class Position:
-    in_pos: bool = False
-
-    # cash balance (can be negative)
-    seed: float = 0.0
-
-    # cycle params
-    entry_seed: float = 0.0          # S0 = seed at entry time
-    unit: float = 0.0               # daily buy amount = entry_seed / max_days
-    entry_date: pd.Timestamp | None = None
     holding_days: int = 0
     extending: bool = False
 
-    legs: list[Leg] = None
+    # 2-step TP + trailing
+    tp1_done: bool = False
+    trail_on: bool = False
+    peak_high_after_tp1: float = np.nan
 
-    # tracking
-    max_leverage_pct: float = 0.0    # max(-seed)/entry_seed observed in this cycle
+    def avg_price(self) -> float:
+        if self.shares <= 0 or self.invested <= 0:
+            return np.nan
+        return float(self.invested / self.shares)
+
+    def value(self, close_px: float) -> float:
+        if self.shares <= 0 or not np.isfinite(close_px):
+            return 0.0
+        return float(self.shares) * float(close_px)
+
+
+@dataclass
+class BundleState:
+    in_pos: bool = False
+    entry_date: pd.Timestamp | None = None
+
+    seed: float = 0.0  # cash (can be negative)
+    entry_seed: float = 0.0  # S0
+    unit: float = 0.0  # daily base buy amount = entry_seed / max_days
+
+    legs: list[Leg] | None = None
+    cooldown_today: bool = False
+
+    # stats
+    max_leverage_pct: float = 0.0
     max_equity: float = 0.0
     max_dd: float = 0.0
 
-    def total_invested(self) -> float:
-        if not self.legs:
-            return 0.0
-        return float(sum(l.invested for l in self.legs))
-
-    def total_value(self, prices_today: dict[str, float]) -> float:
-        if not self.legs:
-            return 0.0
+    def equity(self, close_map: dict[str, float]) -> float:
         v = 0.0
-        for l in self.legs:
-            v += l.value(prices_today.get(l.ticker))
-        return float(v)
+        if self.in_pos and self.legs:
+            for leg in self.legs:
+                px = close_map.get(leg.ticker, np.nan)
+                if np.isfinite(px):
+                    v += leg.value(px)
+        return float(self.seed) + float(v)
 
-    def equity(self, prices_today: dict[str, float]) -> float:
-        return float(self.seed) + self.total_value(prices_today)
-
-    def update_drawdown(self, prices_today: dict[str, float]) -> None:
-        eq = self.equity(prices_today)
+    def update_dd(self, close_map: dict[str, float]) -> None:
+        eq = self.equity(close_map)
         if eq > self.max_equity:
             self.max_equity = eq
         if self.max_equity > 0:
             dd = (eq - self.max_equity) / self.max_equity
             if dd < self.max_dd:
-                self.max_dd = float(dd)
+                self.max_dd = dd
+
+    def update_max_leverage(self, max_leverage_cap: float) -> None:
+        if self.entry_seed <= 0:
+            return
+        lev = max(0.0, -self.seed) / float(self.entry_seed)
+        if lev > self.max_leverage_pct:
+            self.max_leverage_pct = float(lev)
+        if self.max_leverage_pct > max_leverage_cap + 1e-9:
+            self.max_leverage_pct = float(max_leverage_cap)
 
 
 # -----------------------------
-# Leverage cap: core
+# Picks parsing (Top-k compatible)
 # -----------------------------
-def clamp_invest_by_leverage(seed: float, entry_seed: float, desired: float, max_leverage_pct: float) -> float:
-    """
-    Enforce: seed_after >= - entry_seed * max_leverage_pct
+def load_picks(path: str) -> pd.DataFrame:
+    if path.lower().endswith(".parquet"):
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path)
 
-    desired : amount we'd like to spend today (>=0)
-    returns : allowed invest (>=0), possibly reduced to satisfy the cap.
-    """
-    if desired <= 0:
-        return 0.0
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df)
 
-    # If entry_seed <= 0, safest: disallow borrowing beyond 0 (no negative).
-    if not np.isfinite(entry_seed) or entry_seed <= 0:
-        return float(min(desired, max(seed, 0.0)))
+    df = _ensure_col(df, "Date")
+    df = _ensure_col(df, "Ticker")
 
-    borrow_limit = float(entry_seed) * float(max_leverage_pct)  # 1.0 => 100%
-    floor_seed = -borrow_limit
+    if "Date" not in df.columns or "Ticker" not in df.columns:
+        raise ValueError(f"picks must have Date/Ticker. cols={list(df.columns)[:50]}")
 
-    # seed_after = seed - invest >= floor_seed  => invest <= seed - floor_seed = seed + borrow_limit
-    room = float(seed) - float(floor_seed)
-    if room <= 0:
-        return 0.0
-    return float(min(desired, room))
+    df = df.copy()
+    df["Date"] = _norm_date_series(df["Date"])
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    df = df.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
+    # optional cols
+    if "RankInDay" in df.columns:
+        df["RankInDay"] = pd.to_numeric(df["RankInDay"], errors="coerce").fillna(9999).astype(int)
+    else:
+        df["RankInDay"] = 1
 
-def update_max_leverage_pct(pos: Position, max_leverage_pct_cap: float) -> None:
-    if not np.isfinite(pos.entry_seed) or pos.entry_seed <= 0:
-        return
-    lev = max(0.0, -pos.seed) / float(pos.entry_seed)
-    if lev > pos.max_leverage_pct:
-        pos.max_leverage_pct = float(lev)
-    if pos.max_leverage_pct > float(max_leverage_pct_cap) + 1e-9:
-        pos.max_leverage_pct = float(max_leverage_pct_cap)
+    if "Weight" in df.columns:
+        df["Weight"] = pd.to_numeric(df["Weight"], errors="coerce").fillna(1.0).astype(float)
+    else:
+        df["Weight"] = 1.0
 
-
-# -----------------------------
-# Execution helpers
-# -----------------------------
-def buy_leg(pos: Position, leg: Leg, invest: float, px: float) -> None:
-    if invest <= 0 or not np.isfinite(px) or px <= 0:
-        return
-    pos.seed -= float(invest)
-    leg.invested += float(invest)
-    leg.shares += float(invest) / float(px)
+    return df
 
 
-def sell_leg_fraction(pos: Position, leg: Leg, frac: float, px: float) -> float:
-    """
-    Sell fraction of current shares. Reduce invested proportionally (keeps avg consistent).
-    Return proceeds.
-    """
-    if frac <= 0 or frac > 1 or leg.shares <= 0 or not np.isfinite(px) or px <= 0:
-        return 0.0
-    sell_shares = leg.shares * float(frac)
-    proceeds = sell_shares * float(px)
+def picks_for_date(df: pd.DataFrame, date: pd.Timestamp, topk: int) -> pd.DataFrame:
+    sub = df[df["Date"] == date].copy()
+    if sub.empty:
+        return sub
+    sub = sub.sort_values(["RankInDay", "Ticker"]).head(int(topk)).reset_index(drop=True)
 
-    # reduce cost basis proportionally
-    leg.shares -= sell_shares
-    leg.invested *= (1.0 - float(frac))
-
-    pos.seed += float(proceeds)
-    return float(proceeds)
+    # normalize weights among selected
+    w = pd.to_numeric(sub["Weight"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    wsum = float(np.sum(w))
+    if wsum <= 0:
+        sub["Weight"] = 1.0 / len(sub)
+    else:
+        sub["Weight"] = w / wsum
+    return sub
 
 
 # -----------------------------
-# Main simulation
+# Prices
+# -----------------------------
+def load_prices(parq: str, csv: str) -> pd.DataFrame:
+    prices = read_table(parq, csv).copy()
+    prices = _ensure_col(prices, "Date")
+    prices = _ensure_col(prices, "Ticker")
+    if "Date" not in prices.columns or "Ticker" not in prices.columns:
+        raise ValueError(f"prices must have Date/Ticker. cols={list(prices.columns)[:50]}")
+    prices["Date"] = _norm_date_series(prices["Date"])
+    prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
+    for c in ["Open", "High", "Low", "Close"]:
+        if c not in prices.columns:
+            raise ValueError(f"prices missing {c}")
+    prices = prices.dropna(subset=["Date", "Ticker", "Close"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
+    return prices
+
+
+# -----------------------------
+# Main
 # -----------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Single-position engine (Top-1/Top-K picks) with leverage cap and optional 2-step TP+trailing.")
-    ap.add_argument("--picks-path", required=True, type=str, help="CSV/Parquet with columns Date,Ticker (and optional Weight,RankInDay).")
+    ap = argparse.ArgumentParser(description="Top-k bundle engine: 2-step TP + trailing, leverage cap applied to ALL buys.")
+    ap.add_argument("--picks-path", required=True, type=str)
     ap.add_argument("--prices-parq", default="data/raw/prices.parquet", type=str)
     ap.add_argument("--prices-csv", default="data/raw/prices.csv", type=str)
 
     ap.add_argument("--initial-seed", default=40_000_000, type=float)
-    ap.add_argument("--profit-target", required=True, type=float)   # e.g. 0.10
-    ap.add_argument("--max-days", required=True, type=int)          # e.g. 40
-    ap.add_argument("--stop-level", required=True, type=float)      # e.g. -0.10
-    ap.add_argument("--max-extend-days", required=True, type=int)   # kept for tag/label compatibility (NO hard limit)
+    ap.add_argument("--profit-target", required=True, type=float)   # ex: 0.10
+    ap.add_argument("--max-days", required=True, type=int)          # ex: 40
+    ap.add_argument("--stop-level", required=True, type=float)      # ex: -0.10
+    ap.add_argument("--max-extend-days", required=True, type=int)   # tag compat (NO hard limit)
     ap.add_argument("--max-leverage-pct", default=1.0, type=float)  # 1.0 => 100%
 
+    # Top-k
+    ap.add_argument("--topk", default=1, type=int)                  # 1 or 2
+    ap.add_argument("--weights", default="", type=str)              # e.g. "0.7,0.3" for topk=2 (optional override)
+
     # 2-step TP + trailing
-    ap.add_argument("--enable-trailing", default="false", type=str)
-    ap.add_argument("--tp1-frac", default=0.50, type=float)         # fraction to sell at PT hit
-    ap.add_argument("--trail-stop", default=0.10, type=float)       # trailing drawdown from peak (e.g. 0.10 => -10%)
+    ap.add_argument("--enable-trailing", default="true", type=str)  # "true"/"false"
+    ap.add_argument("--tp1-frac", default=0.50, type=float)         # sell fraction at PT
+    ap.add_argument("--trail-stop", default=0.10, type=float)       # trailing stop (e.g. 0.10 => -10% from peak after TP1)
 
     ap.add_argument("--tag", default="", type=str)
     ap.add_argument("--suffix", default="", type=str)
@@ -258,356 +278,284 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    enable_trailing = str(args.enable_trailing).strip().lower() in ("1", "true", "yes", "y", "on")
-    tp1_frac = float(args.tp1_frac)
-    trail_stop = float(args.trail_stop)
-
-    picks_path = args.picks_path
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tag, suffix = _pick_default_out_tag(picks_path, args.tag or None, args.suffix or None)
+    tag, suffix = _pick_default_out_tag(args.picks_path, args.tag or None, args.suffix or None)
 
-    # ---- load picks
-    if picks_path.lower().endswith(".parquet"):
-        picks = pd.read_parquet(picks_path)
-    else:
-        picks = pd.read_csv(picks_path)
+    enable_trailing = str(args.enable_trailing).strip().lower() in ("1", "true", "yes", "y")
+    topk = int(args.topk)
+    if topk not in (1, 2):
+        raise ValueError("--topk must be 1 or 2")
 
-    picks = _canonicalize_date_ticker_columns(picks)
+    # weights override (optional)
+    override_w = None
+    if args.weights.strip():
+        parts = [p.strip() for p in args.weights.split(",") if p.strip()]
+        if len(parts) != topk:
+            raise ValueError(f"--weights must have {topk} numbers (got {len(parts)}): {args.weights}")
+        override_w = np.array([float(x) for x in parts], dtype=float)
+        if float(np.sum(override_w)) <= 0:
+            raise ValueError("--weights sum must be > 0")
+        override_w = override_w / float(np.sum(override_w))
 
-    picks = picks.copy()
-    picks["Date"] = _norm_date(picks["Date"])
-    picks["Ticker"] = picks["Ticker"].astype(str).str.upper().str.strip()
-    picks = picks.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
+    # load data
+    picks = load_picks(args.picks_path)
+    prices = load_prices(args.prices_parq, args.prices_csv)
 
-    # optional Weight/RankInDay
-    if "Weight" in picks.columns:
-        picks["Weight"] = _coerce_num(picks["Weight"], 0.0)
-    else:
-        picks["Weight"] = 1.0
+    # group prices by date
+    grouped = prices.groupby("Date", sort=True)
 
-    if "RankInDay" in picks.columns:
-        picks["RankInDay"] = _coerce_num(picks["RankInDay"], 1.0).astype(int)
-    else:
-        picks["RankInDay"] = picks.groupby("Date").cumcount() + 1
+    st = BundleState(
+        seed=float(args.initial_seed),
+        entry_seed=0.0,
+        unit=0.0,
+        in_pos=False,
+        legs=None,
+        cooldown_today=False,
+        max_leverage_pct=0.0,
+        max_equity=float(args.initial_seed),
+        max_dd=0.0,
+    )
 
-    # normalize weights per day (safe even if top1)
-    picks["Weight"] = picks["Weight"].clip(lower=0.0)
-    wsum = picks.groupby("Date")["Weight"].transform(lambda s: float(s.sum()) if len(s) else 0.0)
-    picks["Weight"] = np.where(wsum > 0, picks["Weight"] / wsum, 0.0)
+    trades_rows = []
+    curve_rows = []
 
-    # ---- load prices
-    prices = read_table(args.prices_parq, args.prices_csv)
-    prices = _canonicalize_date_ticker_columns(prices)
-
-    prices = prices.copy()
-    prices["Date"] = _norm_date(prices["Date"])
-    prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
-
-    for c in ["Open", "High", "Low", "Close"]:
-        if c not in prices.columns:
-            raise ValueError(f"prices missing {c}")
-
-    prices = prices.dropna(subset=["Date", "Ticker", "Close"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
-
-    # per day group
-    prices_by_date = {d: g.set_index("Ticker", drop=False) for d, g in prices.groupby("Date", sort=True)}
-    pick_dates = picks["Date"].dropna().unique().tolist()
-    picks_by_date = {d: picks[picks["Date"] == d].copy() for d in pick_dates}
-
-    pos = Position(seed=float(args.initial_seed), max_equity=float(args.initial_seed), max_dd=0.0, legs=[])
-    cooldown_today = False
-
-    trades = []
-    curve = []
-
-    def close_cycle(exit_date: pd.Timestamp, px_map: dict[str, float], reason: str) -> None:
-        nonlocal cooldown_today, pos, trades
-        proceeds_total = 0.0
-        invested_total = 0.0
-
-        # close each leg at Close price
-        for leg in pos.legs:
-            px = px_map.get(leg.ticker)
-            if px is None or not np.isfinite(px) or px <= 0:
-                continue
-            proceeds = leg.shares * float(px)
-            proceeds_total += proceeds
-            invested_total += float(leg.invested)
-            pos.seed += float(proceeds)
-
-        cycle_return = (proceeds_total - invested_total) / invested_total if invested_total > 0 else np.nan
-        win = int(cycle_return > 0) if np.isfinite(cycle_return) else 0
-
-        trades.append({
-            "EntryDate": pos.entry_date,
+    def close_leg(leg: Leg, exit_price: float, exit_date: pd.Timestamp, reason: str) -> dict:
+        proceeds = leg.shares * float(exit_price)
+        ret = (proceeds - leg.invested) / leg.invested if leg.invested > 0 else np.nan
+        win = int(ret > 0) if np.isfinite(ret) else 0
+        row = {
+            "EntryDate": st.entry_date,
             "ExitDate": exit_date,
-            "Tickers": ",".join([l.ticker for l in pos.legs]),
-            "Weights": ",".join([f"{l.weight:.4f}" for l in pos.legs]),
-            "EntrySeed": pos.entry_seed,
+            "Ticker": leg.ticker,
+            "TopK": topk,
+            "Weight": leg.weight,
+            "EntrySeed": st.entry_seed,
             "ProfitTarget": args.profit_target,
             "MaxDays": args.max_days,
             "StopLevel": args.stop_level,
             "MaxExtendDaysParam": args.max_extend_days,
-            "MaxLeveragePctCap": args.max_leverage_pct,
-            "MaxLeveragePct": pos.max_leverage_pct,
             "EnableTrailing": int(enable_trailing),
-            "TP1Frac": tp1_frac,
-            "TrailStop": trail_stop,
-            "Invested": invested_total,
-            "Proceeds": proceeds_total,
-            "CycleReturn": cycle_return,
-            "HoldingDays": pos.holding_days,
-            "Extending": int(pos.extending),
+            "TP1_Frac": float(args.tp1_frac),
+            "TrailStop": float(args.trail_stop),
+            "MaxLeveragePctCap": float(args.max_leverage_pct),
+            "MaxLeveragePct": float(st.max_leverage_pct),
+            "Invested": float(leg.invested),
+            "Shares": float(leg.shares),
+            "ExitPrice": float(exit_price),
+            "Proceeds": float(proceeds),
+            "LegReturn": float(ret) if np.isfinite(ret) else np.nan,
+            "HoldingDays": int(leg.holding_days),
+            "Extending": int(leg.extending),
+            "TP1_Done": int(leg.tp1_done),
             "Reason": reason,
+            "MaxDrawdownPortfolio": float(st.max_dd),
             "Win": win,
-            "MaxDrawdown": pos.max_dd,
-        })
+        }
+        # update cash
+        st.seed += float(proceeds)
+        # clear leg
+        leg.shares = 0.0
+        leg.invested = 0.0
+        return row
 
-        # reset
-        pos.in_pos = False
-        pos.entry_seed = 0.0
-        pos.unit = 0.0
-        pos.entry_date = None
-        pos.holding_days = 0
-        pos.extending = False
-        pos.legs = []
-        pos.max_leverage_pct = 0.0
+    def bundle_closed() -> bool:
+        if not st.in_pos or not st.legs:
+            return True
+        for leg in st.legs:
+            if leg.shares > 0 and leg.invested > 0:
+                return False
+        return True
 
-        cooldown_today = True  # no re-entry on same day
+    def close_bundle_if_done(exit_date: pd.Timestamp) -> None:
+        if bundle_closed():
+            st.in_pos = False
+            st.legs = None
+            st.entry_date = None
+            st.entry_seed = 0.0
+            st.unit = 0.0
+            st.max_leverage_pct = 0.0
+            st.cooldown_today = True  # no re-entry same day
 
-    # ---- simulate across all price dates
-    all_dates = sorted(prices_by_date.keys())
+    # simulate day by day
+    for date, day_df in grouped:
+        st.cooldown_today = False
+        day_df = day_df.set_index("Ticker", drop=False)
 
-    for date in all_dates:
-        day_df = prices_by_date[date]
-        cooldown_today = False
-        px_close = {}
-        px_high = {}
-        for t, row in day_df.iterrows():
-            try:
-                px_close[str(t)] = float(row["Close"])
-                px_high[str(t)] = float(row["High"])
-            except Exception:
-                pass
+        # close map for equity curve
+        close_map = {t: float(r["Close"]) for t, r in day_df.set_index("Ticker").iterrows()}
 
-        # -------------------------
-        # If in position: advance & manage
-        # -------------------------
-        if pos.in_pos:
-            pos.holding_days += 1
+        # ---- manage existing bundle
+        if st.in_pos and st.legs:
+            for leg in st.legs:
+                if leg.shares <= 0 or leg.invested <= 0:
+                    continue
+                if leg.ticker not in day_df.index:
+                    continue
 
-            # compute avg across legs (weighted by invested)
-            inv_total = pos.total_invested()
-            val_total = pos.total_value(px_close)
-            avg_port = np.nan
-            if inv_total > 0 and val_total >= 0:
-                # portfolio avg proxy: invested / shares doesn't exist across multi legs, use weighted avg price:
-                # sum(invested) / sum(shares*?) not possible w/out per-leg avg, so use value-based exit per-leg.
-                pass
+                row = day_df.loc[leg.ticker]
+                close_px = float(row["Close"])
+                high_px = float(row["High"])
+                low_px = float(row["Low"])
 
-            # ---- 2-step TP + trailing (per-leg)
-            if enable_trailing and not pos.extending:
-                for leg in pos.legs:
-                    if leg.ticker not in day_df.index:
+                leg.holding_days += 1
+                avg = leg.avg_price()
+
+                # (A) TP1 (partial) + trailing activation
+                if (not leg.tp1_done) and np.isfinite(avg) and np.isfinite(high_px):
+                    if high_px >= avg * (1.0 + float(args.profit_target)):
+                        # sell tp1_frac at PT price
+                        tp_px = avg * (1.0 + float(args.profit_target))
+                        sell_frac = float(np.clip(args.tp1_frac, 0.0, 1.0))
+                        sell_shares = leg.shares * sell_frac
+                        if sell_shares > 0:
+                            proceeds = sell_shares * tp_px
+                            # reduce position
+                            leg.shares -= sell_shares
+                            # proportionally reduce invested
+                            leg.invested *= (1.0 - sell_frac)
+                            st.seed += proceeds
+                            st.update_max_leverage(float(args.max_leverage_pct))
+
+                        leg.tp1_done = True
+                        if enable_trailing and leg.shares > 0:
+                            leg.trail_on = True
+                            leg.peak_high_after_tp1 = float(high_px)
+
+                # (B) trailing stop on remaining shares
+                if leg.trail_on and leg.shares > 0 and np.isfinite(leg.peak_high_after_tp1):
+                    if np.isfinite(high_px) and high_px > leg.peak_high_after_tp1:
+                        leg.peak_high_after_tp1 = float(high_px)
+                    trail = float(args.trail_stop)
+                    stop_px = leg.peak_high_after_tp1 * (1.0 - trail)
+                    # intraday hit -> exit remaining at stop_px
+                    if np.isfinite(low_px) and low_px <= stop_px:
+                        trades_rows.append(close_leg(leg, stop_px, date, reason="TRAIL_STOP"))
                         continue
-                    high_px = px_high.get(leg.ticker)
-                    close_px = px_close.get(leg.ticker)
-                    if high_px is None or close_px is None:
-                        continue
 
-                    avg = leg.avg_price()
-                    if not leg.tp1_done:
-                        # TP1 trigger
-                        if np.isfinite(avg) and high_px >= avg * (1.0 + float(args.profit_target)):
-                            tp_px = avg * (1.0 + float(args.profit_target))
-                            sell_leg_fraction(pos, leg, tp1_frac, float(tp_px))
-                            leg.tp1_done = True
-                            leg.peak_after_tp1 = float(max(leg.peak_after_tp1, close_px, tp_px))
+                # (C) max_days decision (extend or close at close)
+                if (not leg.extending) and leg.holding_days >= int(args.max_days):
+                    cur_ret = (close_px - avg) / avg if np.isfinite(avg) and avg != 0 else -np.inf
+                    if cur_ret >= float(args.stop_level):
+                        trades_rows.append(close_leg(leg, close_px, date, reason="MAXDAY_CLOSE"))
+                        continue
                     else:
-                        # update peak and apply trailing stop on remaining
-                        leg.peak_after_tp1 = float(max(leg.peak_after_tp1, close_px))
-                        trail_px = leg.peak_after_tp1 * (1.0 - float(trail_stop))
-                        if close_px <= trail_px and leg.shares > 0:
-                            # sell ALL remaining at close (simple)
-                            sell_leg_fraction(pos, leg, 1.0, float(close_px))
+                        leg.extending = True
 
-                # if all legs sold out via trailing, close cycle
-                if all(l.shares <= 0 for l in pos.legs):
-                    close_cycle(date, px_close, reason="TRAIL_EXIT")
+                # (D) extend recovery exit (stop_level rebound)
+                if leg.extending and leg.shares > 0:
+                    if np.isfinite(avg) and np.isfinite(high_px) and high_px >= avg * (1.0 + float(args.stop_level)):
+                        exit_px = avg * (1.0 + float(args.stop_level))
+                        trades_rows.append(close_leg(leg, exit_px, date, reason="EXT_RECOVERY"))
+                        continue
 
-            # ---- max_days / extending decision (cycle-level)
-            if pos.in_pos and not pos.extending:
-                # at max_days, if portfolio is not recovered to stop threshold, extend
-                # define "recovered" as each remaining leg close >= avg*(1+stop_level) (conservative)
-                if pos.holding_days >= int(args.max_days):
-                    all_ok = True
-                    for leg in pos.legs:
-                        if leg.shares <= 0:
-                            continue
-                        close_px = px_close.get(leg.ticker)
-                        if close_px is None:
-                            all_ok = False
-                            break
-                        avg = leg.avg_price()
-                        if not (np.isfinite(avg) and close_px >= avg * (1.0 + float(args.stop_level))):
-                            all_ok = False
-                            break
-                    if all_ok:
-                        close_cycle(date, px_close, reason="MAXDAY_CLOSE")
+                # (E) daily DCA buy logic (ALL buys leverage-capped)
+                if leg.shares > 0 and np.isfinite(close_px) and close_px > 0:
+                    base_unit = float(st.unit) * float(leg.weight)  # split by weights
+
+                    if leg.extending:
+                        desired = base_unit
                     else:
-                        pos.extending = True
+                        if np.isfinite(avg):
+                            if close_px <= avg:
+                                desired = base_unit
+                            elif close_px <= avg * 1.05:
+                                desired = base_unit / 2.0
+                            else:
+                                desired = 0.0
+                        else:
+                            desired = base_unit
 
-            # ---- extending logic: exit on recovery to stop-level, else DCA
-            if pos.in_pos and pos.extending:
-                # if all remaining legs have intraday high >= avg*(1+stop_level) => exit at that level (approx)
-                all_recovered = True
-                for leg in pos.legs:
-                    if leg.shares <= 0:
-                        continue
-                    high_px = px_high.get(leg.ticker)
-                    if high_px is None:
-                        all_recovered = False
-                        break
-                    avg = leg.avg_price()
-                    if not (np.isfinite(avg) and high_px >= avg * (1.0 + float(args.stop_level))):
-                        all_recovered = False
-                        break
-                if all_recovered:
-                    close_cycle(date, px_close, reason="EXT_RECOVERY")
-                else:
-                    # DCA desired total = unit (fixed), allocate by original weights across active legs
-                    desired_total = float(pos.unit)
-                    invest_total = clamp_invest_by_leverage(pos.seed, pos.entry_seed, desired_total, args.max_leverage_pct)
-                    if invest_total > 0:
-                        # allocate by weights among legs that still exist
-                        wsum = sum(max(0.0, l.weight) for l in pos.legs) or 1.0
-                        for leg in pos.legs:
-                            if leg.ticker not in day_df.index:
-                                continue
-                            close_px = px_close.get(leg.ticker)
-                            if close_px is None or close_px <= 0:
-                                continue
-                            alloc = invest_total * (max(0.0, leg.weight) / wsum)
-                            buy_leg(pos, leg, alloc, float(close_px))
-                        update_max_leverage_pct(pos, args.max_leverage_pct)
+                    invest = clamp_invest_by_leverage(st.seed, st.entry_seed, desired, float(args.max_leverage_pct))
+                    if invest > 0:
+                        st.seed -= invest
+                        leg.invested += invest
+                        leg.shares += invest / close_px
+                        st.update_max_leverage(float(args.max_leverage_pct))
 
-            # ---- normal zone DCA: if close <= avg -> unit, elif <= avg*1.05 -> unit/2
-            if pos.in_pos and not pos.extending:
-                # allocate total buy based on portfolio condition:
-                # If ANY remaining leg close <= its avg => unit, else if ANY close <= avg*1.05 => unit/2, else 0
-                desire = 0.0
-                any_below_avg = False
-                any_near = False
-                for leg in pos.legs:
-                    if leg.shares <= 0:
-                        continue
-                    close_px = px_close.get(leg.ticker)
-                    if close_px is None or close_px <= 0:
-                        continue
-                    avg = leg.avg_price()
-                    if np.isfinite(avg):
-                        if close_px <= avg:
-                            any_below_avg = True
-                        elif close_px <= avg * 1.05:
-                            any_near = True
-                if any_below_avg:
-                    desire = float(pos.unit)
-                elif any_near:
-                    desire = float(pos.unit) / 2.0
+            # after managing legs, update dd / maybe close bundle
+            st.update_dd(close_map)
+            close_bundle_if_done(date)
+        else:
+            # not in position -> still update dd on cash-only
+            st.update_dd(close_map)
 
-                invest_total = clamp_invest_by_leverage(pos.seed, pos.entry_seed, desire, args.max_leverage_pct)
-                if invest_total > 0:
-                    wsum = sum(max(0.0, l.weight) for l in pos.legs) or 1.0
-                    for leg in pos.legs:
-                        if leg.ticker not in day_df.index:
-                            continue
-                        close_px = px_close.get(leg.ticker)
-                        if close_px is None or close_px <= 0:
-                            continue
-                        alloc = invest_total * (max(0.0, leg.weight) / wsum)
-                        buy_leg(pos, leg, alloc, float(close_px))
-                    update_max_leverage_pct(pos, args.max_leverage_pct)
+        # ---- entry (only if not in pos and not cooldown_today)
+        if (not st.in_pos) and (not st.cooldown_today):
+            sub = picks_for_date(picks, date, topk=topk)
+            if not sub.empty:
+                tickers = sub["Ticker"].astype(str).str.upper().tolist()
+                weights = sub["Weight"].to_numpy(dtype=float)
+                if override_w is not None:
+                    weights = override_w.copy()
 
-            # ---- update drawdown
-            if pos.in_pos:
-                pos.update_drawdown(px_close)
-            else:
-                pos.update_drawdown({})
+                # filter to tickers present today in prices
+                valid = []
+                for t, w in zip(tickers, weights):
+                    if t in day_df.index:
+                        valid.append((t, float(w)))
+                if valid:
+                    tickers2, weights2 = zip(*valid)
+                    weights2 = np.array(weights2, dtype=float)
+                    weights2 = weights2 / float(np.sum(weights2))
 
-        # -------------------------
-        # If NOT in position: entry (but not on sell-day)
-        # -------------------------
-        if (not pos.in_pos) and (not cooldown_today):
-            day_picks = picks_by_date.get(date, None)
-            if day_picks is not None and len(day_picks) > 0:
-                # entry legs are whatever picks provides that day (Top-1 or Top-2)
-                legs = []
-                for _, r in day_picks.iterrows():
-                    t = str(r["Ticker"]).upper().strip()
-                    w = float(r.get("Weight", 0.0))
-                    if t in day_df.index and w > 0:
-                        legs.append(Leg(ticker=t, weight=w))
-
-                if legs:
-                    S0 = float(pos.seed)
+                    # entry_seed = current seed (S0)
+                    S0 = float(st.seed)
                     unit = (S0 / float(args.max_days)) if args.max_days > 0 else 0.0
 
-                    desired_total = float(unit)
-                    invest_total = clamp_invest_by_leverage(pos.seed, S0, desired_total, args.max_leverage_pct)
+                    # first-day buy: unit split by weights, leverage-capped at bundle level
+                    legs = [Leg(ticker=t, weight=float(w)) for t, w in zip(tickers2, weights2)]
 
+                    total_desired = float(unit)  # first day total desired = unit
+                    invest_total = clamp_invest_by_leverage(st.seed, S0, total_desired, float(args.max_leverage_pct))
                     if invest_total > 0:
-                        pos.in_pos = True
-                        pos.entry_seed = S0
-                        pos.unit = unit
-                        pos.entry_date = date
-                        pos.holding_days = 1
-                        pos.extending = False
-                        pos.legs = legs
-                        pos.max_leverage_pct = 0.0
+                        st.in_pos = True
+                        st.entry_date = date
+                        st.entry_seed = S0
+                        st.unit = float(unit)
+                        st.legs = legs
+                        st.max_leverage_pct = 0.0
 
-                        wsum = sum(l.weight for l in legs) or 1.0
-                        for leg in legs:
-                            close_px = px_close.get(leg.ticker)
-                            if close_px is None or close_px <= 0:
-                                continue
-                            alloc = invest_total * (leg.weight / wsum)
-                            buy_leg(pos, leg, alloc, float(close_px))
+                        # allocate invest across legs by weights
+                        for leg in st.legs:
+                            row = day_df.loc[leg.ticker]
+                            close_px = float(row["Close"])
+                            leg.holding_days = 1
+                            alloc = invest_total * float(leg.weight)
+                            if alloc > 0 and np.isfinite(close_px) and close_px > 0:
+                                st.seed -= alloc
+                                leg.invested += alloc
+                                leg.shares += alloc / close_px
+                                st.update_max_leverage(float(args.max_leverage_pct))
 
-                        update_max_leverage_pct(pos, args.max_leverage_pct)
-                        pos.update_drawdown(px_close)
-                    else:
-                        pos.update_drawdown({})
-                else:
-                    pos.update_drawdown({})
-            else:
-                pos.update_drawdown({})
+                        st.update_dd(close_map)
 
-        # -------------------------
-        # Record daily curve
-        # -------------------------
-        eq = pos.equity(px_close)
-        curve.append({
+        # ---- curve
+        eq = st.equity(close_map)
+        curve_rows.append({
             "Date": date,
             "Equity": eq,
-            "Seed": pos.seed,
-            "InPosition": int(pos.in_pos),
-            "Tickers": ",".join([l.ticker for l in pos.legs]) if pos.in_pos else "",
-            "Weights": ",".join([f"{l.weight:.4f}" for l in pos.legs]) if pos.in_pos else "",
-            "HoldingDays": pos.holding_days if pos.in_pos else 0,
-            "Extending": int(pos.extending) if pos.in_pos else 0,
-            "MaxLeveragePctCycle": pos.max_leverage_pct if pos.in_pos else 0.0,
-            "MaxDrawdownPortfolio": pos.max_dd,
-            "PositionValue": pos.total_value(px_close) if pos.in_pos else 0.0,
-            "Invested": pos.total_invested() if pos.in_pos else 0.0,
+            "Seed": float(st.seed),
+            "InPosition": int(st.in_pos),
+            "TopK": topk,
+            "Tickers": ",".join([leg.ticker for leg in st.legs]) if (st.in_pos and st.legs) else "",
+            "Invested": float(sum([leg.invested for leg in st.legs]) if (st.in_pos and st.legs) else 0.0),
+            "PositionValue": float(sum([leg.value(close_map.get(leg.ticker, np.nan)) for leg in st.legs]) if (st.in_pos and st.legs) else 0.0),
+            "HoldingDaysMax": int(max([leg.holding_days for leg in st.legs]) if (st.in_pos and st.legs) else 0),
+            "ExtendingAny": int(any([leg.extending for leg in st.legs]) if (st.in_pos and st.legs) else 0),
+            "TP1DoneAny": int(any([leg.tp1_done for leg in st.legs]) if (st.in_pos and st.legs) else 0),
+            "MaxLeveragePctCycle": float(st.max_leverage_pct if st.in_pos else 0.0),
+            "MaxDrawdownPortfolio": float(st.max_dd),
         })
 
-    trades_df = pd.DataFrame(trades)
-    curve_df = pd.DataFrame(curve)
-
+    trades_df = pd.DataFrame(trades_rows)
+    curve_df = pd.DataFrame(curve_rows)
     if not curve_df.empty:
         curve_df["SeedMultiple"] = curve_df["Equity"] / float(args.initial_seed)
+
+        # idle days (portfolio not in position)
+        curve_df["IdleDay"] = (curve_df["InPosition"] == 0).astype(int)
 
     trades_path = out_dir / f"sim_engine_trades_{tag}_gate_{suffix}.parquet"
     curve_path = out_dir / f"sim_engine_curve_{tag}_gate_{suffix}.parquet"
@@ -616,10 +564,10 @@ def main() -> None:
 
     print(f"[DONE] wrote trades: {trades_path} rows={len(trades_df)}")
     print(f"[DONE] wrote curve : {curve_path} rows={len(curve_df)}")
-
     if not curve_df.empty:
         final_mult = float(curve_df["SeedMultiple"].iloc[-1])
-        print(f"[INFO] final SeedMultiple={final_mult:.4f} maxDD={float(pos.max_dd):.4f}")
+        idle = int(curve_df["IdleDay"].sum())
+        print(f"[INFO] final SeedMultiple={final_mult:.4f} idle_days={idle} maxDD={float(st.max_dd):.4f}")
 
 
 if __name__ == "__main__":
