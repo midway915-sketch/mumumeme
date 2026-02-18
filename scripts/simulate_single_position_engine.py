@@ -9,9 +9,6 @@ import numpy as np
 import pandas as pd
 
 
-# -----------------------------
-# IO helpers
-# -----------------------------
 def read_table(parq: str, csv: str) -> pd.DataFrame:
     p = Path(parq)
     c = Path(csv)
@@ -27,14 +24,10 @@ def _norm_date(s: pd.Series) -> pd.Series:
 
 
 def _pick_default_out_tag(picks_path: str, tag: str | None, suffix: str | None) -> tuple[str, str]:
-    """
-    Try to infer tag/suffix from picks filename. Fallback to passed values.
-    """
     if tag and suffix:
         return tag, suffix
 
     name = Path(picks_path).name
-    # e.g. picks_pt10_h40_sl10_ex30_gate_none_t0p20_q0p75_rutility.csv
     m = re.search(r"picks_(pt\d+_h\d+_sl\d+_ex\d+)_gate_(.+)\.(csv|parquet)$", name)
     if m:
         inferred_tag = m.group(1)
@@ -46,35 +39,26 @@ def _pick_default_out_tag(picks_path: str, tag: str | None, suffix: str | None) 
     return inferred_tag, inferred_suffix
 
 
-# -----------------------------
-# Strategy state
-# -----------------------------
 @dataclass
 class Position:
     in_pos: bool = False
     ticker: str | None = None
 
-    # cash balance (can be negative; leverage cap controls it)
-    seed: float = 0.0
+    seed: float = 0.0  # cash (can be negative)
 
-    # position
     shares: float = 0.0
     invested: float = 0.0
 
-    # cycle params
-    entry_seed: float = 0.0          # S0 = seed at entry time
-    unit_base: float = 0.0           # base daily buy = entry_seed / max_days
+    entry_seed: float = 0.0     # S0 at entry
+    unit: float = 0.0          # base unit = entry_seed / max_days
     entry_date: pd.Timestamp | None = None
     holding_days: int = 0
     extending: bool = False
 
-    # tau budget control (only for pre-max_days DCA schedule)
-    tau_class_pred: int | None = None
-    tau_budget_total: float = 0.0      # total budget for days 1..max_days (== entry_seed ideally)
-    tau_budget_used: float = 0.0       # cum spend within days 1..max_days
+    # tau
+    tau_pred: float = np.nan
 
-    # tracking
-    max_leverage_pct: float = 0.0    # max(-seed)/entry_seed observed in this cycle
+    max_leverage_pct: float = 0.0
     max_equity: float = 0.0
     max_dd: float = 0.0
 
@@ -99,192 +83,81 @@ class Position:
                 self.max_dd = dd
 
 
-# -----------------------------
-# Leverage cap: core
-# -----------------------------
 def clamp_invest_by_leverage(seed: float, entry_seed: float, desired: float, max_leverage_pct: float) -> float:
-    """
-    Enforce: seed_after >= - entry_seed * max_leverage_pct
-
-    desired : amount we'd like to spend today (>=0)
-    returns : allowed invest (>=0), possibly reduced to satisfy the cap.
-    """
     if desired <= 0:
         return 0.0
 
-    # If entry_seed <= 0, cap is meaningless; safest: disallow borrowing beyond 0 (no negative).
     if not np.isfinite(entry_seed) or entry_seed <= 0:
         return float(min(desired, max(seed, 0.0)))
 
     borrow_limit = float(entry_seed) * float(max_leverage_pct)  # 1.0 => 100%
     floor_seed = -borrow_limit
-
-    # seed_after = seed - invest >= floor_seed  => invest <= seed - floor_seed = seed + borrow_limit
-    room = float(seed) - float(floor_seed)
+    room = float(seed) - float(floor_seed)  # seed + borrow_limit
     if room <= 0:
         return 0.0
     return float(min(desired, room))
 
 
-def update_max_leverage_pct(pos: Position, entry_seed: float, max_leverage_pct_cap: float) -> None:
+def update_max_leverage_pct(pos: Position, entry_seed: float, cap: float) -> None:
     if entry_seed <= 0:
         return
     lev = max(0.0, -pos.seed) / entry_seed
     if lev > pos.max_leverage_pct:
         pos.max_leverage_pct = float(lev)
-    if pos.max_leverage_pct > max_leverage_pct_cap + 1e-9:
-        pos.max_leverage_pct = float(max_leverage_pct_cap)
+    if pos.max_leverage_pct > cap + 1e-9:
+        pos.max_leverage_pct = float(cap)
 
 
-# -----------------------------
-# Tau-based buy schedule
-# -----------------------------
-def infer_tau_class_from_row(row: pd.Series) -> int | None:
+def tau_adjusted_desired(unit: float, holding_day: int, max_days: int, tau_pred: float, tau_gamma: float) -> float:
     """
-    Prefer TauClassPred if exists.
-    Else infer from probabilities if exist.
-    Returns 0/1/2/3 or None.
+    τ 기반 매수금 조절 (안정형)
+    - tau_pred 짧을수록 초반 매수 더 크게, 후반 더 작게
+    - tau_gamma=0이면 비활성 (unit 그대로)
     """
-    if row is None:
-        return None
+    if unit <= 0:
+        return 0.0
+    if tau_gamma <= 0:
+        return float(unit)
 
-    if "TauClassPred" in row.index:
-        try:
-            v = int(pd.to_numeric(row["TauClassPred"], errors="coerce"))
-            if v in (0, 1, 2, 3):
-                return v
-        except Exception:
-            pass
+    if not np.isfinite(tau_pred) or tau_pred <= 0:
+        return float(unit)
 
-    # Infer from probs if present (TauP10, TauP20, TauPH)
-    # We choose the earliest horizon that has high probability
-    def g(name: str) -> float:
-        if name not in row.index:
-            return np.nan
-        try:
-            return float(pd.to_numeric(row[name], errors="coerce"))
-        except Exception:
-            return np.nan
+    # 안정적으로 clamp
+    tp = float(np.clip(tau_pred, 5.0, float(max_days)))
+    d = float(np.clip(holding_day, 1, max_days))
 
-    p10 = g("TauP10")
-    p20 = g("TauP20")
-    pH  = g("TauPH")
+    # ratio = (max_days / tau_pred) : tau가 짧으면 ratio>1 (초반 강화)
+    ratio = float(max_days) / tp
+    ratio = float(np.clip(ratio, 0.7, 1.8))
 
-    # heuristic thresholds (can be tuned later)
-    if np.isfinite(p10) and p10 >= 0.45:
-        return 0
-    if np.isfinite(p20) and p20 >= 0.55:
-        return 1
-    if np.isfinite(pH) and pH >= 0.60:
-        return 2
-    if np.isfinite(pH):
-        return 3
+    # "초반" 정의: tau_pred 내의 앞 60% 구간을 초반으로 간주
+    early_end = max(1.0, 0.6 * tp)
 
-    return None
-
-
-def tau_multiplier(day: int, max_days: int, tau_class: int | None) -> float:
-    """
-    Profit-max default schedule (balanced budget later).
-    - Fast (0): front-load
-    - Mid  (1): flat
-    - Slow (2/3): back-load
-    """
-    if tau_class is None:
-        return 1.0
-
-    d = int(day)
-    H = int(max_days)
-
-    # split points
-    # 40 -> early=10, mid=20; 30 -> early=8, mid=15; 50 -> early=12, mid=25
-    early = max(1, int(round(H * 0.25)))
-    mid = max(early + 1, int(round(H * 0.50)))
-
-    if tau_class == 0:
-        # fast: buy more early, less later
-        if d <= early:
-            return 1.40
-        elif d <= mid:
-            return 1.05
-        else:
-            return 0.85
-
-    if tau_class == 1:
-        # mid: mostly flat
-        if d <= early:
-            return 1.10
-        elif d <= mid:
-            return 1.00
-        else:
-            return 0.95
-
-    # slow / very slow
-    if d <= early:
-        return 0.70
-    elif d <= mid:
-        return 0.90
+    if d <= early_end:
+        mult = (ratio ** tau_gamma)
     else:
-        return 1.30
+        mult = ((1.0 / ratio) ** tau_gamma)
+
+    # 너무 튀지 않게 최종 클램프
+    mult = float(np.clip(mult, 0.3, 2.5))
+    return float(unit) * mult
 
 
-def desired_buy_amount(pos: Position, day_close: float, profit_target: float, max_days: int, stop_level: float) -> float:
-    """
-    Determine desired buy today (pre-leverage-cap), based on:
-      - extending mode => always unit_base (as per your definition)
-      - normal mode => original DCA logic (<=avg => full, <=avg*1.05 => half)
-      - tau schedule adjusts ONLY within day<=max_days, and keeps total budget ~entry_seed
-    """
-    if not pos.in_pos:
-        return 0.0
-
-    # extending: keep it fixed = unit_base (your current logic)
-    if pos.extending:
-        return float(pos.unit_base)
-
-    avg = pos.avg_price()
-    if not np.isfinite(avg) or avg <= 0 or not np.isfinite(day_close) or day_close <= 0:
-        return 0.0
-
-    # original DCA rule -> base desired
-    if day_close <= avg:
-        base = float(pos.unit_base)
-    elif day_close <= avg * 1.05:
-        base = float(pos.unit_base) / 2.0
-    else:
-        base = 0.0
-
-    if base <= 0:
-        return 0.0
-
-    # tau schedule: apply only during day 1..max_days
-    if pos.holding_days <= int(max_days):
-        mult = tau_multiplier(pos.holding_days, max_days, pos.tau_class_pred)
-        scaled = base * float(mult)
-
-        # budget constraint: total spend within days<=max_days should not exceed entry_seed (tau_budget_total)
-        # remaining budget:
-        remaining = float(max(0.0, pos.tau_budget_total - pos.tau_budget_used))
-        return float(min(scaled, remaining))
-
-    return float(base)
-
-
-# -----------------------------
-# Main simulation
-# -----------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Single-position engine with leverage cap + tau-based buy schedule.")
-    ap.add_argument("--picks-path", required=True, type=str, help="CSV/Parquet with columns Date, Ticker (one pick per date).")
+    ap = argparse.ArgumentParser(description="Single-position engine with leverage cap and τ-based buy sizing.")
+    ap.add_argument("--picks-path", required=True, type=str)
     ap.add_argument("--prices-parq", default="data/raw/prices.parquet", type=str)
     ap.add_argument("--prices-csv", default="data/raw/prices.csv", type=str)
 
     ap.add_argument("--initial-seed", default=40_000_000, type=float)
-    ap.add_argument("--profit-target", required=True, type=float)   # e.g. 0.10
-    ap.add_argument("--max-days", required=True, type=int)          # e.g. 40
-    ap.add_argument("--stop-level", required=True, type=float)      # e.g. -0.10
-    ap.add_argument("--max-extend-days", required=True, type=int)   # kept for tag/label compatibility (NO hard limit)
-    ap.add_argument("--max-leverage-pct", default=1.0, type=float)  # 1.0 => 100%
+    ap.add_argument("--profit-target", required=True, type=float)
+    ap.add_argument("--max-days", required=True, type=int)
+    ap.add_argument("--stop-level", required=True, type=float)
+    ap.add_argument("--max-extend-days", required=True, type=int)
+    ap.add_argument("--max-leverage-pct", default=1.0, type=float)
+
+    # τ sizing strength (0 disables)
+    ap.add_argument("--tau-gamma", default=1.0, type=float, help="0 disables τ sizing, higher = stronger")
 
     ap.add_argument("--tag", default="", type=str)
     ap.add_argument("--suffix", default="", type=str)
@@ -292,33 +165,33 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    picks_path = args.picks_path
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tag, suffix = _pick_default_out_tag(picks_path, args.tag or None, args.suffix or None)
+    tag, suffix = _pick_default_out_tag(args.picks_path, args.tag or None, args.suffix or None)
 
     # load picks
-    if picks_path.lower().endswith(".parquet"):
-        picks = pd.read_parquet(picks_path)
+    if args.picks_path.lower().endswith(".parquet"):
+        picks = pd.read_parquet(args.picks_path)
     else:
-        picks = pd.read_csv(picks_path)
+        picks = pd.read_csv(args.picks_path)
 
     if "Date" not in picks.columns or "Ticker" not in picks.columns:
-        raise ValueError(f"picks file must have Date/Ticker. cols={list(picks.columns)[:50]}")
+        raise ValueError(f"picks must have Date/Ticker. cols={list(picks.columns)[:50]}")
 
     picks = picks.copy()
     picks["Date"] = _norm_date(picks["Date"])
     picks["Ticker"] = picks["Ticker"].astype(str).str.upper().str.strip()
+    if "tau_pred" in picks.columns:
+        picks["tau_pred"] = pd.to_numeric(picks["tau_pred"], errors="coerce")
     picks = picks.dropna(subset=["Date", "Ticker"]).sort_values(["Date"]).reset_index(drop=True)
-
-    # ensure 1 pick per date (top-1 selection already done upstream)
     picks = picks.drop_duplicates(["Date"], keep="last")
 
-    # picks lookup by date -> row (to get tau columns too)
-    picks_by_date = {}
-    for _, r in picks.iterrows():
-        picks_by_date[pd.Timestamp(r["Date"])] = r
+    # map date -> (ticker, tau_pred)
+    if "tau_pred" in picks.columns:
+        picks_by_date = {d: (t, float(tp) if np.isfinite(tp) else np.nan) for d, t, tp in zip(picks["Date"], picks["Ticker"], picks["tau_pred"])}
+    else:
+        picks_by_date = {d: (t, np.nan) for d, t in zip(picks["Date"], picks["Ticker"])}
 
     # load prices
     prices = read_table(args.prices_parq, args.prices_csv).copy()
@@ -350,13 +223,14 @@ def main() -> None:
             "ExitDate": exit_date,
             "Ticker": pos.ticker,
             "EntrySeed": pos.entry_seed,
+            "TauPred": pos.tau_pred,
+            "TauGamma": float(args.tau_gamma),
             "ProfitTarget": args.profit_target,
             "MaxDays": args.max_days,
             "StopLevel": args.stop_level,
             "MaxExtendDaysParam": args.max_extend_days,
             "MaxLeveragePctCap": args.max_leverage_pct,
             "MaxLeveragePct": pos.max_leverage_pct,
-            "TauClassPred": pos.tau_class_pred if pos.tau_class_pred is not None else -1,
             "Invested": pos.invested,
             "Shares": pos.shares,
             "ExitPrice": exit_price,
@@ -366,33 +240,30 @@ def main() -> None:
             "Extending": int(pos.extending),
             "Reason": reason,
             "MaxDrawdown": pos.max_dd,
+            "Win": win,
         })
 
         pos.seed += proceeds
 
-        # reset position state (keep portfolio-level max_equity/max_dd rolling)
         pos.in_pos = False
         pos.ticker = None
         pos.shares = 0.0
         pos.invested = 0.0
         pos.entry_seed = 0.0
-        pos.unit_base = 0.0
+        pos.unit = 0.0
         pos.entry_date = None
         pos.holding_days = 0
         pos.extending = False
+        pos.tau_pred = np.nan
         pos.max_leverage_pct = 0.0
 
-        pos.tau_class_pred = None
-        pos.tau_budget_total = 0.0
-        pos.tau_budget_used = 0.0
-
-        cooldown_today = True  # no re-entry on the same day
+        cooldown_today = True
 
     for date, day_df in grouped:
         day_df = day_df.set_index("Ticker", drop=False)
         cooldown_today = False
 
-        # ---- holding position
+        # ----- HOLDING LOGIC
         if pos.in_pos:
             if pos.ticker not in day_df.index:
                 pos.update_drawdown(None)
@@ -406,12 +277,10 @@ def main() -> None:
 
                 # exits
                 if not pos.extending:
-                    # TP intraday
                     if np.isfinite(avg) and np.isfinite(high_px) and high_px >= avg * (1.0 + args.profit_target):
                         exit_px = avg * (1.0 + args.profit_target)
                         close_cycle(date, float(exit_px), reason="TP")
                     else:
-                        # max_days decision
                         if pos.in_pos and pos.holding_days >= int(args.max_days):
                             cur_ret = (close_px - avg) / avg if np.isfinite(avg) and avg != 0 else -np.inf
                             if cur_ret >= float(args.stop_level):
@@ -419,86 +288,86 @@ def main() -> None:
                             else:
                                 pos.extending = True
 
-                # buys
+                # buys (after exit checks)
                 if pos.in_pos and pos.extending:
-                    # exit if recovery to stop-level threshold
                     if np.isfinite(avg) and np.isfinite(high_px) and high_px >= avg * (1.0 + args.stop_level):
                         exit_px = avg * (1.0 + args.stop_level)
                         close_cycle(date, float(exit_px), reason="EXT_RECOVERY")
                     else:
-                        desired = float(pos.unit_base)
-                        invest = clamp_invest_by_leverage(pos.seed, pos.entry_seed, desired, args.max_leverage_pct)
-                        if invest > 0 and np.isfinite(close_px) and close_px > 0:
-                            pos.seed -= invest
-                            pos.invested += invest
-                            pos.shares += invest / close_px
-                            update_max_leverage_pct(pos, pos.entry_seed, args.max_leverage_pct)
-                else:
-                    if pos.in_pos:
-                        desired = desired_buy_amount(
-                            pos=pos,
-                            day_close=float(close_px),
-                            profit_target=float(args.profit_target),
+                        desired = tau_adjusted_desired(
+                            unit=float(pos.unit),
+                            holding_day=int(pos.holding_days),
                             max_days=int(args.max_days),
-                            stop_level=float(args.stop_level),
+                            tau_pred=float(pos.tau_pred),
+                            tau_gamma=float(args.tau_gamma),
                         )
                         invest = clamp_invest_by_leverage(pos.seed, pos.entry_seed, desired, args.max_leverage_pct)
-                        if invest > 0 and np.isfinite(close_px) and close_px > 0:
+                        if invest > 0 and close_px > 0:
                             pos.seed -= invest
                             pos.invested += invest
                             pos.shares += invest / close_px
                             update_max_leverage_pct(pos, pos.entry_seed, args.max_leverage_pct)
 
-                            # tau budget accounting only within day<=max_days and not extending
-                            if (not pos.extending) and pos.holding_days <= int(args.max_days):
-                                pos.tau_budget_used += float(invest)
+                if pos.in_pos and (not pos.extending):
+                    if np.isfinite(avg) and close_px > 0:
+                        if close_px <= avg:
+                            base_desired = float(pos.unit)
+                        elif close_px <= avg * 1.05:
+                            base_desired = float(pos.unit) / 2.0
+                        else:
+                            base_desired = 0.0
 
-                # update dd
+                        desired = tau_adjusted_desired(
+                            unit=float(base_desired),
+                            holding_day=int(pos.holding_days),
+                            max_days=int(args.max_days),
+                            tau_pred=float(pos.tau_pred),
+                            tau_gamma=float(args.tau_gamma),
+                        )
+                        invest = clamp_invest_by_leverage(pos.seed, pos.entry_seed, desired, args.max_leverage_pct)
+                        if invest > 0:
+                            pos.seed -= invest
+                            pos.invested += invest
+                            pos.shares += invest / close_px
+                            update_max_leverage_pct(pos, pos.entry_seed, args.max_leverage_pct)
+
                 if pos.in_pos:
                     pos.update_drawdown(close_px)
                 else:
                     pos.update_drawdown(None)
 
-        # ---- entry
+        # ----- ENTRY
         if (not pos.in_pos) and (not cooldown_today):
-            pick_row = picks_by_date.get(pd.Timestamp(date), None)
-            if pick_row is not None:
-                pick = str(pick_row["Ticker"]).upper().strip()
+            pick_info = picks_by_date.get(date, None)
+            if pick_info is not None:
+                pick, tau_pred = pick_info
                 if pick in day_df.index:
                     row = day_df.loc[pick]
                     close_px = float(row["Close"])
                     if np.isfinite(close_px) and close_px > 0:
-                        # S0 = current seed at entry
                         S0 = float(pos.seed)
-                        unit_base = (S0 / float(args.max_days)) if args.max_days > 0 else 0.0
+                        unit = (S0 / float(args.max_days)) if args.max_days > 0 else 0.0
 
-                        # infer tau class from pick_row (if present)
-                        tau_cls = infer_tau_class_from_row(pick_row)
-
-                        # first day desired amount: base * tau_multiplier (budgeted)
-                        mult = tau_multiplier(1, int(args.max_days), tau_cls)
-                        desired = float(unit_base) * float(mult)
-
-                        # budget total (for pre-max_days window) is entry_seed (S0).
-                        # if S0 <= 0, budget is 0 and entry will fail anyway.
-                        budget_total = max(0.0, float(S0))
-                        desired = min(desired, budget_total)
-
+                        # entry buy also uses tau-adjust
+                        desired = tau_adjusted_desired(
+                            unit=float(unit),
+                            holding_day=1,
+                            max_days=int(args.max_days),
+                            tau_pred=float(tau_pred),
+                            tau_gamma=float(args.tau_gamma),
+                        )
                         invest = clamp_invest_by_leverage(pos.seed, S0, desired, args.max_leverage_pct)
 
                         if invest > 0:
                             pos.in_pos = True
                             pos.ticker = pick
                             pos.entry_seed = S0
-                            pos.unit_base = unit_base
+                            pos.unit = unit
                             pos.entry_date = date
                             pos.holding_days = 1
                             pos.extending = False
+                            pos.tau_pred = float(tau_pred) if np.isfinite(tau_pred) else np.nan
                             pos.max_leverage_pct = 0.0
-
-                            pos.tau_class_pred = tau_cls
-                            pos.tau_budget_total = float(budget_total)
-                            pos.tau_budget_used = float(invest)  # day1 used
 
                             pos.seed -= invest
                             pos.invested = invest
@@ -515,7 +384,7 @@ def main() -> None:
             else:
                 pos.update_drawdown(None)
 
-        # ---- curve record
+        # ----- CURVE
         px = None
         if pos.in_pos and pos.ticker is not None and pos.ticker in day_df.index:
             px = float(day_df.loc[pos.ticker]["Close"])
@@ -533,9 +402,8 @@ def main() -> None:
             "AvgPrice": pos.avg_price() if pos.in_pos else np.nan,
             "HoldingDays": pos.holding_days if pos.in_pos else 0,
             "Extending": int(pos.extending) if pos.in_pos else 0,
-            "TauClassPred": pos.tau_class_pred if pos.in_pos and pos.tau_class_pred is not None else -1,
-            "TauBudgetTotal": pos.tau_budget_total if pos.in_pos else 0.0,
-            "TauBudgetUsed": pos.tau_budget_used if pos.in_pos else 0.0,
+            "TauPred": pos.tau_pred if pos.in_pos else np.nan,
+            "TauGamma": float(args.tau_gamma),
             "MaxLeveragePctCycle": pos.max_leverage_pct if pos.in_pos else 0.0,
             "MaxDrawdownPortfolio": pos.max_dd,
         })
