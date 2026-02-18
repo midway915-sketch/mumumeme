@@ -185,6 +185,20 @@ jobs:
             echo "[INFO] model exists -> reuse"
           fi
 
+          # 4b) tail_model.pkl / tail_scaler.pkl (p_tail)
+          if [ ! -f app/tail_model.pkl ] || [ ! -f app/tail_scaler.pkl ]; then
+            python scripts/train_tail_model.py \
+              --profit-target "$PROFIT_TARGET" \
+              --max-days "$MAX_DAYS" \
+              --stop-level "$STOP_LEVEL" \
+              --max-extend-days "$MAX_EXTEND_DAYS"
+          else
+            echo "[INFO] tail model exists -> reuse"
+          fi
+          
+          # 5) score features -> features_scored (p_success/p_tail attached)
+          python scripts/score_features.py --tag "$LABEL_KEY"
+
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
         env:
@@ -220,7 +234,7 @@ jobs:
 
           OUT_DIR: "data/signals"
           EXCLUDE_TICKERS: "SPY,^VIX"
-          REQUIRE_FILES: "data/features/features_model.parquet,app/model.pkl,app/scaler.pkl"
+          REQUIRE_FILES: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl"
 
         run: |
           set -euo pipefail
