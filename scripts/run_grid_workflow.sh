@@ -30,7 +30,7 @@ if [ ! -f "$SIM" ]; then echo "[ERROR] $SIM not found"; exit 1; fi
 if [ ! -f "$SUM" ]; then echo "[ERROR] $SUM not found"; exit 1; fi
 
 # tag e.g. pt10_h40_sl10_ex30
-pt_tag="$(python - <<PY
+pt_tag="$(python - <<'PY'
 pt=float("${PROFIT_TARGET}")
 md=int("${MAX_DAYS}")
 sl=float("${STOP_LEVEL}")
@@ -96,8 +96,6 @@ for mode in "${mode_list[@]}"; do
           CURVE="${OUT_DIR}/sim_engine_curve_${TAG}_gate_${SUFFIX}.parquet"
 
           # ---- 1) predict_gate -> picks
-          # NOTE: predict_gate.py 자체는 p_success_min gate를 아직 “내장”해두지 않았으니,
-          #       여기서는 picks 생성 후 p_success_min 필터를 적용하는 방식으로 처리 (안전/확실)
           python "$PRED" \
             --profit-target "$PROFIT_TARGET" \
             --max-days "$MAX_DAYS" \
@@ -120,28 +118,35 @@ for mode in "${mode_list[@]}"; do
 
           # ---- 1.5) apply p_success min filter (optional)
           if [ "$ps_min" != "NA" ]; then
-            python - <<PY
+            PICKS_PATH="$PICKS" P_SUCCESS_MIN="$ps_min" python - <<'PY'
+import os
 import pandas as pd
 from pathlib import Path
-p=Path("${PICKS}")
-df=pd.read_csv(p)
+
+p = Path(os.environ["PICKS_PATH"])
+ps_min = float(os.environ["P_SUCCESS_MIN"])
+
+df = pd.read_csv(p)
+
 if "p_success" not in df.columns:
-    # if no p_success, don't filter (but warn)
     print("[WARN] p_success not found in picks -> skip p_success_min filtering")
 else:
-    before=len(df)
-    df=df[pd.to_numeric(df["p_success"], errors="coerce").fillna(0.0) >= float("${ps_min}")]
-    # keep 1 per day
+    before = len(df)
+    df["p_success"] = pd.to_numeric(df["p_success"], errors="coerce").fillna(0.0)
+    df = df[df["p_success"] >= ps_min].copy()
+
+    # keep 1 per day after filtering
     if "Date" in df.columns:
-        df["Date"]=pd.to_datetime(df["Date"], errors="coerce")
-        df=df.sort_values(["Date","p_success"], ascending=[True,False]).drop_duplicates(["Date"], keep="first")
-    after=len(df)
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.sort_values(["Date", "p_success"], ascending=[True, False]).drop_duplicates(["Date"], keep="first")
+
+    after = len(df)
     print(f"[INFO] p_success_min applied: {before} -> {after} (min={ps_min})")
     df.to_csv(p, index=False)
 PY
           fi
 
-          # ---- 2) simulate_single_position_engine -> trades/curve
+          # ---- 2) simulate -> trades/curve
           python "$SIM" \
             --picks-path "$PICKS" \
             --profit-target "$PROFIT_TARGET" \
@@ -160,7 +165,7 @@ PY
             exit 1
           fi
 
-          # ---- 3) summarize (IMPORTANT: pass curve-path explicitly)
+          # ---- 3) summarize (curve-path explicitly)
           python "$SUM" \
             --trades-path "$TRADES" \
             --curve-path "$CURVE" \
