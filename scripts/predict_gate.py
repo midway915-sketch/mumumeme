@@ -6,12 +6,8 @@ from pathlib import Path
 import json
 import numpy as np
 import pandas as pd
-import joblib
 
 
-# -------------------------
-# IO helpers
-# -------------------------
 def read_table(parq: str, csv: str) -> pd.DataFrame:
     p = Path(parq)
     c = Path(csv)
@@ -30,18 +26,12 @@ def read_universe(universe_csv: str) -> list[str]:
     path = Path(universe_csv)
     if not path.exists():
         raise FileNotFoundError(f"Missing universe file: {universe_csv}")
-
     uni = pd.read_csv(path)
     if "Ticker" not in uni.columns:
         raise ValueError("universe.csv must contain 'Ticker' column")
-
     if "Enabled" in uni.columns:
         uni = uni[uni["Enabled"] == True]  # noqa: E712
-
-    tickers = (
-        uni["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
-    )
-    return tickers
+    return uni["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
 
 
 def ensure_cols(df: pd.DataFrame, cols: list[str]) -> None:
@@ -59,9 +49,6 @@ def require_files(spec: str) -> None:
         raise FileNotFoundError(f"Missing required files: {missing}")
 
 
-# -------------------------
-# scoring
-# -------------------------
 def coerce_num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     if col not in df.columns:
         return pd.Series([default] * len(df), index=df.index, dtype=float)
@@ -77,55 +64,21 @@ def build_utility(df: pd.DataFrame, lambda_tail: float) -> pd.Series:
 def rank_pick_one_per_day(df: pd.DataFrame, rank_by: str) -> pd.DataFrame:
     if df.empty:
         return df
-
     if rank_by not in ("utility", "ret_score", "p_success"):
-        raise ValueError(f"rank_by must be one of utility|ret_score|p_success (got {rank_by})")
+        raise ValueError("rank_by must be one of utility|ret_score|p_success")
 
     ev = coerce_num(df, "EV", 0.0) if "EV" in df.columns else pd.Series([0.0] * len(df), index=df.index)
     close = coerce_num(df, "Close", 0.0) if "Close" in df.columns else pd.Series([0.0] * len(df), index=df.index)
 
-    rank_col = coerce_num(df, rank_by, 0.0)
     df = df.copy()
-    df["_rank"] = rank_col
+    df["_rank"] = coerce_num(df, rank_by, 0.0)
     df["_ev"] = ev
     df["_close"] = close
 
     df = df.sort_values(["Date", "_rank", "_ev", "_close"], ascending=[True, False, False, False])
-    out = df.drop_duplicates(["Date"], keep="first").drop(columns=["_rank", "_ev", "_close"])
-    return out
+    return df.drop_duplicates(["Date"], keep="first").drop(columns=["_rank", "_ev", "_close"])
 
 
-def maybe_predict_tau(feats: pd.DataFrame, tau_model_path: str, tau_scaler_path: str, feature_cols: list[str]) -> pd.Series:
-    mp = Path(tau_model_path)
-    sp = Path(tau_scaler_path)
-    if (not mp.exists()) or (not sp.exists()):
-        return pd.Series([np.nan] * len(feats), index=feats.index, dtype=float)
-
-    model = joblib.load(mp)
-    scaler = joblib.load(sp)
-
-    X = feats.copy()
-    for c in feature_cols:
-        if c not in X.columns:
-            X[c] = np.nan
-    X = X[feature_cols]
-    X = X.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-
-    Xs = scaler.transform(X.values)
-
-    # regression: predict days
-    # (If you later switch to bucket classifier, you can adjust here)
-    try:
-        pred = model.predict(Xs)
-        pred = pd.to_numeric(pd.Series(pred, index=feats.index), errors="coerce")
-        return pred.astype(float)
-    except Exception:
-        return pd.Series([np.nan] * len(feats), index=feats.index, dtype=float)
-
-
-# -------------------------
-# main
-# -------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(description="Predict gate picks (Top-1 per day) with universe-only candidates.")
     ap.add_argument("--profit-target", required=True, type=float)
@@ -141,25 +94,24 @@ def main() -> None:
     ap.add_argument("--features-parq", default="data/features/features_model.parquet", type=str)
     ap.add_argument("--features-csv", default="data/features/features_model.csv", type=str)
 
+    # τ optional merge
+    ap.add_argument("--tau-parq", default="data/features/features_tau.parquet", type=str)
+    ap.add_argument("--tau-csv", default="data/features/features_tau.csv", type=str)
+
     ap.add_argument("--universe-csv", default="data/universe.csv", type=str)
-    ap.add_argument("--exclude-tickers", default="SPY,^VIX", type=str, help="comma-separated tickers to force-exclude")
+    ap.add_argument("--exclude-tickers", default="SPY,^VIX", type=str)
 
     ap.add_argument("--tail-threshold", required=True, type=float)
     ap.add_argument("--utility-quantile", required=True, type=float)
     ap.add_argument("--rank-by", required=True, choices=["utility", "ret_score", "p_success"])
     ap.add_argument("--lambda-tail", required=True, type=float)
 
-    ap.add_argument("--p-success-min", default=0.0, type=float, help="p_success must be >= this to be eligible (0 disables)")
+    # NEW: optional p_success minimum gate (comma in workflow grid 가능하게 만들었으면 bash에서 루프 돌리면 됨)
+    ap.add_argument("--p-success-min", default=-1.0, type=float, help="if >=0, require p_success >= this")
 
-    ap.add_argument("--require-files", default="", type=str, help="comma-separated file paths that must exist")
-
-    # τ model (optional)
-    ap.add_argument("--tau-model-path", default="app/tau_model.pkl", type=str)
-    ap.add_argument("--tau-scaler-path", default="app/tau_scaler.pkl", type=str)
-    ap.add_argument("--tau-features", default="", type=str, help="comma-separated feature cols for tau model (blank => use common defaults)")
+    ap.add_argument("--require-files", default="", type=str)
 
     args = ap.parse_args()
-
     if args.require_files:
         require_files(args.require_files)
 
@@ -172,51 +124,39 @@ def main() -> None:
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
+    # universe-only
     universe = set(read_universe(args.universe_csv))
     excludes = set([t.strip().upper() for t in args.exclude_tickers.split(",") if t.strip()])
-
     before = len(feats)
     feats = feats[feats["Ticker"].isin(universe)].copy()
     feats = feats[~feats["Ticker"].isin(excludes)].copy()
     after = len(feats)
-
     if after == 0:
-        raise RuntimeError(
-            f"No rows left after universe filter. before={before} after={after} "
-            f"(check universe.csv / features_model tickers)"
-        )
+        raise RuntimeError(f"No rows left after universe filter. before={before} after={after}")
 
+    # numeric cols
     feats["p_tail"] = coerce_num(feats, "p_tail", 0.0)
     feats["p_success"] = coerce_num(feats, "p_success", 0.0)
     feats["ret_score"] = coerce_num(feats, "ret_score", 0.0)
     feats["utility"] = build_utility(feats, lambda_tail=float(args.lambda_tail))
 
-    # τ_pred (optional)
-    if args.tau_features.strip():
-        tau_cols = [c.strip() for c in args.tau_features.split(",") if c.strip()]
-    else:
-        # safe defaults (you can override from workflow later)
-        tau_cols = [
-            "Drawdown_252", "Drawdown_60", "ATR_ratio", "Z_score", "MACD_hist", "MA20_slope",
-            "Market_Drawdown", "Market_ATR_ratio"
-        ]
-    feats["tau_pred"] = maybe_predict_tau(feats, args.tau_model_path, args.tau_scaler_path, tau_cols)
-
-    # gate conditions
+    # tail gate
     tail_ok = feats["p_tail"] <= float(args.tail_threshold)
 
+    # utility per-date quantile cutoff
     q = float(args.utility_quantile)
     if not (0.0 <= q <= 1.0):
         raise ValueError("--utility-quantile must be in [0,1]")
-
     util_cut = feats.groupby("Date")["utility"].transform(lambda s: float(s.quantile(q)) if len(s) else np.nan)
     util_ok = (feats["utility"] >= util_cut).fillna(False)
 
+    # p_success min gate (optional)
     ps_min = float(args.p_success_min)
-    ps_ok = feats["p_success"] >= ps_min
+    ps_ok = (feats["p_success"] >= ps_min) if ps_min >= 0 else pd.Series([True] * len(feats), index=feats.index)
 
+    # mode
     if args.mode == "none":
-        eligible = feats[ps_ok].copy() if ps_min > 0 else feats
+        eligible = feats[ps_ok].copy()
     elif args.mode == "tail":
         eligible = feats[tail_ok & ps_ok].copy()
     elif args.mode == "utility":
@@ -224,13 +164,33 @@ def main() -> None:
     elif args.mode == "tail_utility":
         eligible = feats[tail_ok & util_ok & ps_ok].copy()
     else:
-        raise ValueError(f"Unknown mode: {args.mode}")
+        raise ValueError("Unknown mode")
 
     picks = rank_pick_one_per_day(eligible, rank_by=args.rank_by)
 
-    out_cols = ["Date", "Ticker", "p_tail", "p_success", "ret_score", "utility", "tau_pred"]
+    # τ merge (optional)
+    tau_used = False
+    tau_src = ""
+    try:
+        tau = read_table(args.tau_parq, args.tau_csv).copy()
+        if "Date" in tau.columns and "Ticker" in tau.columns:
+            tau["Date"] = norm_date(tau["Date"])
+            tau["Ticker"] = tau["Ticker"].astype(str).str.upper().str.strip()
+            tau = tau.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
+            # keep only expected cols if exist
+            keep_tau = [c for c in ["p_tau_fast", "p_tau_mid", "p_tau_slow", "TauClassPred", "TauThr"] if c in tau.columns]
+            if keep_tau:
+                picks = pd.merge(picks, tau[["Date", "Ticker"] + keep_tau], on=["Date", "Ticker"], how="left")
+                tau_used = True
+                tau_src = args.tau_parq if Path(args.tau_parq).exists() else args.tau_csv
+    except FileNotFoundError:
+        tau_used = False
+
+    # output
+    out_cols = ["Date", "Ticker", "p_tail", "p_success", "ret_score", "utility"]
     extra_cols = [c for c in ["EV", "Close", "Volume"] if c in picks.columns]
-    keep = [c for c in out_cols + extra_cols if c in picks.columns]
+    tau_cols = [c for c in ["p_tau_fast", "p_tau_mid", "p_tau_slow", "TauClassPred", "TauThr"] if c in picks.columns]
+    keep = [c for c in out_cols + extra_cols + tau_cols if c in picks.columns]
     picks_out = picks[keep].copy()
 
     picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
@@ -245,10 +205,6 @@ def main() -> None:
         "utility_quantile": float(args.utility_quantile),
         "lambda_tail": float(args.lambda_tail),
         "p_success_min": float(args.p_success_min),
-        "tau_model_path": args.tau_model_path,
-        "tau_scaler_path": args.tau_scaler_path,
-        "tau_features": tau_cols,
-        "universe_csv": args.universe_csv,
         "universe_size": int(len(universe)),
         "excluded": sorted(list(excludes)),
         "rows_features_after_filter": int(len(feats)),
@@ -259,6 +215,8 @@ def main() -> None:
         "max_days": int(args.max_days),
         "stop_level": float(args.stop_level),
         "max_extend_days": int(args.max_extend_days),
+        "tau_used": bool(tau_used),
+        "tau_src": tau_src,
         "features_src": args.features_parq if Path(args.features_parq).exists() else args.features_csv,
     }
     meta_path = out_dir / f"picks_meta_{args.tag}_gate_{args.suffix}.json"
@@ -269,6 +227,7 @@ def main() -> None:
     print(f"[DONE] wrote meta : {meta_path}")
     print(f"[INFO] mode={args.mode} tail_max={args.tail_threshold} u_q={args.utility_quantile} rank_by={args.rank_by} lambda_tail={args.lambda_tail} p_success_min={args.p_success_min}")
     print(f"[INFO] universe_only rows: {before} -> {after} (excluded {sorted(list(excludes))})")
+    print(f"[INFO] tau_used={tau_used} tau_src={tau_src}")
     if picks_out.empty:
         print("[WARN] picks_out is empty. Gate may be too strict for this period.")
     else:
