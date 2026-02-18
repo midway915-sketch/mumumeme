@@ -214,27 +214,27 @@ jobs:
           START_DATE=""
           if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
             START_DATE="$(python - <<'PY'
-import pandas as pd
-from pathlib import Path
-p=Path("data/features/features_model.parquet")
-c=Path("data/features/features_model.csv")
-df=None
-if p.exists():
-  df=pd.read_parquet(p)
-elif c.exists():
-  df=pd.read_csv(c)
-if df is None or len(df)==0 or "Date" not in df.columns:
-  print("")
-else:
-  d=pd.to_datetime(df["Date"], errors="coerce").dropna()
-  if len(d)==0:
-    print("")
-  else:
-    last=d.max()
-    start=last - pd.Timedelta(days=20)
-    print(start.strftime("%Y-%m-%d"))
-PY
-)"
+          import pandas as pd
+          from pathlib import Path
+          p=Path("data/features/features_model.parquet")
+          c=Path("data/features/features_model.csv")
+          df=None
+          if p.exists():
+            df=pd.read_parquet(p)
+          elif c.exists():
+            df=pd.read_csv(c)
+          if df is None or len(df)==0 or "Date" not in df.columns:
+            print("")
+          else:
+            d=pd.to_datetime(df["Date"], errors="coerce").dropna()
+            if len(d)==0:
+              print("")
+            else:
+              last=d.max()
+              start=last - pd.Timedelta(days=20)
+              print(start.strftime("%Y-%m-%d"))
+          PY
+          )"
           fi
           echo "[INFO] START_DATE=$START_DATE"
 
