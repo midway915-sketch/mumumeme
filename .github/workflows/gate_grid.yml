@@ -162,6 +162,8 @@ jobs:
             python scripts/build_tau_labels.py \
               --profit-target "$PROFIT_TARGET" \
               --max-days "$MAX_DAYS" \
+              --stop-level "$STOP_LEVEL" \
+              --max-extend-days "$MAX_EXTEND_DAYS" \
               --k1 10 \
               --k2 20
           fi
