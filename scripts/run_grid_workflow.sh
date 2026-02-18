@@ -1,141 +1,191 @@
 #!/usr/bin/env bash
+# scripts/run_grid_workflow.sh
 set -euo pipefail
 
-# scripts/run_grid_workflow.sh
-# Requires env:
-#   PROFIT_TARGET MAX_DAYS STOP_LEVEL MAX_EXTEND_DAYS
-#   P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL
-#   (optional) P_SUCCESS_MINS
-#   GATE_MODES (default: none,tail,utility,tail_utility)
-#   TAU_THR (default: 0.45)
+# -------------------------
+# Helpers
+# -------------------------
+split_csv() {
+  # Split comma-separated values -> one per line (trim spaces)
+  echo "${1:-}" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF>0'
+}
 
-PROFIT_TARGET="${PROFIT_TARGET:?}"
-MAX_DAYS="${MAX_DAYS:?}"
-STOP_LEVEL="${STOP_LEVEL:?}"
-MAX_EXTEND_DAYS="${MAX_EXTEND_DAYS:?}"
+need_file() {
+  local p="$1"
+  if [ ! -f "$p" ]; then
+    echo "[ERROR] required file not found: $p"
+    exit 1
+  fi
+}
 
-P_TAIL_THRESHOLDS="${P_TAIL_THRESHOLDS:-0.20,0.30}"
-UTILITY_QUANTILES="${UTILITY_QUANTILES:-0.75,0.90}"
-RANK_METRICS="${RANK_METRICS:-utility}"
-LAMBDA_TAIL="${LAMBDA_TAIL:-0.05}"
-P_SUCCESS_MINS="${P_SUCCESS_MINS:--1}"  # -1 means disabled
+py() {
+  python "$@"
+}
+
+# -------------------------
+# Resolve script paths
+# -------------------------
+PRED=""
+SIM=""
+SUM=""
+
+if [ -f scripts/predict_gate.py ]; then PRED="scripts/predict_gate.py"; elif [ -f predict_gate.py ]; then PRED="predict_gate.py"; fi
+if [ -f scripts/simulate_single_position_engine.py ]; then SIM="scripts/simulate_single_position_engine.py"; elif [ -f simulate_single_position_engine.py ]; then SIM="simulate_single_position_engine.py"; fi
+if [ -f scripts/summarize_sim_trades.py ]; then SUM="scripts/summarize_sim_trades.py"; elif [ -f summarize_sim_trades.py ]; then SUM="summarize_sim_trades.py"; fi
+
+need_file "$PRED"
+need_file "$SIM"
+need_file "$SUM"
+
+# -------------------------
+# Read env (from workflow)
+# -------------------------
+: "${TAG:?TAG env is required (e.g. pt10_h40_sl10_ex30)}"
+
+: "${PROFIT_TARGET:?PROFIT_TARGET env required}"
+: "${MAX_DAYS:?MAX_DAYS env required}"
+: "${STOP_LEVEL:?STOP_LEVEL env required}"
+: "${MAX_EXTEND_DAYS:?MAX_EXTEND_DAYS env required}"
+
+: "${P_TAIL_THRESHOLDS:?P_TAIL_THRESHOLDS env required (comma-separated)}"
+: "${UTILITY_QUANTILES:?UTILITY_QUANTILES env required (comma-separated)}"
+: "${RANK_METRICS:?RANK_METRICS env required (comma-separated)}"
+
+# LAMBDA_TAIL is single float (NOT a list)
+: "${LAMBDA_TAIL:?LAMBDA_TAIL env required (single float)}"
+
+# Optional envs
+OUT_DIR="${OUT_DIR:-data/signals}"
 GATE_MODES="${GATE_MODES:-none,tail,utility,tail_utility}"
-TAU_THR="${TAU_THR:-0.45}"
+MAX_LEVERAGE_PCT="${MAX_LEVERAGE_PCT:-1.0}"
 
-TAG="pt$(python - <<PY
-pt=float("${PROFIT_TARGET}")
-print(int(round(pt*100)))
-PY)_h${MAX_DAYS}_sl$(python - <<PY
-sl=float("${STOP_LEVEL}")
-print(int(round(abs(sl)*100)))
-PY)_ex${MAX_EXTEND_DAYS}"
+# 2-stage TP optional (will be passed only if simulator supports)
+TP1_FRAC="${TP1_FRAC:-0.50}"
+TRAIL_STOP="${TRAIL_STOP:-0.10}"
 
-mkdir -p data/signals data/labels data/features app
+mkdir -p "$OUT_DIR"
 
-echo "[INFO] TAG=${TAG}"
+echo "============================================================"
+echo "[INFO] TAG=$TAG"
+echo "[INFO] PT=$PROFIT_TARGET H=$MAX_DAYS SL=$STOP_LEVEL EX=$MAX_EXTEND_DAYS"
+echo "[INFO] MODES=$GATE_MODES"
+echo "[INFO] p_tail thresholds=$P_TAIL_THRESHOLDS"
+echo "[INFO] utility quantiles=$UTILITY_QUANTILES"
+echo "[INFO] rank metrics=$RANK_METRICS"
+echo "[INFO] lambda_tail=$LAMBDA_TAIL"
+echo "[INFO] max_leverage_pct=$MAX_LEVERAGE_PCT"
+echo "[INFO] tp1_frac=$TP1_FRAC trail_stop=$TRAIL_STOP (only if SIM supports)"
+echo "============================================================"
 
-# 1) tau labels
-if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
-  echo "[RUN] build_tau_labels.py"
-  python scripts/build_tau_labels.py \
-    --profit-target "${PROFIT_TARGET}" \
-    --max-days "${MAX_DAYS}" \
-    --stop-level "${STOP_LEVEL}" \
-    --max-extend-days "${MAX_EXTEND_DAYS}" \
-    --k1 10 --k2 20
-else
-  echo "[INFO] labels_tau exists -> reuse"
-fi
+# Detect SIM optional args
+SIM_SUPPORTS_TP1="0"
+SIM_SUPPORTS_TRAIL="0"
+if grep -q -- "--tp1-frac" "$SIM"; then SIM_SUPPORTS_TP1="1"; fi
+if grep -q -- "--trail-stop" "$SIM"; then SIM_SUPPORTS_TRAIL="1"; fi
 
-# 2) tau model
-if [ ! -f app/tau_model.pkl ] || [ ! -f app/tau_scaler.pkl ]; then
-  echo "[RUN] train_tau_model.py"
-  python scripts/train_tau_model.py
-else
-  echo "[INFO] tau model exists -> reuse"
-fi
+echo "[INFO] SIM supports --tp1-frac?  $SIM_SUPPORTS_TP1"
+echo "[INFO] SIM supports --trail-stop? $SIM_SUPPORTS_TRAIL"
 
-# 3) tau predictions
-if [ ! -f data/features/features_tau.parquet ] && [ ! -f data/features/features_tau.csv ]; then
-  echo "[RUN] predict_tau.py"
-  python scripts/predict_tau.py --thr "${TAU_THR}"
-else
-  echo "[INFO] features_tau exists -> reuse"
-fi
+# -------------------------
+# Grid loop
+# -------------------------
+modes="$(split_csv "$GATE_MODES")"
+tails="$(split_csv "$P_TAIL_THRESHOLDS")"
+uqs="$(split_csv "$UTILITY_QUANTILES")"
+ranks="$(split_csv "$RANK_METRICS")"
 
-# helpers: split CSV lists
-IFS=',' read -r -a arr_tail <<< "${P_TAIL_THRESHOLDS}"
-IFS=',' read -r -a arr_uq <<< "${UTILITY_QUANTILES}"
-IFS=',' read -r -a arr_rank <<< "${RANK_METRICS}"
-IFS=',' read -r -a arr_modes <<< "${GATE_MODES}"
-IFS=',' read -r -a arr_psmin <<< "${P_SUCCESS_MINS}"
+# Normalize floats for suffix (0.10 -> 0p10)
+f2s() {
+  # float to suffix token
+  python - <<PY
+x=float("$1")
+s=f"{x:.4f}".rstrip("0").rstrip(".")
+print(s.replace(".","p").replace("-","m"))
+PY
+}
 
-for mode in "${arr_modes[@]}"; do
-  mode="$(echo "$mode" | xargs)"
-  for tail in "${arr_tail[@]}"; do
-    tail="$(echo "$tail" | xargs)"
-    for uq in "${arr_uq[@]}"; do
-      uq="$(echo "$uq" | xargs)"
-      for rank in "${arr_rank[@]}"; do
-        rank="$(echo "$rank" | xargs)"
-        for psmin in "${arr_psmin[@]}"; do
-          psmin="$(echo "$psmin" | xargs)"
+for mode in $modes; do
+  for t in $tails; do
+    for uq in $uqs; do
+      for rb in $ranks; do
 
-          suffix="${mode}_t${tail}_q${uq}_r${rank}"
-          if [ "${psmin}" != "-1" ] && [ "${psmin}" != "" ]; then
-            suffix="${suffix}_ps${psmin}"
-          fi
+        t_tok="$(f2s "$t")"
+        uq_tok="$(f2s "$uq")"
+        lam_tok="$(f2s "$LAMBDA_TAIL")"
 
-          echo "=============================="
-          echo "[RUN] mode=${mode} tail_max=${tail} u_q=${uq} rank_by=${rank} ps_min=${psmin} suffix=${suffix}"
-          echo "=============================="
+        suffix="${mode}_t${t_tok}_q${uq_tok}_r${rb}_l${lam_tok}"
 
-          python scripts/predict_gate.py \
-            --profit-target "${PROFIT_TARGET}" \
-            --max-days "${MAX_DAYS}" \
-            --stop-level "${STOP_LEVEL}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}" \
-            --mode "${mode}" \
-            --tag "${TAG}" \
-            --suffix "${suffix}" \
-            --tail-threshold "${tail}" \
-            --utility-quantile "${uq}" \
-            --rank-by "${rank}" \
-            --lambda-tail "${LAMBDA_TAIL}" \
-            --p-success-min "${psmin}" \
-            --tau-parq "data/features/features_tau.parquet" \
-            --tau-csv "data/features/features_tau.csv"
+        echo "=============================="
+        echo "[RUN] mode=$mode tail_max=$t utility_q=$uq rank_by=$rb lambda=$LAMBDA_TAIL suffix=$suffix"
+        echo "=============================="
 
-          PICKS="data/signals/picks_${TAG}_gate_${suffix}.csv"
+        # 1) Predict picks
+        py "$PRED" \
+          --profit-target "$PROFIT_TARGET" \
+          --max-days "$MAX_DAYS" \
+          --stop-level "$STOP_LEVEL" \
+          --max-extend-days "$MAX_EXTEND_DAYS" \
+          --mode "$mode" \
+          --tag "$TAG" \
+          --suffix "$suffix" \
+          --out-dir "$OUT_DIR" \
+          --tail-threshold "$t" \
+          --utility-quantile "$uq" \
+          --rank-by "$rb" \
+          --lambda-tail "$LAMBDA_TAIL"
 
-          python scripts/simulate_single_position_engine.py \
-            --picks-path "${PICKS}" \
-            --profit-target "${PROFIT_TARGET}" \
-            --max-days "${MAX_DAYS}" \
-            --stop-level "${STOP_LEVEL}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}" \
-            --max-leverage-pct "1.0" \
-            --tag "${TAG}" \
-            --suffix "${suffix}" \
-            --out-dir "data/signals"
+        picks_path="$OUT_DIR/picks_${TAG}_gate_${suffix}.csv"
+        if [ ! -f "$picks_path" ]; then
+          echo "[ERROR] picks file not created: $picks_path"
+          exit 1
+        fi
 
-          # summarize trades (you already have summarize_sim_trades.py; keep using it)
-          if [ -f scripts/summarize_sim_trades.py ]; then
-            python scripts/summarize_sim_trades.py \
-              --trades-path "data/signals/sim_engine_trades_${TAG}_gate_${suffix}.parquet" \
-              --tag "${TAG}" \
-              --suffix "${suffix}" \
-              --profit-target "${PROFIT_TARGET}" \
-              --max-days "${MAX_DAYS}" \
-              --stop-level "${STOP_LEVEL}" \
-              --max-extend-days "${MAX_EXTEND_DAYS}" \
-              --out-dir "data/signals"
-          fi
+        # 2) Simulate
+        sim_cmd=( python "$SIM"
+          --picks-path "$picks_path"
+          --profit-target "$PROFIT_TARGET"
+          --max-days "$MAX_DAYS"
+          --stop-level "$STOP_LEVEL"
+          --max-extend-days "$MAX_EXTEND_DAYS"
+          --max-leverage-pct "$MAX_LEVERAGE_PCT"
+          --tag "$TAG"
+          --suffix "$suffix"
+          --out-dir "$OUT_DIR"
+        )
 
-        done
+        if [ "$SIM_SUPPORTS_TP1" = "1" ]; then
+          sim_cmd+=( --tp1-frac "$TP1_FRAC" )
+        fi
+        if [ "$SIM_SUPPORTS_TRAIL" = "1" ]; then
+          sim_cmd+=( --trail-stop "$TRAIL_STOP" )
+        fi
+
+        "${sim_cmd[@]}"
+
+        trades_path="$OUT_DIR/sim_engine_trades_${TAG}_gate_${suffix}.parquet"
+        if [ ! -f "$trades_path" ]; then
+          echo "[ERROR] trades parquet not created: $trades_path"
+          exit 1
+        fi
+
+        # 3) Summarize (gate_summary_*.csv)
+        py "$SUM" \
+          --trades-path "$trades_path" \
+          --tag "$TAG" \
+          --suffix "$suffix" \
+          --profit-target "$PROFIT_TARGET" \
+          --max-days "$MAX_DAYS" \
+          --stop-level "$STOP_LEVEL" \
+          --max-extend-days "$MAX_EXTEND_DAYS" \
+          --out-dir "$OUT_DIR"
+
       done
     done
   done
 done
 
+echo "============================================================"
 echo "[DONE] grid completed"
+echo "[INFO] outputs:"
+ls -la "$OUT_DIR" | sed -n '1,200p'
+echo "============================================================"
