@@ -110,16 +110,16 @@ jobs:
           EX="${{ inputs.max_extend_days }}"
           # pt10_h40_sl10_ex30 style
           PTI=$(python - <<'PY'
-import os
-pt=float(os.environ["PT"])
-print(int(round(pt*100)))
-PY
-          )
-          SLI=$(python - <<'PY'
-import os
-sl=float(os.environ["SL"])
-print(int(round(abs(sl)*100)))
-PY
+          import os
+          pt=float(os.environ["PT"])
+          print(int(round(pt*100)))
+          PY
+                    )
+                    SLI=$(python - <<'PY'
+          import os
+          sl=float(os.environ["SL"])
+          print(int(round(abs(sl)*100)))
+          PY
           )
           echo "LABEL_KEY=pt${PTI}_h${H}_sl${SLI}_ex${EX}" >> $GITHUB_ENV
         env:
