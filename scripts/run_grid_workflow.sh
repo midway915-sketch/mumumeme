@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Required env:
-#   PROFIT_TARGET, MAX_DAYS, STOP_LEVEL, MAX_EXTEND_DAYS
-#   P_TAIL_THRESHOLDS (csv), UTILITY_QUANTILES (csv), RANK_METRICS (csv)
-#   LAMBDA_TAIL
-#   GATE_MODES (csv): none,tail,utility,tail_utility
-#   P_SUCCESS_MINS (csv): e.g. 0.0,0.55,0.60,0.65
+# ----------------------------
+# required envs
+# ----------------------------
+: "${PROFIT_TARGET:?missing PROFIT_TARGET}"
+: "${MAX_DAYS:?missing MAX_DAYS}"
+: "${STOP_LEVEL:?missing STOP_LEVEL}"
+: "${MAX_EXTEND_DAYS:?missing MAX_EXTEND_DAYS}"
+
+: "${P_TAIL_THRESHOLDS:?missing P_TAIL_THRESHOLDS}"   # e.g. "0.20,0.30"
+: "${UTILITY_QUANTILES:?missing UTILITY_QUANTILES}"   # e.g. "0.75,0.90"
+: "${RANK_METRICS:?missing RANK_METRICS}"             # e.g. "utility,ret_score"
+: "${LAMBDA_TAIL:?missing LAMBDA_TAIL}"               # e.g. "0.05"
+
+: "${GATE_MODES:=none,tail,utility,tail_utility}"     # default
+: "${MAX_LEVERAGE_PCT:=1.0}"                          # 1.0 => 100%
+: "${P_SUCCESS_MINS:=}"                               # optional. e.g. "0.45,0.55" or ""
+
+OUT_DIR="data/signals"
+mkdir -p "$OUT_DIR"
 
 PRED="scripts/predict_gate.py"
 SIM="scripts/simulate_single_position_engine.py"
@@ -16,102 +29,148 @@ if [ ! -f "$PRED" ]; then echo "[ERROR] $PRED not found"; exit 1; fi
 if [ ! -f "$SIM" ]; then echo "[ERROR] $SIM not found"; exit 1; fi
 if [ ! -f "$SUM" ]; then echo "[ERROR] $SUM not found"; exit 1; fi
 
-mkdir -p data/signals
-
-pt_tag=$(python - <<PY
+# tag e.g. pt10_h40_sl10_ex30
+pt_tag="$(python - <<PY
 pt=float("${PROFIT_TARGET}")
-h=int("${MAX_DAYS}")
+md=int("${MAX_DAYS}")
 sl=float("${STOP_LEVEL}")
 ex=int("${MAX_EXTEND_DAYS}")
-def fmt_pct(x): return str(int(round(x*100)))
-def fmt_negpct(x): return str(int(round(abs(x)*100)))
-print(f"pt{fmt_pct(pt)}_h{h}_sl{fmt_negpct(sl)}_ex{ex}")
+print(f"pt{int(round(pt*100)):02d}_h{md}_sl{int(round(abs(sl)*100)):02d}_ex{ex}")
 PY
-)
+)"
+TAG="$pt_tag"
+echo "[INFO] TAG=$TAG"
 
-f2tag() {
+# parse lists
+IFS=',' read -r -a tail_list <<< "${P_TAIL_THRESHOLDS}"
+IFS=',' read -r -a uq_list <<< "${UTILITY_QUANTILES}"
+IFS=',' read -r -a rank_list <<< "${RANK_METRICS}"
+IFS=',' read -r -a mode_list <<< "${GATE_MODES}"
+
+# p_success mins list (optional)
+if [ -n "${P_SUCCESS_MINS}" ]; then
+  IFS=',' read -r -a ps_list <<< "${P_SUCCESS_MINS}"
+else
+  ps_list=("NA")
+fi
+
+# helper: normalize number suffix e.g. 0.30 -> 0p30
+to_suffix_num () {
   python - <<PY
-s="${1}".strip()
-if s.startswith("."): s="0"+s
-if s.startswith("-."): s="-0"+s[1:]
-s=s.replace("-","m").replace(".","p")
-print(s)
+x=float("$1")
+s=f"{x:.4f}".rstrip("0").rstrip(".")
+print(s.replace(".","p").replace("-","m"))
 PY
 }
 
-csv_to_array() {
-  local s="${1}"
-  python - <<PY
-s="${s}"
-parts=[p.strip() for p in s.split(",") if p.strip()!=""]
-print("\n".join(parts))
-PY
-}
+for mode in "${mode_list[@]}"; do
+  mode="$(echo "$mode" | xargs)"
+  for t in "${tail_list[@]}"; do
+    t="$(echo "$t" | xargs)"
+    t_suf="$(to_suffix_num "$t")"
 
-echo "[RUN] TAG=$pt_tag"
-echo "[RUN] PT=$PROFIT_TARGET H=$MAX_DAYS SL=$STOP_LEVEL EX=$MAX_EXTEND_DAYS"
+    for uq in "${uq_list[@]}"; do
+      uq="$(echo "$uq" | xargs)"
+      uq_suf="$(to_suffix_num "$uq")"
 
-modes="$(csv_to_array "${GATE_MODES:-none,tail,utility,tail_utility}")"
-tails="$(csv_to_array "${P_TAIL_THRESHOLDS:-0.20,0.30}")"
-uqs="$(csv_to_array "${UTILITY_QUANTILES:-0.75,0.90}")"
-ranks="$(csv_to_array "${RANK_METRICS:-utility}")"
-psmins="$(csv_to_array "${P_SUCCESS_MINS:-0.0}")"
+      for rank_by in "${rank_list[@]}"; do
+        rank_by="$(echo "$rank_by" | xargs)"
 
-lambda_tail="${LAMBDA_TAIL:-0.05}"
+        for ps_min in "${ps_list[@]}"; do
+          ps_min="$(echo "$ps_min" | xargs)"
 
-for mode in $modes; do
-  for t in $tails; do
-    for q in $uqs; do
-      for r in $ranks; do
-        for ps in $psmins; do
-
-          ttag="$(f2tag "$t")"
-          qtag="$(f2tag "$q")"
-          pstag="$(f2tag "$ps")"
-          suffix="${mode}_t${ttag}_q${qtag}_r${r}_lam$(f2tag "$lambda_tail")_ps${pstag}"
+          # suffix: include p_success min only if enabled
+          if [ "$ps_min" = "NA" ]; then
+            SUFFIX="${mode}_t${t_suf}_q${uq_suf}_r${rank_by}"
+          else
+            ps_suf="$(to_suffix_num "$ps_min")"
+            SUFFIX="${mode}_t${t_suf}_q${uq_suf}_ps${ps_suf}_r${rank_by}"
+          fi
 
           echo "=============================="
-          echo "[RUN] mode=$mode tail_max=$t u_q=$q rank_by=$r lambda=$lambda_tail p_success_min=$ps"
-          echo "      suffix=$suffix"
+          echo "[RUN] mode=$mode tail_max=$t u_q=$uq rank_by=$rank_by p_success_min=$ps_min suffix=$SUFFIX"
           echo "=============================="
 
+          PICKS="${OUT_DIR}/picks_${TAG}_gate_${SUFFIX}.csv"
+          TRADES="${OUT_DIR}/sim_engine_trades_${TAG}_gate_${SUFFIX}.parquet"
+          CURVE="${OUT_DIR}/sim_engine_curve_${TAG}_gate_${SUFFIX}.parquet"
+
+          # ---- 1) predict_gate -> picks
+          # NOTE: predict_gate.py 자체는 p_success_min gate를 아직 “내장”해두지 않았으니,
+          #       여기서는 picks 생성 후 p_success_min 필터를 적용하는 방식으로 처리 (안전/확실)
           python "$PRED" \
             --profit-target "$PROFIT_TARGET" \
             --max-days "$MAX_DAYS" \
             --stop-level "$STOP_LEVEL" \
             --max-extend-days "$MAX_EXTEND_DAYS" \
             --mode "$mode" \
-            --tag "$pt_tag" \
-            --suffix "$suffix" \
+            --tag "$TAG" \
+            --suffix "$SUFFIX" \
+            --out-dir "$OUT_DIR" \
             --tail-threshold "$t" \
-            --utility-quantile "$q" \
-            --rank-by "$r" \
-            --lambda-tail "$lambda_tail" \
-            --p-success-min "$ps" \
-            --require-files "data/features/features_model.parquet,app/model.pkl,app/scaler.pkl"
+            --utility-quantile "$uq" \
+            --rank-by "$rank_by" \
+            --lambda-tail "$LAMBDA_TAIL" \
+            --require-files "data/features/features_model.parquet"
 
-          picks_path="data/signals/picks_${pt_tag}_gate_${suffix}.csv"
+          if [ ! -f "$PICKS" ]; then
+            echo "[ERROR] picks not created: $PICKS"
+            exit 1
+          fi
 
+          # ---- 1.5) apply p_success min filter (optional)
+          if [ "$ps_min" != "NA" ]; then
+            python - <<PY
+import pandas as pd
+from pathlib import Path
+p=Path("${PICKS}")
+df=pd.read_csv(p)
+if "p_success" not in df.columns:
+    # if no p_success, don't filter (but warn)
+    print("[WARN] p_success not found in picks -> skip p_success_min filtering")
+else:
+    before=len(df)
+    df=df[pd.to_numeric(df["p_success"], errors="coerce").fillna(0.0) >= float("${ps_min}")]
+    # keep 1 per day
+    if "Date" in df.columns:
+        df["Date"]=pd.to_datetime(df["Date"], errors="coerce")
+        df=df.sort_values(["Date","p_success"], ascending=[True,False]).drop_duplicates(["Date"], keep="first")
+    after=len(df)
+    print(f"[INFO] p_success_min applied: {before} -> {after} (min={ps_min})")
+    df.to_csv(p, index=False)
+PY
+          fi
+
+          # ---- 2) simulate_single_position_engine -> trades/curve
           python "$SIM" \
-            --picks-path "$picks_path" \
+            --picks-path "$PICKS" \
             --profit-target "$PROFIT_TARGET" \
             --max-days "$MAX_DAYS" \
             --stop-level "$STOP_LEVEL" \
             --max-extend-days "$MAX_EXTEND_DAYS" \
-            --max-leverage-pct "1.0" \
-            --out-dir "data/signals"
+            --max-leverage-pct "$MAX_LEVERAGE_PCT" \
+            --tag "$TAG" \
+            --suffix "$SUFFIX" \
+            --out-dir "$OUT_DIR"
 
-          trades_path="data/signals/sim_engine_trades_${pt_tag}_gate_${suffix}.parquet"
+          if [ ! -f "$TRADES" ] || [ ! -f "$CURVE" ]; then
+            echo "[ERROR] trades/curve not created for $SUFFIX"
+            echo "  trades=$TRADES exists? $(test -f "$TRADES" && echo yes || echo no)"
+            echo "  curve =$CURVE exists? $(test -f "$CURVE" && echo yes || echo no)"
+            exit 1
+          fi
 
+          # ---- 3) summarize (IMPORTANT: pass curve-path explicitly)
           python "$SUM" \
-            --trades-path "$trades_path" \
-            --tag "$pt_tag" \
-            --suffix "$suffix" \
+            --trades-path "$TRADES" \
+            --curve-path "$CURVE" \
+            --tag "$TAG" \
+            --suffix "$SUFFIX" \
             --profit-target "$PROFIT_TARGET" \
             --max-days "$MAX_DAYS" \
             --stop-level "$STOP_LEVEL" \
             --max-extend-days "$MAX_EXTEND_DAYS" \
-            --out-dir "data/signals"
+            --out-dir "$OUT_DIR"
 
         done
       done
@@ -119,4 +178,5 @@ for mode in $modes; do
   done
 done
 
-echo "[DONE] grid finished. outputs in data/signals"
+echo "[DONE] grid runs complete."
+ls -la "$OUT_DIR" | sed -n '1,200p' || true
