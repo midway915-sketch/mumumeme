@@ -193,6 +193,14 @@ def main() -> None:
     ap.add_argument("--tp1-frac", default=0.50, type=float)         # fraction to sell at PT
     ap.add_argument("--trail-stop", default=0.10, type=float)       # peak drawdown for trailing (0.08~0.12)
 
+    # ✅ compat only: run_grid_workflow.sh가 넘겨주는 인자(옵션B 제거했더라도 argparse 에러 방지)
+    ap.add_argument(
+        "--tp1-trail-unlimited",
+        default="true",
+        type=str,
+        help="compat only. ignored in this engine (trailing is effectively unlimited once TP1 occurs).",
+    )
+
     ap.add_argument("--topk", default=1, type=int)                  # 1 or 2
     ap.add_argument("--weights", default="1.0", type=str)           # "1.0" or "0.7,0.3" etc
 
@@ -209,6 +217,11 @@ def main() -> None:
     args = ap.parse_args()
 
     enable_trailing = str(args.enable_trailing).lower() in ("1", "true", "yes", "y")
+
+    # compat parse (unused)
+    tp1_trail_unlimited = str(args.tp1_trail_unlimited).lower() in ("1", "true", "yes", "y")
+    _ = tp1_trail_unlimited  # compat only
+
     topk = int(args.topk)
     if topk < 1 or topk > 2:
         raise ValueError("--topk should be 1 or 2")
