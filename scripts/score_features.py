@@ -15,7 +15,9 @@ FEATURE_DIR = DATA_DIR / "features"
 META_DIR = DATA_DIR / "meta"
 
 
+# ✅ build_features.py 기준(16) + (옵션) 섹터(2)
 DEFAULT_FEATURES = [
+    # base (9)
     "Drawdown_252",
     "Drawdown_60",
     "ATR_ratio",
@@ -24,6 +26,18 @@ DEFAULT_FEATURES = [
     "MA20_slope",
     "Market_Drawdown",
     "Market_ATR_ratio",
+    "ret_score",
+    # new (7)
+    "ret_5",
+    "ret_10",
+    "ret_20",
+    "breakout_20",
+    "vol_surge",
+    "trend_align",
+    "beta_60",
+    # optional sector (2)
+    "Sector_Ret_20",
+    "RelStrength",
 ]
 
 
@@ -211,18 +225,15 @@ def main() -> None:
         X_tau = feats_tau[tau_cols].to_numpy(dtype=float)
         X_tau_s = tau_scaler.transform(X_tau)
 
-        # predict class
         try:
             tau_class = tau_model.predict(X_tau_s)
             tau_class = np.asarray(tau_class).astype(int)
         except Exception:
-            # fallback: use proba argmax if available
             proba = tau_model.predict_proba(X_tau_s)
             tau_class = np.argmax(proba, axis=1).astype(int)
 
         feats["tau_class"] = tau_class.astype(int)
 
-        # also keep best-prob (optional but useful)
         try:
             proba = tau_model.predict_proba(X_tau_s)
             feats["tau_pmax"] = np.max(proba, axis=1).astype(float)
@@ -231,7 +242,6 @@ def main() -> None:
 
         feats["tau_H"] = feats["tau_class"].apply(lambda x: class_to_h(int(x), hmap)).astype(int)
     else:
-        # keep columns for downstream compatibility
         feats["tau_class"] = -1
         feats["tau_pmax"] = 0.0
         feats["tau_H"] = int(hmap[0]) if hmap else 40
