@@ -23,7 +23,9 @@ APP_DIR = Path("app")
 META_DIR = DATA_DIR / "meta"
 
 
+# ✅ build_features.py 기준(16) + (옵션) 섹터(2)
 DEFAULT_FEATURES = [
+    # base (9)
     "Drawdown_252",
     "Drawdown_60",
     "ATR_ratio",
@@ -32,6 +34,18 @@ DEFAULT_FEATURES = [
     "MA20_slope",
     "Market_Drawdown",
     "Market_ATR_ratio",
+    "ret_score",
+    # new (7)
+    "ret_5",
+    "ret_10",
+    "ret_20",
+    "breakout_20",
+    "vol_surge",
+    "trend_align",
+    "beta_60",
+    # optional sector (2)
+    "Sector_Ret_20",
+    "RelStrength",
 ]
 
 
