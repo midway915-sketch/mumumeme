@@ -4,8 +4,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+
+TAU_CLASS_TO_H = {0: 20, 1: 40, 2: 60}
 
 
 def read_table(parq: str, csv: str) -> pd.DataFrame:
@@ -67,9 +71,20 @@ class CycleState:
 
     seed: float = 0.0         # cash, can go negative
     entry_seed: float = 0.0   # S0 at entry
-    unit: float = 0.0         # daily buy budget = entry_seed / max_days
+
+    # dynamic H decided at entry (tau_H)
+    H: int = 0
+    unit: float = 0.0         # daily buy budget = entry_seed / H
     holding_days: int = 0
+
+    # extend / grace
+    pending_reval: bool = False
+    ret_H: float = np.nan
     extending: bool = False
+    grace_days_total: int = 0
+    grace_days_left: int = 0
+    recovery_threshold: float = np.nan  # return threshold (e.g. -0.05 means -5%)
+    reval_strength: str = ""            # FAIL/WEAK/STRONG
 
     max_leverage_pct: float = 0.0
     max_equity: float = 0.0
@@ -116,32 +131,76 @@ def parse_weights(weights: str, topk: int) -> list[float]:
     return [w / s for w in ws]
 
 
+def compute_cycle_return_today(st: CycleState, day_close: dict[str, float]) -> float:
+    rets = []
+    for leg in st.legs:
+        if leg.shares <= 0:
+            continue
+        px = day_close.get(leg.ticker, np.nan)
+        avg = leg.avg_price()
+        if np.isfinite(px) and np.isfinite(avg) and avg > 0:
+            rets.append((px - avg) / avg)
+    return float(np.mean(rets)) if rets else float("nan")
+
+
+def load_feat_map(features_parq: str, features_csv: str) -> pd.DataFrame:
+    p = Path(features_parq)
+    c = Path(features_csv)
+    if not p.exists() and not c.exists():
+        return pd.DataFrame()
+    df = read_table(str(p), str(c)).copy()
+    if "Date" not in df.columns or "Ticker" not in df.columns:
+        return pd.DataFrame()
+    df["Date"] = _norm_date(df["Date"])
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    keep = [x for x in ["Date", "Ticker", "p_success", "p_tail", "tau_H", "tau_class"] if x in df.columns]
+    df = df[keep].dropna(subset=["Date", "Ticker"]).drop_duplicates(subset=["Date", "Ticker"]).reset_index(drop=True)
+    df = df.set_index(["Date", "Ticker"], drop=True)
+    return df
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
             "Single-cycle engine with TopK (1~2), TP1 partial, trailing stop, leverage cap on ALL buys.\n"
-            "Lookahead-safe entry: use previous trading day's picks to trade today (T-1 signal -> T execution)."
+            "FINAL RULES:\n"
+            " - H decided by tau_H at entry (fallback to --max-days)\n"
+            " - at holding_days==H: set pending_reval, execute re-eval on T+1 using features_scored(p_success,p_tail)\n"
+            " - if reval fails => sell at T+1 close\n"
+            " - if reval passes => grace=min(H/4,15), DCA STOP during grace\n"
+            " - during grace: trailing has priority; TP1 legs ignore recovery-stop\n"
+            " - backtest last day: force close at close\n"
         )
     )
-    ap.add_argument("--picks-path", required=True, type=str, help="CSV with columns Date,Ticker (TopK rows/day).")
+
+    ap.add_argument("--picks-path", required=True, type=str, help="CSV with columns Date,Ticker (TopK rows/day). RankIdx optional.")
     ap.add_argument("--prices-parq", default="data/raw/prices.parquet", type=str)
     ap.add_argument("--prices-csv", default="data/raw/prices.csv", type=str)
 
+    ap.add_argument("--features-scored-parq", default="data/features/features_scored.parquet", type=str)
+    ap.add_argument("--features-scored-csv", default="data/features/features_scored.csv", type=str)
+
     ap.add_argument("--initial-seed", default=40_000_000, type=float)
 
-    ap.add_argument("--profit-target", required=True, type=float)
-    ap.add_argument("--max-days", required=True, type=int)
-    ap.add_argument("--stop-level", required=True, type=float)
-    ap.add_argument("--max-extend-days", required=True, type=int)
+    ap.add_argument("--profit-target", required=True, type=float)   # PT (e.g. 0.10)
+    ap.add_argument("--max-days", required=True, type=int)          # fallback H if tau missing
+    ap.add_argument("--stop-level", required=True, type=float)      # legacy (used only for metadata)
+    ap.add_argument("--max-extend-days", required=True, type=int)   # legacy (used only for metadata)
 
-    ap.add_argument("--max-leverage-pct", default=1.0, type=float)
+    ap.add_argument("--max-leverage-pct", default=1.0, type=float)  # 1.0 => 100%
 
     ap.add_argument("--enable-trailing", default="true", type=str)
-    ap.add_argument("--tp1-frac", default=0.50, type=float)
-    ap.add_argument("--trail-stop", default=0.10, type=float)
+    ap.add_argument("--tp1-frac", default=0.50, type=float)         # fraction to sell at PT
+    ap.add_argument("--trail-stop", default=0.10, type=float)       # peak drawdown for trailing (0.08~0.12)
 
-    ap.add_argument("--topk", default=1, type=int)
-    ap.add_argument("--weights", default="1.0", type=str)
+    ap.add_argument("--topk", default=1, type=int)                  # 1 or 2
+    ap.add_argument("--weights", default="1.0", type=str)           # "1.0" or "0.7,0.3" etc
+
+    # re-eval thresholds
+    ap.add_argument("--reval-ps-strong", default=0.70, type=float)
+    ap.add_argument("--reval-pt-strong", default=0.20, type=float)
+    ap.add_argument("--reval-ps-pass", default=0.60, type=float)
+    ap.add_argument("--reval-pt-pass", default=0.35, type=float)
 
     ap.add_argument("--tag", default="", type=str)
     ap.add_argument("--suffix", default="", type=str)
@@ -158,7 +217,10 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---------- picks
+    # load features_scored map (for tau + reval)
+    feat_map = load_feat_map(args.features_scored_parq, args.features_scored_csv)
+
+    # load picks
     picks_path = Path(args.picks_path)
     if not picks_path.exists():
         raise FileNotFoundError(f"Missing picks file: {picks_path}")
@@ -171,13 +233,11 @@ def main() -> None:
     picks["Date"] = _norm_date(picks["Date"])
     picks["Ticker"] = picks["Ticker"].astype(str).str.upper().str.strip()
     picks = picks.dropna(subset=["Date", "Ticker"]).sort_values(["Date"]).reset_index(drop=True)
+
+    # keep TopK per day (in case input contains more)
     picks = picks.groupby("Date", group_keys=False).head(topk).reset_index(drop=True)
 
-    picks_by_date: dict[pd.Timestamp, list[str]] = {}
-    for d, g in picks.groupby("Date"):
-        picks_by_date[d] = g["Ticker"].tolist()
-
-    # ---------- prices
+    # load prices
     prices = read_table(args.prices_parq, args.prices_csv).copy()
     if "Date" not in prices.columns or "Ticker" not in prices.columns:
         raise ValueError("prices must have Date,Ticker")
@@ -188,11 +248,15 @@ def main() -> None:
             raise ValueError(f"prices missing {c}")
     prices = prices.dropna(subset=["Date", "Ticker", "Close"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
+    # date -> list[tickers] picks
+    picks_by_date: dict[pd.Timestamp, list[str]] = {}
+    for d, g in picks.groupby("Date"):
+        picks_by_date[d] = g["Ticker"].tolist()
+
     grouped = prices.groupby("Date", sort=True)
     all_dates = list(grouped.groups.keys())
-    all_dates = [pd.Timestamp(d) for d in all_dates]
+    last_date = all_dates[-1] if all_dates else None
 
-    # ---------- state
     st = CycleState(
         seed=float(args.initial_seed),
         max_equity=float(args.initial_seed),
@@ -201,36 +265,44 @@ def main() -> None:
     )
 
     cooldown_today = False
-    trades: list[dict] = []
-    curve: list[dict] = []
+    trades = []
+    curve = []
 
-    def close_cycle(exit_date: pd.Timestamp, day_prices_close: dict[str, float], reason: str) -> None:
-        nonlocal cooldown_today, st, trades
+    def liquidate_all_legs(day_prices_close: dict[str, float]) -> tuple[float, float]:
         proceeds = 0.0
         invested_total = 0.0
-
         for leg in st.legs:
             px = float(day_prices_close.get(leg.ticker, np.nan))
             if not np.isfinite(px) or px <= 0:
                 continue
             proceeds += leg.shares * px
             invested_total += leg.invested
+        return proceeds, invested_total
+
+    def close_cycle(exit_date: pd.Timestamp, day_prices_close: dict[str, float], reason: str) -> None:
+        nonlocal cooldown_today, st, trades
+        proceeds, invested_total = liquidate_all_legs(day_prices_close)
 
         cycle_return = (proceeds - invested_total) / invested_total if invested_total > 0 else np.nan
         win = int(cycle_return > 0) if np.isfinite(cycle_return) else 0
 
         trades.append({
+            "CycleType": "MAIN",
             "EntryDate": st.entry_date,
             "ExitDate": exit_date,
             "Tickers": ",".join([l.ticker for l in st.legs]),
             "Weights": ",".join([f"{l.weight:.4f}" for l in st.legs]),
             "EntrySeed": st.entry_seed,
+            "H": int(st.H),
             "ProfitTarget": args.profit_target,
             "TP1_Frac": float(args.tp1_frac),
             "TrailStop": float(args.trail_stop) if enable_trailing else np.nan,
-            "MaxDays": args.max_days,
-            "StopLevel": args.stop_level,
-            "MaxExtendDaysParam": args.max_extend_days,
+            "MaxDaysInput": int(args.max_days),
+            "StopLevelInput": float(args.stop_level),
+            "MaxExtendDaysInput": int(args.max_extend_days),
+            "GraceDays": int(st.grace_days_total),
+            "RevalStrength": st.reval_strength,
+            "RecoveryThreshold": float(st.recovery_threshold) if np.isfinite(st.recovery_threshold) else np.nan,
             "MaxLeveragePctCap": args.max_leverage_pct,
             "MaxLeveragePct": st.max_leverage_pct,
             "Invested": invested_total,
@@ -245,28 +317,67 @@ def main() -> None:
 
         st.seed += proceeds
 
+        # reset cycle
         st.in_cycle = False
         st.entry_date = None
         st.entry_seed = 0.0
+        st.H = 0
         st.unit = 0.0
         st.holding_days = 0
+
+        st.pending_reval = False
+        st.ret_H = np.nan
         st.extending = False
+        st.grace_days_total = 0
+        st.grace_days_left = 0
+        st.recovery_threshold = np.nan
+        st.reval_strength = ""
+
         st.max_leverage_pct = 0.0
         st.legs = []
 
         cooldown_today = True
 
-    # ---------- simulate (IMPORTANT: T-1 picks -> T execution)
-    prev_date: pd.Timestamp | None = None
+    def reval_strength_for_day(date: pd.Timestamp) -> tuple[str, float, float]:
+        """
+        Return (strength, p_success_mean, p_tail_mean) based on features_scored at T+1.
+        If missing -> FAIL.
+        """
+        if feat_map.empty:
+            return "FAIL", 0.0, 1.0
 
+        ps = []
+        pt = []
+        for leg in st.legs:
+            try:
+                row = feat_map.loc[(date, leg.ticker)]
+            except Exception:
+                continue
+            if "p_success" in row.index:
+                ps.append(float(row["p_success"]))
+            if "p_tail" in row.index:
+                pt.append(float(row["p_tail"]))
+
+        if not ps or not pt:
+            return "FAIL", float(np.mean(ps)) if ps else 0.0, float(np.mean(pt)) if pt else 1.0
+
+        ps_m = float(np.mean(ps))
+        pt_m = float(np.mean(pt))
+
+        if ps_m >= float(args.reval_ps_strong) and pt_m <= float(args.reval_pt_strong):
+            return "STRONG", ps_m, pt_m
+        if ps_m >= float(args.reval_ps_pass) and pt_m <= float(args.reval_pt_pass):
+            return "WEAK", ps_m, pt_m
+        return "FAIL", ps_m, pt_m
+
+    # simulate
     for date, day_df in grouped:
-        date = pd.Timestamp(date)
         day_df = day_df.set_index("Ticker", drop=False)
         cooldown_today = False
 
-        day_prices_close: dict[str, float] = {}
-        day_prices_high: dict[str, float] = {}
-        day_prices_low: dict[str, float] = {}
+        day_prices_close = {}
+        day_prices_high = {}
+        day_prices_low = {}
 
         for t in day_df.index:
             r = day_df.loc[t]
@@ -274,68 +385,121 @@ def main() -> None:
             day_prices_high[t] = float(r["High"])
             day_prices_low[t] = float(r["Low"])
 
-        # ----- in cycle: update exits + buys
+        # ----- in cycle: update
         if st.in_cycle:
             st.holding_days += 1
 
-            # 1) TP1 + trailing per leg
-            if enable_trailing:
-                for leg in st.legs:
-                    if leg.ticker not in day_df.index:
-                        continue
-                    high_px = day_prices_high[leg.ticker]
-                    low_px = day_prices_low[leg.ticker]
-                    avg = leg.avg_price()
+            # (0) pending re-eval executes on T+1 (same day close execution)
+            if st.pending_reval:
+                strength, ps_m, pt_m = reval_strength_for_day(date)
+                st.reval_strength = strength
 
-                    # TP1 trigger (intraday high touches)
-                    if (not leg.tp1_done) and np.isfinite(avg) and high_px >= avg * (1.0 + float(args.profit_target)):
-                        tp_px = avg * (1.0 + float(args.profit_target))
-                        sell_shares = leg.shares * float(args.tp1_frac)
-                        sell_shares = float(min(leg.shares, max(0.0, sell_shares)))
-                        proceeds = sell_shares * tp_px
+                if strength == "FAIL":
+                    close_cycle(date, day_prices_close, reason=f"REVAL_FAIL(ps={ps_m:.3f},pt={pt_m:.3f})")
+                else:
+                    # enter grace mode
+                    st.extending = True
+                    st.pending_reval = False
 
-                        leg.shares -= sell_shares
-                        leg.invested *= (leg.shares / (leg.shares + sell_shares)) if (leg.shares + sell_shares) > 0 else 0.0
+                    st.grace_days_total = int(min(max(1, st.H // 4), 15))
+                    st.grace_days_left = int(st.grace_days_total)
 
-                        st.seed += proceeds
-                        leg.tp1_done = True
-                        leg.peak = float(max(high_px, tp_px))
-                        st.update_lev(float(args.max_leverage_pct))
-
-                    # trailing stop after TP1
-                    if leg.tp1_done and leg.shares > 0:
-                        if high_px > leg.peak:
-                            leg.peak = float(high_px)
-                        stop_px = leg.peak * (1.0 - float(args.trail_stop))
-                        if np.isfinite(low_px) and low_px <= stop_px:
-                            proceeds = leg.shares * stop_px
-                            st.seed += proceeds
-                            leg.shares = 0.0
-                            leg.invested = 0.0
-
-            # 2) if all legs emptied -> close cycle today
-            if st.in_cycle and all((leg.shares <= 0 for leg in st.legs)):
-                close_cycle(date, day_prices_close, reason="TRAIL_EXIT_ALL")
-
-            # 3) max_days decision (only if still holding)
-            if st.in_cycle:
-                if st.holding_days >= int(args.max_days) and (not st.extending):
-                    rets = []
-                    for leg in st.legs:
-                        if leg.ticker in day_df.index and leg.shares > 0:
-                            avg = leg.avg_price()
-                            px = day_prices_close[leg.ticker]
-                            if np.isfinite(avg) and avg > 0:
-                                rets.append((px - avg) / avg)
-                    cur_ret = float(np.mean(rets)) if rets else -np.inf
-
-                    if cur_ret >= float(args.stop_level):
-                        close_cycle(date, day_prices_close, reason="MAXDAY_CLOSE")
+                    # hybrid threshold
+                    # STRONG -> max(ret_H+0.05, -0.05)
+                    # WEAK   -> min(ret_H+0.05, -0.05)
+                    base = float(st.ret_H) + 0.05 if np.isfinite(st.ret_H) else -0.05
+                    if strength == "STRONG":
+                        st.recovery_threshold = float(max(base, -0.05))
                     else:
-                        st.extending = True
+                        st.recovery_threshold = float(min(base, -0.05))
 
-            # 4) buys (DCA), leverage cap applies ALWAYS
+            # if cycle got closed by reval, skip rest
             if st.in_cycle:
+                # 1) TP1 + trailing per leg (priority)
+                if enable_trailing:
+                    for leg in st.legs:
+                        if leg.ticker not in day_df.index:
+                            continue
+                        high_px = day_prices_high[leg.ticker]
+                        low_px = day_prices_low[leg.ticker]
+                        avg = leg.avg_price()
+
+                        # TP1
+                        if (not leg.tp1_done) and np.isfinite(avg) and high_px >= avg * (1.0 + float(args.profit_target)):
+                            tp_px = avg * (1.0 + float(args.profit_target))
+                            sell_shares = leg.shares * float(args.tp1_frac)
+                            sell_shares = float(min(leg.shares, max(0.0, sell_shares)))
+                            proceeds = sell_shares * tp_px
+
+                            leg.shares -= sell_shares
+                            leg.invested *= (leg.shares / (leg.shares + sell_shares)) if (leg.shares + sell_shares) > 0 else 0.0
+
+                            st.seed += proceeds
+                            leg.tp1_done = True
+                            leg.peak = float(max(high_px, tp_px))
+
+                            st.update_lev(float(args.max_leverage_pct))
+
+                        # trailing after TP1
+                        if leg.tp1_done and leg.shares > 0:
+                            if high_px > leg.peak:
+                                leg.peak = float(high_px)
+                            stop_px = leg.peak * (1.0 - float(args.trail_stop))
+                            if np.isfinite(low_px) and low_px <= stop_px:
+                                proceeds = leg.shares * stop_px
+                                st.seed += proceeds
+                                leg.shares = 0.0
+                                leg.invested = 0.0
+
+                # 2) if all legs emptied -> close
+                if st.in_cycle and all((leg.shares <= 0 for leg in st.legs)):
+                    close_cycle(date, day_prices_close, reason="TRAIL_EXIT_ALL")
+
+            # 3) H reached: set pending_reval (but only if no TP1 triggered)
+            if st.in_cycle and (not st.extending) and (not st.pending_reval):
+                any_tp1 = any((leg.tp1_done for leg in st.legs))
+                if (not any_tp1) and (st.H > 0) and (st.holding_days >= st.H):
+                    st.ret_H = compute_cycle_return_today(st, day_prices_close)
+                    st.pending_reval = True
+                    # NOTE: decision is executed on T+1 (next loop date)
+
+            # 4) Grace mode: DCA STOP, apply recovery-stop for non-TP1 legs only
+            if st.in_cycle and st.extending:
+                # decrement grace only when we're in grace AND still no TP1 anywhere
+                any_tp1 = any((leg.tp1_done for leg in st.legs))
+                if not any_tp1:
+                    st.grace_days_left = max(0, int(st.grace_days_left) - 1)
+
+                    # recovery-stop check (close-based)
+                    thr = float(st.recovery_threshold) if np.isfinite(st.recovery_threshold) else -0.05
+                    hit = False
+                    for leg in st.legs:
+                        if leg.shares <= 0:
+                            continue
+                        # TP1 legs ignore recovery-stop
+                        if leg.tp1_done:
+                            continue
+                        px = day_prices_close.get(leg.ticker, np.nan)
+                        avg = leg.avg_price()
+                        if np.isfinite(px) and np.isfinite(avg) and avg > 0:
+                            r = (px - avg) / avg
+                            if r >= thr:
+                                hit = True
+                                break
+
+                    if hit:
+                        close_cycle(date, day_prices_close, reason="GRACE_RECOVERY_EXIT")
+                    else:
+                        # grace end => close (only if still no TP1)
+                        if st.in_cycle and st.grace_days_left <= 0:
+                            close_cycle(date, day_prices_close, reason="GRACE_END_EXIT")
+
+                # if TP1 exists, trailing regime continues without grace closing
+                if st.in_cycle:
+                    st.update_dd(day_prices_close)
+
+            # 5) Normal mode DCA (only when not extending and no pending reval)
+            if st.in_cycle and (not st.extending) and (not st.pending_reval):
                 all_tp1 = all((leg.tp1_done for leg in st.legs))
                 if not all_tp1:
                     desired_total = float(st.unit)
@@ -349,14 +513,14 @@ def main() -> None:
                         avg = leg.avg_price()
                         desired_leg = desired_total * float(leg.weight)
 
-                        if not st.extending:
-                            if np.isfinite(avg) and avg > 0:
-                                if close_px <= avg:
-                                    pass
-                                elif close_px <= avg * 1.05:
-                                    desired_leg = desired_leg / 2.0
-                                else:
-                                    desired_leg = 0.0
+                        # buy rule: only <=avg, soften in near zone
+                        if np.isfinite(avg) and avg > 0:
+                            if close_px <= avg:
+                                pass
+                            elif close_px <= avg * 1.05:
+                                desired_leg = desired_leg / 2.0
+                            else:
+                                desired_leg = 0.0
 
                         invest = clamp_invest_by_leverage(st.seed, st.entry_seed, desired_leg, float(args.max_leverage_pct))
                         if invest > 0:
@@ -365,25 +529,35 @@ def main() -> None:
                             leg.shares += invest / close_px
                             st.update_lev(float(args.max_leverage_pct))
 
-            # update dd
-            if st.in_cycle:
                 st.update_dd(day_prices_close)
-            else:
-                st.update_dd({})
 
-        # ----- entry: NOT in cycle and NOT cooldown
-        # IMPORTANT: use prev_date picks to enter today (T-1 signal -> T execution)
-        if (not st.in_cycle) and (not cooldown_today) and (prev_date is not None):
-            picks_prev = picks_by_date.get(prev_date, [])
-            if picks_prev:
-                valid = [t for t in picks_prev if t in day_df.index and np.isfinite(day_prices_close.get(t, np.nan))]
+        # ----- entry: not in cycle and not cooldown day
+        if (not st.in_cycle) and (not cooldown_today):
+            picks_today = picks_by_date.get(date, [])
+            if picks_today:
+                valid = [t for t in picks_today if t in day_df.index and np.isfinite(day_prices_close.get(t, np.nan))]
                 if len(valid) >= 1:
                     chosen = valid[:topk]
 
-                    S0 = float(st.seed)
-                    unit = (S0 / float(args.max_days)) if args.max_days > 0 else 0.0
+                    # decide H from tau_H (use max across legs); fallback to args.max_days
+                    Hs = []
+                    if not feat_map.empty:
+                        for t in chosen:
+                            try:
+                                row = feat_map.loc[(date, t)]
+                                if "tau_H" in row.index:
+                                    hh = int(row["tau_H"])
+                                    if hh > 0:
+                                        Hs.append(hh)
+                            except Exception:
+                                pass
+                    H_eff = int(max(Hs)) if Hs else int(args.max_days)
+                    H_eff = int(max(1, H_eff))
 
-                    legs: list[Leg] = []
+                    S0 = float(st.seed)
+                    unit = (S0 / float(H_eff)) if H_eff > 0 else 0.0
+
+                    legs = []
                     for i, t in enumerate(chosen):
                         legs.append(Leg(ticker=t, weight=float(weights[i])))
 
@@ -400,17 +574,27 @@ def main() -> None:
 
                     if invested_total > 0:
                         st.in_cycle = True
-                        st.entry_date = date  # execution date
+                        st.entry_date = date
                         st.entry_seed = S0
+                        st.H = int(H_eff)
                         st.unit = float(unit)
                         st.holding_days = 1
+
+                        st.pending_reval = False
+                        st.ret_H = np.nan
                         st.extending = False
+                        st.grace_days_total = 0
+                        st.grace_days_left = 0
+                        st.recovery_threshold = np.nan
+                        st.reval_strength = ""
+
                         st.max_leverage_pct = 0.0
                         st.legs = legs
+
                         st.update_lev(float(args.max_leverage_pct))
                         st.update_dd(day_prices_close)
 
-        # ----- record curve
+        # ----- record curve (mark-to-close)
         prices_for_eq = day_prices_close if st.in_cycle else {}
         eq = st.equity(prices_for_eq)
 
@@ -421,12 +605,19 @@ def main() -> None:
             "InCycle": int(st.in_cycle),
             "Tickers": ",".join([l.ticker for l in st.legs]) if st.in_cycle else "",
             "HoldingDays": st.holding_days if st.in_cycle else 0,
-            "Extending": int(st.extending) if st.in_cycle else 0,
+            "H": int(st.H) if st.in_cycle else 0,
+            "PendingReval": int(st.pending_reval),
+            "Extending": int(st.extending),
+            "GraceLeft": int(st.grace_days_left),
+            "RevalStrength": st.reval_strength,
+            "RecoveryThreshold": float(st.recovery_threshold) if np.isfinite(st.recovery_threshold) else np.nan,
             "MaxLeveragePctCycle": st.max_leverage_pct if st.in_cycle else 0.0,
             "MaxDrawdownPortfolio": st.max_dd,
         })
 
-        prev_date = date
+        # ----- force close on last day (after recording curve)
+        if last_date is not None and date == last_date and st.in_cycle:
+            close_cycle(date, day_prices_close, reason="FINAL_CLOSE")
 
     trades_df = pd.DataFrame(trades)
     curve_df = pd.DataFrame(curve)
