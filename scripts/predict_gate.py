@@ -4,42 +4,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 
-def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
 
-    # Date가 인덱스에 들어간 경우 -> 컬럼으로 복구
-    if "Date" not in out.columns:
-        idx_name = (out.index.name or "").lower()
-        if idx_name in ("date", "datetime", "timestamp"):
-            out = out.reset_index()
-
-    # 대소문자/대체이름을 Date/Ticker로 통일
-    colmap = {c.lower(): c for c in out.columns}
-
-    if "date" in colmap and "Date" not in out.columns:
-        out = out.rename(columns={colmap["date"]: "Date"})
-    if "datetime" in colmap and "Date" not in out.columns:
-        out = out.rename(columns={colmap["datetime"]: "Date"})
-    if "timestamp" in colmap and "Date" not in out.columns:
-        out = out.rename(columns={colmap["timestamp"]: "Date"})
-
-    if "ticker" in colmap and "Ticker" not in out.columns:
-        out = out.rename(columns={colmap["ticker"]: "Ticker"})
-    if "symbol" in colmap and "Ticker" not in out.columns:
-        out = out.rename(columns={colmap["symbol"]: "Ticker"})
-
-    if "Date" not in out.columns:
-        raise KeyError(f"Date column missing. columns(head)={list(out.columns)[:30]} index.name={out.index.name}")
-    if "Ticker" not in out.columns:
-        raise KeyError(f"Ticker column missing. columns(head)={list(out.columns)[:30]} index.name={out.index.name}")
-
-    return out
-
+# ----------------------------
+# IO helpers
+# ----------------------------
 def read_table(parq_path: Path, csv_path: Path) -> pd.DataFrame:
     if parq_path.exists():
         return pd.read_parquet(parq_path)
@@ -64,22 +37,55 @@ def parse_require_files(s: str) -> List[Path]:
     return [Path(p) for p in parts]
 
 
-def pick_features_source(require_files: List[Path]) -> tuple[Path, Path]:
-    """
-    Prefer features_scored if present in require_files, else fallback to features_model.
-    Return (parq_path, csv_path) candidates (one of them must exist or later fallback will try).
-    """
-    # 1) if require_files includes a features_scored parquet/csv, honor it
-    for p in require_files:
-        name = p.name
-        if "features_scored" in name and (name.endswith(".parquet") or name.endswith(".csv")):
-            if name.endswith(".parquet"):
-                return p, p.with_suffix(".csv")
-            else:
-                return p.with_suffix(".parquet"), p
+def ensure_required_files_exist(require_files: List[Path]) -> None:
+    missing = [str(p) for p in require_files if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing required files: {missing}")
 
-    # 2) default paths
-    return Path("data/features/features_scored.parquet"), Path("data/features/features_scored.csv")
+
+# ----------------------------
+# Column normalization
+# ----------------------------
+def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make sure df has 'Date' and 'Ticker' as columns.
+    - If Date is index, reset_index
+    - If columns are 'date'/'datetime'/'timestamp', rename to 'Date'
+    - If columns are 'ticker'/'symbol', rename to 'Ticker'
+    """
+    out = df.copy()
+
+    # Date might be index
+    idxn = (out.index.name or "").lower()
+    if "Date" not in out.columns and idxn in ("date", "datetime", "timestamp"):
+        out = out.reset_index()
+
+    colmap = {c.lower(): c for c in out.columns}
+
+    # Date candidates
+    if "date" in colmap and "Date" not in out.columns:
+        out = out.rename(columns={colmap["date"]: "Date"})
+    if "datetime" in colmap and "Date" not in out.columns:
+        out = out.rename(columns={colmap["datetime"]: "Date"})
+    if "timestamp" in colmap and "Date" not in out.columns:
+        out = out.rename(columns={colmap["timestamp"]: "Date"})
+
+    # Ticker candidates
+    if "ticker" in colmap and "Ticker" not in out.columns:
+        out = out.rename(columns={colmap["ticker"]: "Ticker"})
+    if "symbol" in colmap and "Ticker" not in out.columns:
+        out = out.rename(columns={colmap["symbol"]: "Ticker"})
+
+    if "Date" not in out.columns:
+        raise KeyError(
+            f"Date column missing. cols(head)={list(out.columns)[:30]} index.name={out.index.name}"
+        )
+    if "Ticker" not in out.columns:
+        raise KeyError(
+            f"Ticker column missing. cols(head)={list(out.columns)[:30]} index.name={out.index.name}"
+        )
+
+    return out
 
 
 def apply_exclude_tickers(df: pd.DataFrame, exclude_csv: str) -> pd.DataFrame:
@@ -89,6 +95,28 @@ def apply_exclude_tickers(df: pd.DataFrame, exclude_csv: str) -> pd.DataFrame:
     return df[~df["Ticker"].isin(ex)].copy()
 
 
+# ----------------------------
+# Features source selection
+# ----------------------------
+def pick_features_source(require_files: List[Path]) -> Tuple[Path, Path]:
+    """
+    Prefer features_scored if present in require_files.
+    Otherwise default to scored path; caller will fallback to features_model if not found.
+    Returns (parq_candidate, csv_candidate)
+    """
+    for p in require_files:
+        name = p.name
+        if "features_scored" in name and (name.endswith(".parquet") or name.endswith(".csv")):
+            if name.endswith(".parquet"):
+                return p, p.with_suffix(".csv")
+            return p.with_suffix(".parquet"), p
+
+    return Path("data/features/features_scored.parquet"), Path("data/features/features_scored.csv")
+
+
+# ----------------------------
+# Utility / gating / ranking
+# ----------------------------
 def build_utility(df: pd.DataFrame, lambda_tail: float) -> pd.Series:
     # utility = ret_score - lambda * p_tail
     ret = coerce_num(df, "ret_score", 0.0)
@@ -137,10 +165,14 @@ def gate_filter(
     raise ValueError(f"Unknown mode: {mode} (expected none|tail|utility|tail_utility)")
 
 
-def rank_and_topk(df: pd.DataFrame, rank_by: str, topk: int) -> pd.DataFrame:
-    rb = (rank_by or "utility").strip().lower()
-    d = df.copy()
+def rank_topk_per_day(df: pd.DataFrame, rank_by: str, topk: int) -> pd.DataFrame:
+    # extra safety: Date could become index after groupby/apply in some edge cases
+    d = ensure_date_ticker_columns(df)
 
+    if d.empty:
+        return d
+
+    rb = (rank_by or "utility").strip().lower()
     if rb == "utility":
         metric = d["utility"]
     elif rb == "ret_score":
@@ -162,12 +194,9 @@ def rank_and_topk(df: pd.DataFrame, rank_by: str, topk: int) -> pd.DataFrame:
     return picks
 
 
-def ensure_required_files_exist(require_files: List[Path]) -> None:
-    missing = [str(p) for p in require_files if not p.exists()]
-    if missing:
-        raise FileNotFoundError(f"Missing required files: {missing}")
-
-
+# ----------------------------
+# main
+# ----------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(description="Gate picks generator (reads features_scored if available).")
 
@@ -201,7 +230,7 @@ def main() -> None:
     require_files = parse_require_files(args.require_files)
     ensure_required_files_exist(require_files)
 
-    # decide which features file to read
+    # decide which features file to read (prefer scored)
     f_parq, f_csv = pick_features_source(require_files)
 
     # fallback: if scored not found, try features_model
@@ -212,23 +241,25 @@ def main() -> None:
     feats = read_table(f_parq, f_csv).copy()
     features_src = str(f_parq) if f_parq.exists() else str(f_csv)
 
-    # --- normalize Date/Ticker even if names differ or Date is index
+    # normalize Date/Ticker robustly
     feats = ensure_date_ticker_columns(feats)
 
     feats["Date"] = norm_date(feats["Date"])
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
-    # ensure key columns exist
+
+    # ensure key columns exist (if missing, filled with 0)
     feats["p_success"] = coerce_num(feats, "p_success", 0.0)
     feats["p_tail"] = coerce_num(feats, "p_tail", 0.0)
     feats["ret_score"] = coerce_num(feats, "ret_score", 0.0)
 
+    # exclude tickers
     feats = apply_exclude_tickers(feats, args.exclude_tickers)
 
-    # base filter: ps_min
+    # base filter: ps_min (always applied)
     feats = feats[feats["p_success"] >= float(args.ps_min)].copy()
 
-    # utility column
+    # utility
     feats["utility"] = build_utility(feats, float(args.lambda_tail))
 
     # gate
@@ -240,20 +271,16 @@ def main() -> None:
     )
 
     # rank + topk per day
-    picks = rank_and_topk(gated, rank_by=args.rank_by, topk=int(args.topk))
+    picks = rank_topk_per_day(gated, rank_by=args.rank_by, topk=int(args.topk))
 
-    # output path MUST match run_grid_workflow.sh
+    # output paths MUST match run_grid_workflow.sh
     picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
     meta_path = out_dir / f"picks_meta_{args.tag}_gate_{args.suffix}.json"
 
-    # Keep columns simple & stable for simulator
-    keep_cols = []
-    for c in ["Date", "Ticker", "p_success", "p_tail", "ret_score", "utility"]:
-        if c in picks.columns:
-            keep_cols.append(c)
+    # keep stable columns for simulator
+    keep_cols = [c for c in ["Date", "Ticker", "p_success", "p_tail", "ret_score", "utility"] if c in picks.columns]
     picks_out = picks[keep_cols].copy()
 
-    # write CSV
     picks_out.to_csv(picks_path, index=False)
 
     meta = {
