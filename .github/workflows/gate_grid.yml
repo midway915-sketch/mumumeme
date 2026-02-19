@@ -227,16 +227,16 @@ jobs:
           fi
 
           # 4a) strategy_raw_data_{tag} (Tail 포함)
-          EX_TAG="pt$(python - <<'PY'
+          EX_TAG="pt$(python - <<PY
           pt=float("$PROFIT_TARGET")
           print(int(round(pt*100)))
           PY
-          )_h${MAX_DAYS}_sl$(python - <<'PY'
+          )_h${MAX_DAYS}_sl$(python - <<PY
           sl=float("$STOP_LEVEL")
           print(int(round(abs(sl)*100)))
           PY
           )_ex${MAX_EXTEND_DAYS}"
-
+          
           if [ ! -f "data/labels/strategy_raw_data_${EX_TAG}.parquet" ] && [ ! -f "data/labels/strategy_raw_data_${EX_TAG}.csv" ]; then
             python scripts/build_strategy_labels.py \
               --profit-target "$PROFIT_TARGET" \
