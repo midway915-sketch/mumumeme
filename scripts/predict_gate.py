@@ -9,6 +9,36 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
+def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # Date가 인덱스에 들어간 경우 -> 컬럼으로 복구
+    if "Date" not in out.columns:
+        idx_name = (out.index.name or "").lower()
+        if idx_name in ("date", "datetime", "timestamp"):
+            out = out.reset_index()
+
+    # 대소문자/대체이름을 Date/Ticker로 통일
+    colmap = {c.lower(): c for c in out.columns}
+
+    if "date" in colmap and "Date" not in out.columns:
+        out = out.rename(columns={colmap["date"]: "Date"})
+    if "datetime" in colmap and "Date" not in out.columns:
+        out = out.rename(columns={colmap["datetime"]: "Date"})
+    if "timestamp" in colmap and "Date" not in out.columns:
+        out = out.rename(columns={colmap["timestamp"]: "Date"})
+
+    if "ticker" in colmap and "Ticker" not in out.columns:
+        out = out.rename(columns={colmap["ticker"]: "Ticker"})
+    if "symbol" in colmap and "Ticker" not in out.columns:
+        out = out.rename(columns={colmap["symbol"]: "Ticker"})
+
+    if "Date" not in out.columns:
+        raise KeyError(f"Date column missing. columns(head)={list(out.columns)[:30]} index.name={out.index.name}")
+    if "Ticker" not in out.columns:
+        raise KeyError(f"Ticker column missing. columns(head)={list(out.columns)[:30]} index.name={out.index.name}")
+
+    return out
 
 def read_table(parq_path: Path, csv_path: Path) -> pd.DataFrame:
     if parq_path.exists():
@@ -182,13 +212,12 @@ def main() -> None:
     feats = read_table(f_parq, f_csv).copy()
     features_src = str(f_parq) if f_parq.exists() else str(f_csv)
 
-    if "Date" not in feats.columns or "Ticker" not in feats.columns:
-        raise ValueError("features file must include Date and Ticker columns")
+    # --- normalize Date/Ticker even if names differ or Date is index
+    feats = ensure_date_ticker_columns(feats)
 
     feats["Date"] = norm_date(feats["Date"])
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
-
     # ensure key columns exist
     feats["p_success"] = coerce_num(feats, "p_success", 0.0)
     feats["p_tail"] = coerce_num(feats, "p_tail", 0.0)
