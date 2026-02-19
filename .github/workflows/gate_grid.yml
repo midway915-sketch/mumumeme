@@ -8,7 +8,7 @@ on:
         required: true
         default: "0.10"
       max_days:
-        description: "max holding days (H) (e.g. 40)"
+        description: "max holding days H (e.g. 40)"
         required: true
         default: "40"
       stop_level:
@@ -78,21 +78,12 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      - name: Set env keys
+      - name: Set env keys (LABEL_KEY + PRICE_START + MAX_EXTEND_DAYS auto)
         shell: bash
         run: |
           set -euo pipefail
 
-          # max_extend_days = H/2 (정수 내림)  -> 로컬 변수로 먼저 잡기
-          MAX_EXTEND_DAYS="$(python - <<'PY'
-          h=int("${{ inputs.max_days }}")
-          print(max(1, h//2))
-          PY
-          )"
-
-          echo "MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS" >> "$GITHUB_ENV"
-
-          # LABEL_KEY에도 동일 로컬 변수 사용 (여기서 ${MAX_EXTEND_DAYS} 쓰면 안됨!)
+          # LABEL_KEY: ex(extend)는 캐시/태그에 넣지 않음 (이제 H/2 자동계산이니까)
           echo "LABEL_KEY=pt$(python - <<'PY'
           pt=float("${{ inputs.profit_target }}")
           print(int(round(pt*100)))
@@ -101,10 +92,19 @@ jobs:
           sl=float("${{ inputs.stop_level }}")
           print(int(round(abs(sl)*100)))
           PY
-          )_ex${MAX_EXTEND_DAYS}" >> "$GITHUB_ENV"
+          )" >> $GITHUB_ENV
 
-          # 10년만
-          echo "PRICE_START=2015-02-21" >> "$GITHUB_ENV"
+          # 10년만 돌릴 거니까 가격 시작일 고정
+          echo "PRICE_START=2015-02-21" >> $GITHUB_ENV
+
+          # ✅ MAX_EXTEND_DAYS = H/2 (정수)
+          echo "MAX_EXTEND_DAYS=$(python - <<'PY'
+          H=int("${{ inputs.max_days }}")
+          print(max(1, H//2))
+          PY
+          )" >> $GITHUB_ENV
+
+      # ---- PRICES cache
       - name: Restore cache (PRICES)
         uses: actions/cache@v4
         with:
@@ -112,20 +112,22 @@ jobs:
             data/raw/prices.parquet
             data/raw/prices.csv
             data/raw/prices_meta.json
-          key: etff-prices-v1-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
+          key: mumumeme-prices-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
           restore-keys: |
-            etff-prices-v1-${{ runner.os }}-
+            mumumeme-prices-v3-${{ runner.os }}-
 
+      # ---- FEATURES cache
       - name: Restore cache (FEATURES_MODEL)
         uses: actions/cache@v4
         with:
           path: |
             data/features/features_model.parquet
             data/features/features_model.csv
-          key: etff-features-v1-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py','scripts/build_features.py') }}
+          key: mumumeme-features-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py','scripts/build_features.py') }}
           restore-keys: |
-            etff-features-v1-${{ runner.os }}-
+            mumumeme-features-v3-${{ runner.os }}-
 
+      # ---- MODEL cache (p_success labels+model)
       - name: Restore cache (MODEL)
         uses: actions/cache@v4
         with:
@@ -134,39 +136,43 @@ jobs:
             data/labels/labels_model.csv
             app/model.pkl
             app/scaler.pkl
-          key: etff-model-v1-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py') }}
+            data/meta/train_model_report*.json
+          key: mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py') }}
           restore-keys: |
-            etff-model-v1-${{ runner.os }}-${{ env.LABEL_KEY }}-
-            etff-model-v1-${{ runner.os }}-
+            mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
+            mumumeme-model-v3-${{ runner.os }}-
 
+      # ---- TAIL cache (labels_tail + tail model)  ※ tag는 ex 포함해서 생성됨
       - name: Restore cache (TAIL)
         uses: actions/cache@v4
         with:
           path: |
-            data/labels/strategy_raw_data_${{ env.LABEL_KEY }}.parquet
-            data/labels/strategy_raw_data_${{ env.LABEL_KEY }}.csv
-            data/labels/labels_tail_${{ env.LABEL_KEY }}.parquet
-            data/labels/labels_tail_${{ env.LABEL_KEY }}.csv
+            data/labels/strategy_raw_data_*.parquet
+            data/labels/strategy_raw_data_*.csv
+            data/labels/labels_tail_*.parquet
+            data/labels/labels_tail_*.csv
             app/tail_model.pkl
             app/tail_scaler.pkl
-            data/meta/train_tail_report_${{ env.LABEL_KEY }}.json
-          key: etff-tail-v1-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_strategy_labels.py','scripts/build_tail_labels.py','scripts/train_tail_model.py') }}
+            data/meta/train_tail_report_*.json
+          key: mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-ex${{ env.MAX_EXTEND_DAYS }}-${{ hashFiles('scripts/build_strategy_labels.py','scripts/build_tail_labels.py','scripts/train_tail_model.py') }}
           restore-keys: |
-            etff-tail-v1-${{ runner.os }}-${{ env.LABEL_KEY }}-
-            etff-tail-v1-${{ runner.os }}-
+            mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-ex${{ env.MAX_EXTEND_DAYS }}-
+            mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
+            mumumeme-tail-v3-${{ runner.os }}-
 
+      # ---- TAU cache (tau labels + tau model)
       - name: Restore cache (TAU)
         uses: actions/cache@v4
         with:
           path: |
-            data/labels/labels_tau_${{ env.LABEL_KEY }}.parquet
-            data/labels/labels_tau_${{ env.LABEL_KEY }}.csv
+            data/labels/labels_tau.parquet
+            data/labels/labels_tau.csv
             app/tau_model.pkl
             app/tau_scaler.pkl
-          key: etff-tau-v1-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_tau_labels.py','scripts/train_tau_model.py') }}
+            data/meta/train_tau_report*.json
+          key: mumumeme-tau-v3-${{ runner.os }}-${{ hashFiles('scripts/build_tau_labels.py','scripts/train_tau_model.py') }}
           restore-keys: |
-            etff-tau-v1-${{ runner.os }}-${{ env.LABEL_KEY }}-
-            etff-tau-v1-${{ runner.os }}-
+            mumumeme-tau-v3-${{ runner.os }}-
 
       - name: Prepare required files (10y only + partial rebuild)
         shell: bash
@@ -180,6 +186,7 @@ jobs:
           MAX_EXTEND_DAYS: ${{ env.MAX_EXTEND_DAYS }}
 
           LABEL_KEY: ${{ env.LABEL_KEY }}
+
         run: |
           set -euo pipefail
 
@@ -187,6 +194,7 @@ jobs:
             rm -rf data/raw/* data/features/* data/labels/* app/* data/signals/* data/meta/* || true
           fi
 
+          # 1) universe + prices (10y만)
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full --start "$PRICE_START"
@@ -194,12 +202,14 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "$PRICE_START"
           fi
 
+          # 2) features
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             python scripts/build_features.py --enable-sector-strength
           else
             echo "[INFO] features_model exists -> reuse"
           fi
 
+          # 3) labels (p_success 학습 데이터)
           if [ ! -f data/labels/labels_model.parquet ] && [ ! -f data/labels/labels_model.csv ]; then
             python scripts/build_labels.py \
               --profit-target "$PROFIT_TARGET" \
@@ -209,14 +219,25 @@ jobs:
             echo "[INFO] labels_model exists -> reuse"
           fi
 
+          # 4) p_success model.pkl / scaler.pkl
           if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
             python scripts/train_model.py
           else
-            echo "[INFO] model exists -> reuse"
+            echo "[INFO] p_success model exists -> reuse"
           fi
 
-          # tail raw + labels + model
-          if [ ! -f "data/labels/strategy_raw_data_${LABEL_KEY}.parquet" ] && [ ! -f "data/labels/strategy_raw_data_${LABEL_KEY}.csv" ]; then
+          # 4a) strategy_raw_data_{tag} (Tail 포함)
+          EX_TAG="pt$(python - <<'PY'
+          pt=float("$PROFIT_TARGET")
+          print(int(round(pt*100)))
+          PY
+          )_h${MAX_DAYS}_sl$(python - <<'PY'
+          sl=float("$STOP_LEVEL")
+          print(int(round(abs(sl)*100)))
+          PY
+          )_ex${MAX_EXTEND_DAYS}"
+
+          if [ ! -f "data/labels/strategy_raw_data_${EX_TAG}.parquet" ] && [ ! -f "data/labels/strategy_raw_data_${EX_TAG}.csv" ]; then
             python scripts/build_strategy_labels.py \
               --profit-target "$PROFIT_TARGET" \
               --max-days "$MAX_DAYS" \
@@ -226,7 +247,8 @@ jobs:
             echo "[INFO] strategy_raw_data exists -> reuse"
           fi
 
-          if [ ! -f "data/labels/labels_tail_${LABEL_KEY}.parquet" ] && [ ! -f "data/labels/labels_tail_${LABEL_KEY}.csv" ]; then
+          # 4b) labels_tail_{tag}
+          if [ ! -f "data/labels/labels_tail_${EX_TAG}.parquet" ] && [ ! -f "data/labels/labels_tail_${EX_TAG}.csv" ]; then
             python scripts/build_tail_labels.py \
               --profit-target "$PROFIT_TARGET" \
               --max-days "$MAX_DAYS" \
@@ -236,6 +258,7 @@ jobs:
             echo "[INFO] labels_tail exists -> reuse"
           fi
 
+          # 4c) tail_model.pkl / tail_scaler.pkl
           if [ ! -f app/tail_model.pkl ] || [ ! -f app/tail_scaler.pkl ]; then
             python scripts/train_tail_model.py \
               --profit-target "$PROFIT_TARGET" \
@@ -246,32 +269,35 @@ jobs:
             echo "[INFO] tail model exists -> reuse"
           fi
 
-          # tau labels + model
-          if [ ! -f "data/labels/labels_tau_${LABEL_KEY}.parquet" ] && [ ! -f "data/labels/labels_tau_${LABEL_KEY}.csv" ]; then
-            python scripts/build_tau_labels.py \
-              --profit-target "$PROFIT_TARGET" \
-              --max-days "$MAX_DAYS" \
-              --stop-level "$STOP_LEVEL" \
-              --max-extend-days "$MAX_EXTEND_DAYS"
+          # 4d) TAU labels + model (있으면 사용)
+          if [ -f scripts/build_tau_labels.py ]; then
+            if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
+              python scripts/build_tau_labels.py
+            else
+              echo "[INFO] labels_tau exists -> reuse"
+            fi
           else
-            echo "[INFO] labels_tau exists -> reuse"
+            echo "[WARN] scripts/build_tau_labels.py not found -> skip tau labels"
           fi
 
-          if [ ! -f app/tau_model.pkl ] || [ ! -f app/tau_scaler.pkl ]; then
-            python scripts/train_tau_model.py \
-              --labels-parq "data/labels/labels_tau_${LABEL_KEY}.parquet" \
-              --labels-csv "data/labels/labels_tau_${LABEL_KEY}.csv"
+          if [ -f scripts/train_tau_model.py ] && ([ -f data/labels/labels_tau.parquet ] || [ -f data/labels/labels_tau.csv ]); then
+            if [ ! -f app/tau_model.pkl ] || [ ! -f app/tau_scaler.pkl ]; then
+              python scripts/train_tau_model.py
+            else
+              echo "[INFO] tau model exists -> reuse"
+            fi
           else
-            echo "[INFO] tau model exists -> reuse"
+            echo "[WARN] tau training skipped (missing script or labels_tau)"
           fi
 
-          # score features (p_success/p_tail + tau_H)
+          # 5) score features -> features_scored (p_success/p_tail/tau_H attached if tau exists)
           python scripts/score_features.py --tag "$LABEL_KEY"
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
         env:
           LABEL_KEY: ${{ env.LABEL_KEY }}
+          PRICE_START: ${{ env.PRICE_START }}
 
           PROFIT_TARGET: ${{ inputs.profit_target }}
           MAX_DAYS: ${{ inputs.max_days }}
