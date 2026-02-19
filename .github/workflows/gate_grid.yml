@@ -272,7 +272,11 @@ jobs:
           # 4d) TAU labels + model (있으면 사용)
           if [ -f scripts/build_tau_labels.py ]; then
             if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
-              python scripts/build_tau_labels.py
+              python scripts/build_tau_labels.py \
+                --profit-target "$PROFIT_TARGET" \
+                --max-days "$MAX_DAYS" \
+                --stop-level "$STOP_LEVEL" \
+                --max-extend-days "$MAX_EXTEND_DAYS"
             else
               echo "[INFO] labels_tau exists -> reuse"
             fi
@@ -282,6 +286,12 @@ jobs:
 
           if [ -f scripts/train_tau_model.py ] && ([ -f data/labels/labels_tau.parquet ] || [ -f data/labels/labels_tau.csv ]); then
             if [ ! -f app/tau_model.pkl ] || [ ! -f app/tau_scaler.pkl ]; then
+              # train_tau_model.py가 인자를 받는 타입이면 아래처럼 같이 넘기는 게 안전함
+              python scripts/train_tau_model.py \
+                --profit-target "$PROFIT_TARGET" \
+                --max-days "$MAX_DAYS" \
+                --stop-level "$STOP_LEVEL" \
+                --max-extend-days "$MAX_EXTEND_DAYS" || \
               python scripts/train_tau_model.py
             else
               echo "[INFO] tau model exists -> reuse"
