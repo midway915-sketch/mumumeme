@@ -16,7 +16,6 @@ echo "[INFO] OUT_DIR=$OUT_DIR"
 : "${PROFIT_TARGET:?}"
 : "${MAX_DAYS:?}"
 : "${STOP_LEVEL:?}"
-: "${MAX_EXTEND_DAYS:?}"   # compat only (engine overrides to H//2)
 : "${P_TAIL_THRESHOLDS:?}"
 : "${UTILITY_QUANTILES:?}"
 : "${RANK_METRICS:?}"
@@ -31,8 +30,19 @@ echo "[INFO] OUT_DIR=$OUT_DIR"
 : "${EXCLUDE_TICKERS:?}"
 : "${REQUIRE_FILES:?}"
 
-# NEW: A/B modes (Option A=true, Option B=false)
-TP1_TRAIL_UNLIMITED_MODES="${TP1_TRAIL_UNLIMITED_MODES:-true,false}"
+# ✅ MAX_EXTEND_DAYS는 "있으면 사용", 없으면 H//2 자동계산 (unbound 방지)
+if [ -z "${MAX_EXTEND_DAYS:-}" ]; then
+  MAX_EXTEND_DAYS="$(python - <<PY
+H=int("${MAX_DAYS}")
+print(max(1, H//2))
+PY
+)"
+  export MAX_EXTEND_DAYS
+fi
+echo "[INFO] MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS (auto: H//2 when not provided)"
+
+# ✅ 옵션B 제거: tp1-trail-unlimited는 true만 사용
+TP1_TRAIL_UNLIMITED="true"
 
 # ----- helpers
 split_csv() {
@@ -100,7 +110,7 @@ PY
 echo "[INFO] TOPK_CONFIGS=$TOPK_CONFIGS"
 echo "[INFO] TRAIL_STOPS=$TRAIL_STOPS TP1_FRAC=$TP1_FRAC ENABLE_TRAILING=$ENABLE_TRAILING"
 echo "[INFO] PS_MINS=$PS_MINS MAX_LEVERAGE_PCT=$MAX_LEVERAGE_PCT"
-echo "[INFO] TP1_TRAIL_UNLIMITED_MODES=$TP1_TRAIL_UNLIMITED_MODES"
+echo "[INFO] TP1_TRAIL_UNLIMITED=$TP1_TRAIL_UNLIMITED"
 
 DEFAULT_TMAX="$(first_csv_item "$P_TAIL_THRESHOLDS")"
 DEFAULT_UQ="$(first_csv_item "$UTILITY_QUANTILES")"
@@ -120,84 +130,80 @@ is_hash_seen() { local h="$1"; [ -n "$h" ] && grep -q "^$h$" "$seen_hash_file"; 
 mark_hash_seen() { local h="$1"; [ -n "$h" ] && echo "$h" >> "$seen_hash_file"; }
 
 # ----- main loops
-while read -r tp1u; do
-  tp1u="$(echo "$tp1u" | tr '[:upper:]' '[:lower:]' | xargs)"
-  [ -z "$tp1u" ] && continue
+while read -r mode; do
+  mode="$(echo "$mode" | tr '[:upper:]' '[:lower:]' | xargs)"
+  [ -z "$mode" ] && continue
 
-  while read -r mode; do
-    mode="$(echo "$mode" | tr '[:upper:]' '[:lower:]' | xargs)"
-    [ -z "$mode" ] && continue
+  if [ "$mode" = "none" ]; then
+    TMAX_LIST="$DEFAULT_TMAX"
+    UQ_LIST="$DEFAULT_UQ"
+  elif [ "$mode" = "tail" ]; then
+    TMAX_LIST="$P_TAIL_THRESHOLDS"
+    UQ_LIST="$DEFAULT_UQ"
+  elif [ "$mode" = "utility" ]; then
+    TMAX_LIST="$DEFAULT_TMAX"
+    UQ_LIST="$UTILITY_QUANTILES"
+  elif [ "$mode" = "tail_utility" ]; then
+    TMAX_LIST="$P_TAIL_THRESHOLDS"
+    UQ_LIST="$UTILITY_QUANTILES"
+  else
+    echo "[ERROR] Unknown mode: $mode"
+    exit 1
+  fi
 
-    if [ "$mode" = "none" ]; then
-      TMAX_LIST="$DEFAULT_TMAX"
-      UQ_LIST="$DEFAULT_UQ"
-    elif [ "$mode" = "tail" ]; then
-      TMAX_LIST="$P_TAIL_THRESHOLDS"
-      UQ_LIST="$DEFAULT_UQ"
-    elif [ "$mode" = "utility" ]; then
-      TMAX_LIST="$DEFAULT_TMAX"
-      UQ_LIST="$UTILITY_QUANTILES"
-    elif [ "$mode" = "tail_utility" ]; then
-      TMAX_LIST="$P_TAIL_THRESHOLDS"
-      UQ_LIST="$UTILITY_QUANTILES"
-    else
-      echo "[ERROR] Unknown mode: $mode"
-      exit 1
-    fi
+  while read -r tmax; do
+    while read -r uq; do
+      while read -r rank_by; do
+        while read -r psmin; do
+          while read -r topk_line; do
+            K="${topk_line%%|*}"
+            W="${topk_line#*|}"
 
-    while read -r tmax; do
-      while read -r uq; do
-        while read -r rank_by; do
-          while read -r psmin; do
-            while read -r topk_line; do
-              K="${topk_line%%|*}"
-              W="${topk_line#*|}"
-
-              while read -r trail; do
-                t_s="$(suffix_float "$tmax")"
-                uq_s="$(suffix_float "$uq")"
-                lam_s="$(suffix_float "$LAMBDA_TAIL")"
-                ps_s="$(suffix_float "$psmin")"
-                tr_s="$(suffix_float "$trail")"
-                tp_pct="$(python - <<PY
+            while read -r trail; do
+              t_s="$(suffix_float "$tmax")"
+              uq_s="$(suffix_float "$uq")"
+              lam_s="$(suffix_float "$LAMBDA_TAIL")"
+              ps_s="$(suffix_float "$psmin")"
+              tr_s="$(suffix_float "$trail")"
+              tp_pct="$(python - <<PY
 f=float("$TP1_FRAC")
 print(int(round(f*100)))
 PY
 )"
-                tu_s="tu$(echo "$tp1u" | sed 's/true/1/; s/false/0/')"
+              tu_s="tu1"  # ✅ 옵션B 제거 -> 항상 tu1
 
-                suffix="${mode}_${tu_s}_t${t_s}_q${uq_s}_r${rank_by}_lam${lam_s}_ps${ps_s}_k${K}_w$(echo "$W" | tr ',' '_')_tp${tp_pct}_tr${tr_s}"
+              suffix="${mode}_${tu_s}_t${t_s}_q${uq_s}_r${rank_by}_lam${lam_s}_ps${ps_s}_k${K}_w$(echo "$W" | tr ',' '_')_tp${tp_pct}_tr${tr_s}"
 
-                echo "=============================="
-                echo "[RUN] tp1_unlim=$tp1u mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin topk=$K weights=$W trail=$trail suffix=$suffix"
-                echo "=============================="
+              echo "=============================="
+              echo "[RUN] tp1_unlim=$TP1_TRAIL_UNLIMITED mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin topk=$K weights=$W trail=$trail suffix=$suffix"
+              echo "=============================="
 
-                python "$PRED" \
-                  --profit-target "$PROFIT_TARGET" \
-                  --max-days "$MAX_DAYS" \
-                  --stop-level "$STOP_LEVEL" \
-                  --max-extend-days "$MAX_EXTEND_DAYS" \
-                  --mode "$mode" \
-                  --tag "$TAG" \
-                  --suffix "$suffix" \
-                  --tail-threshold "$tmax" \
-                  --utility-quantile "$uq" \
-                  --rank-by "$rank_by" \
-                  --lambda-tail "$LAMBDA_TAIL" \
-                  --topk "$K" \
-                  --ps-min "$psmin" \
-                  --exclude-tickers "$EXCLUDE_TICKERS" \
-                  --out-dir "$OUT_DIR" \
-                  --require-files "$REQUIRE_FILES"
+              python "$PRED" \
+                --profit-target "$PROFIT_TARGET" \
+                --max-days "$MAX_DAYS" \
+                --stop-level "$STOP_LEVEL" \
+                --max-extend-days "$MAX_EXTEND_DAYS" \
+                --mode "$mode" \
+                --tag "$TAG" \
+                --suffix "$suffix" \
+                --tail-threshold "$tmax" \
+                --utility-quantile "$uq" \
+                --rank-by "$rank_by" \
+                --lambda-tail "$LAMBDA_TAIL" \
+                --topk "$K" \
+                --ps-min "$psmin" \
+                --exclude-tickers "$EXCLUDE_TICKERS" \
+                --out-dir "$OUT_DIR" \
+                --require-files "$REQUIRE_FILES"
 
-                picks_path="$OUT_DIR/picks_${TAG}_gate_${suffix}.csv"
+              picks_path="$OUT_DIR/picks_${TAG}_gate_${suffix}.csv"
 
-                if [ ! -f "$picks_path" ]; then
-                  echo "[WARN] picks missing -> skip simulate/summarize (suffix=$suffix)"
-                  continue
-                fi
+              if [ ! -f "$picks_path" ]; then
+                echo "[WARN] picks missing -> skip simulate/summarize (suffix=$suffix)"
+                continue
+              fi
 
-                rows="$(python - <<PY
+              rows="$(python - <<PY
 import pandas as pd
 try:
   df=pd.read_csv("$picks_path")
@@ -206,56 +212,55 @@ except Exception:
   print(0)
 PY
 )"
-                if [ "${rows:-0}" = "0" ]; then
-                  echo "[INFO] picks rows=0 -> skip simulate/summarize (suffix=$suffix)"
-                  continue
-                fi
+              if [ "${rows:-0}" = "0" ]; then
+                echo "[INFO] picks rows=0 -> skip simulate/summarize (suffix=$suffix)"
+                continue
+              fi
 
-                h="$(picks_hash "$picks_path")"
-                if is_hash_seen "$h"; then
-                  echo "[INFO] duplicate picks hash=$h -> skip simulate/summarize (suffix=$suffix)"
-                  continue
-                fi
-                mark_hash_seen "$h"
+              h="$(picks_hash "$picks_path")"
+              if is_hash_seen "$h"; then
+                echo "[INFO] duplicate picks hash=$h -> skip simulate/summarize (suffix=$suffix)"
+                continue
+              fi
+              mark_hash_seen "$h"
 
-                python "$SIM" \
-                  --picks-path "$picks_path" \
-                  --profit-target "$PROFIT_TARGET" \
-                  --max-days "$MAX_DAYS" \
-                  --stop-level "$STOP_LEVEL" \
-                  --max-extend-days "$MAX_EXTEND_DAYS" \
-                  --max-leverage-pct "$MAX_LEVERAGE_PCT" \
-                  --enable-trailing "$ENABLE_TRAILING" \
-                  --tp1-frac "$TP1_FRAC" \
-                  --trail-stop "$trail" \
-                  --tp1-trail-unlimited "$tp1u" \
-                  --topk "$K" \
-                  --weights "$W" \
-                  --tag "$TAG" \
-                  --suffix "$suffix" \
-                  --out-dir "$OUT_DIR"
+              python "$SIM" \
+                --picks-path "$picks_path" \
+                --profit-target "$PROFIT_TARGET" \
+                --max-days "$MAX_DAYS" \
+                --stop-level "$STOP_LEVEL" \
+                --max-extend-days "$MAX_EXTEND_DAYS" \
+                --max-leverage-pct "$MAX_LEVERAGE_PCT" \
+                --enable-trailing "$ENABLE_TRAILING" \
+                --tp1-frac "$TP1_FRAC" \
+                --trail-stop "$trail" \
+                --tp1-trail-unlimited "$TP1_TRAIL_UNLIMITED" \
+                --topk "$K" \
+                --weights "$W" \
+                --tag "$TAG" \
+                --suffix "$suffix" \
+                --out-dir "$OUT_DIR"
 
-                trades_path="$OUT_DIR/sim_engine_trades_${TAG}_gate_${suffix}.parquet"
+              trades_path="$OUT_DIR/sim_engine_trades_${TAG}_gate_${suffix}.parquet"
 
-                python "$SUM" \
-                  --trades-path "$trades_path" \
-                  --tag "$TAG" \
-                  --suffix "$suffix" \
-                  --profit-target "$PROFIT_TARGET" \
-                  --max-days "$MAX_DAYS" \
-                  --stop-level "$STOP_LEVEL" \
-                  --max-extend-days "$MAX_EXTEND_DAYS" \
-                  --out-dir "$OUT_DIR"
+              python "$SUM" \
+                --trades-path "$trades_path" \
+                --tag "$TAG" \
+                --suffix "$suffix" \
+                --profit-target "$PROFIT_TARGET" \
+                --max-days "$MAX_DAYS" \
+                --stop-level "$STOP_LEVEL" \
+                --max-extend-days "$MAX_EXTEND_DAYS" \
+                --out-dir "$OUT_DIR"
 
-              done < <(split_csv "$TRAIL_STOPS")
-            done < <(split_scsv "$TOPK_CONFIGS")
-          done < <(split_csv "$PS_MINS")
-        done < <(split_csv "$RANK_METRICS")
-      done < <(split_csv "$UQ_LIST")
-    done < <(split_csv "$TMAX_LIST")
+            done < <(split_csv "$TRAIL_STOPS")
+          done < <(split_scsv "$TOPK_CONFIGS")
+        done < <(split_csv "$PS_MINS")
+      done < <(split_csv "$RANK_METRICS")
+    done < <(split_csv "$UQ_LIST")
+  done < <(split_csv "$TMAX_LIST")
 
-  done < <(split_csv "$GATE_MODES")
-done < <(split_csv "$TP1_TRAIL_UNLIMITED_MODES")
+done < <(split_csv "$GATE_MODES")
 
 echo "[DONE] grid finished"
 echo "[INFO] unique picks hashes: $(wc -l < "$seen_hash_file" | tr -d ' ')"
