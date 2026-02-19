@@ -101,26 +101,34 @@ def main() -> None:
     ap.add_argument("--features-parq", default="data/features/features_scored.parquet", type=str)
     ap.add_argument("--features-csv", default="data/features/features_scored.csv", type=str)
     # prefer scored features
+ def main():
+    import argparse
+    from pathlib import Path
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--features-parq", default="data/features/features_scored.parquet")
+    ap.add_argument("--features-csv", default="data/features/features_scored.csv")
+    ap.add_argument("--tag", default=None)
+    # ... 너 원래 있던 다른 add_argument들 그대로 ...
+
+    args = ap.parse_args()  # ✅ 이 줄이 무조건 args 사용보다 먼저!
+
+    # ---- 여기부터 args 사용
     f_parq = Path(args.features_parq)
-    f_csv  = Path(args.features_csv)
-    
-    # fallback: if scored doesn't exist, use features_model
+    f_csv = Path(args.features_csv)
+
     if (not f_parq.exists()) and (not f_csv.exists()):
         f_parq = Path("data/features/features_model.parquet")
-        f_csv  = Path("data/features/features_model.csv")
-    
+        f_csv = Path("data/features/features_model.csv")
+
     feats = read_table(str(f_parq), str(f_csv)).copy()
-    
     features_src = str(f_parq) if f_parq.exists() else str(f_csv)
-    
-    # ---- meta (예시: 네 코드에서 meta dict 만드는 곳에 이렇게 추가)
-    meta = {
-        "label_key": args.tag if hasattr(args, "tag") else None,
-        # ... 기존 meta 키들 ...
-    }
-    
-    # ✅ 여기서 안전하게 추가
+
+    # meta dict가 있으면 안전하게 대입
+    meta = {}
     meta["features_src"] = features_src
+
+    # ... 이하 기존 로직 계속 ...
     ap.add_argument("--universe-csv", default="data/universe.csv", type=str)
     ap.add_argument("--exclude-tickers", default="SPY,^VIX", type=str, help="comma-separated tickers to force-exclude")
 
@@ -133,7 +141,6 @@ def main() -> None:
     ap.add_argument("--ps-min", default=0.0, type=float, help="Minimum p_success to be eligible (0.0 disables)")
 
     ap.add_argument("--require-files", default="", type=str, help="comma-separated file paths that must exist")
-    args = ap.parse_args()
 
     require_files(args.require_files)
 
