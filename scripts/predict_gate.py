@@ -48,18 +48,36 @@ def ensure_required_files_exist(require_files: List[Path]) -> None:
 # ----------------------------
 def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Make sure df has 'Date' and 'Ticker' as columns.
-    - If Date is index, reset_index
-    - If columns are 'date'/'datetime'/'timestamp', rename to 'Date'
-    - If columns are 'ticker'/'symbol', rename to 'Ticker'
+    Ensure 'Date' and 'Ticker' exist as columns.
+    Handles:
+      - Date is an index level named date/datetime/timestamp/Date
+      - column names date/datetime/timestamp -> Date
+      - ticker/symbol -> Ticker
+      - groupby/apply artefacts where Date becomes index level 'Date' or 'level_0'
     """
     out = df.copy()
 
-    # Date might be index
-    idxn = (out.index.name or "").lower()
-    if "Date" not in out.columns and idxn in ("date", "datetime", "timestamp"):
+    # If Date is in index name (exact or common variants), reset it into columns
+    idx_name = (out.index.name or "")
+    if "Date" not in out.columns and idx_name.lower() in ("date", "datetime", "timestamp"):
         out = out.reset_index()
 
+    # If Date exists as an index level in a MultiIndex (common after groupby/apply), bring it back
+    if "Date" not in out.columns and isinstance(out.index, pd.MultiIndex):
+        names = [str(n) for n in out.index.names]
+        if "Date" in names:
+            out = out.reset_index(level="Date")
+        elif "date" in [n.lower() for n in names if n is not None]:
+            # find actual name
+            for n in out.index.names:
+                if n is not None and str(n).lower() == "date":
+                    out = out.reset_index(level=n)
+                    break
+        elif "level_0" in names:
+            # some pandas versions use level_0 for group key
+            out = out.reset_index(level=0)
+
+    # Normalize column names to Date/Ticker
     colmap = {c.lower(): c for c in out.columns}
 
     # Date candidates
@@ -69,6 +87,9 @@ def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
         out = out.rename(columns={colmap["datetime"]: "Date"})
     if "timestamp" in colmap and "Date" not in out.columns:
         out = out.rename(columns={colmap["timestamp"]: "Date"})
+    # If reset_index produced "level_0" and it's actually dates, map to Date
+    if "level_0" in out.columns and "Date" not in out.columns:
+        out = out.rename(columns={"level_0": "Date"})
 
     # Ticker candidates
     if "ticker" in colmap and "Ticker" not in out.columns:
@@ -78,11 +99,13 @@ def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     if "Date" not in out.columns:
         raise KeyError(
-            f"Date column missing. cols(head)={list(out.columns)[:30]} index.name={out.index.name}"
+            f"Date column missing. cols(head)={list(out.columns)[:30]} index.name={out.index.name} "
+            f"index.names={getattr(out.index, 'names', None)}"
         )
     if "Ticker" not in out.columns:
         raise KeyError(
-            f"Ticker column missing. cols(head)={list(out.columns)[:30]} index.name={out.index.name}"
+            f"Ticker column missing. cols(head)={list(out.columns)[:30]} index.name={out.index.name} "
+            f"index.names={getattr(out.index, 'names', None)}"
         )
 
     return out
@@ -124,6 +147,40 @@ def build_utility(df: pd.DataFrame, lambda_tail: float) -> pd.Series:
     return ret - float(lambda_tail) * p_tail
 
 
+def _post_group_apply_fix(res: pd.DataFrame) -> pd.DataFrame:
+    """
+    After groupby/apply, some pandas versions move group key to index.
+    This function guarantees Date becomes a column again.
+    """
+    if "Date" in res.columns:
+        return res.reset_index(drop=True)
+
+    # Try recovering from index level names
+    if isinstance(res.index, pd.MultiIndex):
+        names = [str(n) for n in res.index.names]
+        if "Date" in names:
+            res = res.reset_index(level="Date")
+        elif "level_0" in names:
+            res = res.reset_index(level=0)
+        else:
+            # generic: bring first level back
+            res = res.reset_index(level=0)
+    else:
+        # single index: reset to a column (might become 'index')
+        res = res.reset_index()
+
+    # Normalize possible names
+    if "level_0" in res.columns and "Date" not in res.columns:
+        res = res.rename(columns={"level_0": "Date"})
+    if "index" in res.columns and "Date" not in res.columns:
+        # last resort: if index column looks like datetime, treat as Date
+        res = res.rename(columns={"index": "Date"})
+
+    # Ensure Date/Ticker columns exist now
+    res = ensure_date_ticker_columns(res)
+    return res.reset_index(drop=True)
+
+
 def gate_filter(
     df: pd.DataFrame,
     mode: str,
@@ -131,10 +188,10 @@ def gate_filter(
     utility_quantile: float,
 ) -> pd.DataFrame:
     mode = (mode or "none").strip().lower()
-    d = df.copy()
+    d = ensure_date_ticker_columns(df)
 
     if mode == "none":
-        return d
+        return d.copy()
 
     if mode == "tail":
         return d[d["p_tail"] <= float(tail_threshold)].copy()
@@ -143,30 +200,33 @@ def gate_filter(
         q = float(utility_quantile)
 
         def _f(g: pd.DataFrame) -> pd.DataFrame:
+            g = ensure_date_ticker_columns(g)
             if len(g) == 0:
                 return g
             thr = g["utility"].quantile(q)
             return g[g["utility"] >= thr]
 
-        return d.groupby("Date", group_keys=False).apply(_f).reset_index(drop=True)
+        res = d.groupby("Date", group_keys=True).apply(_f)
+        return _post_group_apply_fix(res)
 
     if mode == "tail_utility":
-        d = d[d["p_tail"] <= float(tail_threshold)].copy()
+        d2 = d[d["p_tail"] <= float(tail_threshold)].copy()
         q = float(utility_quantile)
 
         def _f(g: pd.DataFrame) -> pd.DataFrame:
+            g = ensure_date_ticker_columns(g)
             if len(g) == 0:
                 return g
             thr = g["utility"].quantile(q)
             return g[g["utility"] >= thr]
 
-        return d.groupby("Date", group_keys=False).apply(_f).reset_index(drop=True)
+        res = d2.groupby("Date", group_keys=True).apply(_f)
+        return _post_group_apply_fix(res)
 
     raise ValueError(f"Unknown mode: {mode} (expected none|tail|utility|tail_utility)")
 
 
 def rank_topk_per_day(df: pd.DataFrame, rank_by: str, topk: int) -> pd.DataFrame:
-    # extra safety: Date could become index after groupby/apply in some edge cases
     d = ensure_date_ticker_columns(df)
 
     if d.empty:
@@ -200,7 +260,6 @@ def rank_topk_per_day(df: pd.DataFrame, rank_by: str, topk: int) -> pd.DataFrame
 def main() -> None:
     ap = argparse.ArgumentParser(description="Gate picks generator (reads features_scored if available).")
 
-    # args used only for metadata compatibility with your pipeline
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
@@ -241,28 +300,25 @@ def main() -> None:
     feats = read_table(f_parq, f_csv).copy()
     features_src = str(f_parq) if f_parq.exists() else str(f_csv)
 
-    # normalize Date/Ticker robustly
     feats = ensure_date_ticker_columns(feats)
 
     feats["Date"] = norm_date(feats["Date"])
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
-    # ensure key columns exist (if missing, filled with 0)
     feats["p_success"] = coerce_num(feats, "p_success", 0.0)
     feats["p_tail"] = coerce_num(feats, "p_tail", 0.0)
     feats["ret_score"] = coerce_num(feats, "ret_score", 0.0)
 
-    # exclude tickers
     feats = apply_exclude_tickers(feats, args.exclude_tickers)
 
-    # base filter: ps_min (always applied)
+    # base gate: p_success min
     feats = feats[feats["p_success"] >= float(args.ps_min)].copy()
 
-    # utility
+    # utility column
     feats["utility"] = build_utility(feats, float(args.lambda_tail))
 
-    # gate
+    # mode gate
     gated = gate_filter(
         feats,
         mode=args.mode,
@@ -277,7 +333,6 @@ def main() -> None:
     picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
     meta_path = out_dir / f"picks_meta_{args.tag}_gate_{args.suffix}.json"
 
-    # keep stable columns for simulator
     keep_cols = [c for c in ["Date", "Ticker", "p_success", "p_tail", "ret_score", "utility"] if c in picks.columns]
     picks_out = picks[keep_cols].copy()
 
