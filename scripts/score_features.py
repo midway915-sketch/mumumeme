@@ -15,7 +15,7 @@ FEATURE_DIR = DATA_DIR / "features"
 META_DIR = DATA_DIR / "meta"
 
 
-# ✅ build_features.py 기준(16) + (옵션) 섹터(2)
+# build_features.py 기준(16) + (옵션) 섹터(2)
 DEFAULT_FEATURES = [
     # base (9)
     "Drawdown_252",
@@ -81,6 +81,11 @@ def _load_feature_cols_from_report(report_path: Path) -> list[str] | None:
     return None
 
 
+def load_ps_feature_cols(tag: str) -> list[str] | None:
+    # ✅ train_model.py writes: data/meta/train_model_report_{tag}.json
+    return _load_feature_cols_from_report(META_DIR / f"train_model_report_{tag}.json")
+
+
 def load_tail_feature_cols(tag: str) -> list[str] | None:
     # train_tail_model.py writes: data/meta/train_tail_report_{tag}.json
     return _load_feature_cols_from_report(META_DIR / f"train_tail_report_{tag}.json")
@@ -118,6 +123,11 @@ def class_to_h(cls: int, hmap: list[int]) -> int:
     return hmap[cls]
 
 
+def parse_csv_cols(s: str) -> list[str]:
+    cols = [c.strip() for c in (s or "").split(",") if c.strip()]
+    return cols
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Score features_model with p_success, p_tail, and tau_class/tau_H -> save features_scored."
@@ -133,7 +143,13 @@ def main() -> None:
     # p_success
     ap.add_argument("--ps-model", default="app/model.pkl", type=str)
     ap.add_argument("--ps-scaler", default="app/scaler.pkl", type=str)
-    ap.add_argument("--ps-features", default=",".join(DEFAULT_FEATURES), type=str)
+    # ✅ 기본값을 빈 문자열로: report에서 자동으로 읽도록
+    ap.add_argument(
+        "--ps-features",
+        default="",
+        type=str,
+        help="comma-separated override. default=read train_model_report_{tag}.json or fallback to DEFAULT_FEATURES",
+    )
 
     # p_tail
     ap.add_argument("--tail-model", default="app/tail_model.pkl", type=str)
@@ -174,13 +190,19 @@ def main() -> None:
     feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
     # -------------------------
-    # p_success
+    # p_success (✅ report 기반 강제 정렬)
     # -------------------------
     ps_model = joblib.load(args.ps_model)
     ps_scaler = joblib.load(args.ps_scaler)
-    ps_cols = [c.strip() for c in str(args.ps_features).split(",") if c.strip()]
+
+    if args.ps_features.strip():
+        ps_cols = parse_csv_cols(args.ps_features)
+    else:
+        ps_cols = load_ps_feature_cols(args.tag) or DEFAULT_FEATURES
+
+    ps_cols = [c for c in ps_cols if c]  # sanitize
     feats_ps = ensure_features_exist(feats, ps_cols)
-    X_ps = feats_ps[ps_cols].to_numpy(dtype=float)
+    X_ps = feats_ps[ps_cols].to_numpy(dtype=float)  # ✅ train과 같은 순서/컬럼
     X_ps_s = ps_scaler.transform(X_ps)
     feats["p_success"] = ps_model.predict_proba(X_ps_s)[:, 1].astype(float)
 
@@ -194,7 +216,7 @@ def main() -> None:
         tail_scaler = joblib.load(tail_scaler_path)
 
         if args.tail_features.strip():
-            tail_cols = [c.strip() for c in args.tail_features.split(",") if c.strip()]
+            tail_cols = parse_csv_cols(args.tail_features)
         else:
             tail_cols = load_tail_feature_cols(args.tag) or ps_cols
 
@@ -217,7 +239,7 @@ def main() -> None:
         tau_scaler = joblib.load(tau_scaler_path)
 
         if args.tau_features.strip():
-            tau_cols = [c.strip() for c in args.tau_features.split(",") if c.strip()]
+            tau_cols = parse_csv_cols(args.tau_features)
         else:
             tau_cols = load_tau_feature_cols(args.tag) or ps_cols
 
@@ -225,6 +247,7 @@ def main() -> None:
         X_tau = feats_tau[tau_cols].to_numpy(dtype=float)
         X_tau_s = tau_scaler.transform(X_tau)
 
+        # predict class
         try:
             tau_class = tau_model.predict(X_tau_s)
             tau_class = np.asarray(tau_class).astype(int)
@@ -234,6 +257,7 @@ def main() -> None:
 
         feats["tau_class"] = tau_class.astype(int)
 
+        # best-prob
         try:
             proba = tau_model.predict_proba(X_tau_s)
             feats["tau_pmax"] = np.max(proba, axis=1).astype(float)
