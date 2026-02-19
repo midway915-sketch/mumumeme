@@ -138,6 +138,7 @@ def main() -> None:
         feats.to_csv(out_csv, index=False)
         print(f"[DONE] wrote: {out_csv} rows={len(feats)}")
 
+print("[DEBUG] features_scored cols:", list(feats.columns)[:30], " index.name:", feats.index.name)
 
 if __name__ == "__main__":
     main()
