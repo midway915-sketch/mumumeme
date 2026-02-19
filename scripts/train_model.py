@@ -1,7 +1,8 @@
-# scripts/train_model.py
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import joblib
@@ -19,6 +20,7 @@ DATA_DIR = Path("data")
 LABELS_PARQ = DATA_DIR / "labels" / "labels_model.parquet"
 LABELS_CSV = DATA_DIR / "labels" / "labels_model.csv"
 APP_DIR = Path("app")
+META_DIR = DATA_DIR / "meta"
 
 
 DEFAULT_FEATURES = [
@@ -52,16 +54,31 @@ def ensure_features_exist(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFram
     df = df.copy()
     for c in feat_cols:
         if c not in df.columns:
-            # ✅ 방어: 누락 컬럼은 0으로 생성 (pipeline 안 죽게)
+            # 방어: 누락 컬럼은 0으로 생성 (pipeline 안 죽게)
             df[c] = 0.0
     for c in feat_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df[c] = (
+            pd.to_numeric(df[c], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .astype(float)
+        )
     return df
+
+
+def write_train_report(tag: str, report: dict) -> None:
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    if tag:
+        p = META_DIR / f"train_model_report_{tag}.json"
+    else:
+        p = META_DIR / "train_model_report.json"
+    p.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[DONE] wrote train report -> {p}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", default="", type=str, help="optional tag suffix for saving model files")
+    ap.add_argument("--tag", default="", type=str, help="optional tag suffix for saving model files + meta report")
 
     ap.add_argument("--target-col", default="Success", type=str)
     ap.add_argument("--date-col", default="Date", type=str)
@@ -81,16 +98,21 @@ def main() -> None:
 
     date_col = args.date_col
     target_col = args.target_col
+    ticker_col = args.ticker_col
+
     feat_cols = parse_csv_list(args.features) or DEFAULT_FEATURES
+    feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
 
     for c in [date_col, target_col]:
         if c not in df.columns:
             raise ValueError(f"labels_model missing required column: {c}")
 
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    # normalize date
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.tz_localize(None)
     df = df.dropna(subset=[date_col]).copy()
     df = df.sort_values(date_col).reset_index(drop=True)
 
+    # features
     df = ensure_features_exist(df, feat_cols)
 
     y = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int).to_numpy()
@@ -111,7 +133,7 @@ def main() -> None:
     base = LogisticRegression(max_iter=int(args.max_iter))
     tscv = TimeSeriesSplit(n_splits=int(args.n_splits))
 
-    # ✅ sklearn 버전 차이 방어 (estimator vs base_estimator)
+    # sklearn 버전 차이 방어 (estimator vs base_estimator)
     try:
         model = CalibratedClassifierCV(estimator=base, method="isotonic", cv=tscv)
     except TypeError:
@@ -124,12 +146,16 @@ def main() -> None:
     if len(np.unique(y_test)) > 1:
         auc = float(roc_auc_score(y_test, probs))
 
+    base_rate = float(np.mean(y_test)) if len(y_test) else float("nan")
+    pred_mean = float(np.mean(probs)) if len(probs) else float("nan")
+
     print("=" * 60)
     print("[TRAIN] p_success model")
     print("rows:", len(y), "train:", len(y_train), "test:", len(y_test))
-    print("AUC:", (round(auc, 4) if np.isfinite(auc) else "nan"))
-    print("base_rate:", round(float(np.mean(y_test)), 4) if len(y_test) else "nan")
-    print("pred_mean:", round(float(np.mean(probs)), 4) if len(probs) else "nan")
+    print("AUC:", (round(auc, 6) if np.isfinite(auc) else "nan"))
+    print("base_rate:", (round(base_rate, 6) if np.isfinite(base_rate) else "nan"))
+    print("pred_mean:", (round(pred_mean, 6) if np.isfinite(pred_mean) else "nan"))
+    print("feature_cols:", feat_cols)
     print("=" * 60)
 
     APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -143,6 +169,24 @@ def main() -> None:
 
     print(f"[DONE] saved model -> {out_model}")
     print(f"[DONE] saved scaler -> {out_scaler}")
+
+    # ✅ meta report (score_features가 이걸 읽어서 동일 피처로 scoring 하게 만들 것)
+    report = {
+        "tag": tag,
+        "target_col": target_col,
+        "date_col": date_col,
+        "ticker_col": ticker_col if ticker_col in df.columns else "",
+        "feature_cols": feat_cols,
+        "rows_total": int(len(y)),
+        "rows_train": int(len(y_train)),
+        "rows_test": int(len(y_test)),
+        "auc": float(auc) if np.isfinite(auc) else None,
+        "base_rate_test": float(base_rate) if np.isfinite(base_rate) else None,
+        "pred_mean_test": float(pred_mean) if np.isfinite(pred_mean) else None,
+        "out_model": str(out_model),
+        "out_scaler": str(out_scaler),
+    }
+    write_train_report(tag, report)
 
 
 if __name__ == "__main__":
