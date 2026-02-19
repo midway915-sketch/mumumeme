@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # scripts/simulate_single_position_engine.py
 from __future__ import annotations
 
@@ -45,6 +44,7 @@ def clamp_invest_by_leverage(seed: float, entry_seed: float, desired: float, max
 class Leg:
     ticker: str
     weight: float
+
     shares: float = 0.0
     invested: float = 0.0
 
@@ -69,9 +69,7 @@ class CycleState:
     entry_seed: float = 0.0   # S0 at entry
     unit: float = 0.0         # daily buy budget = entry_seed / max_days
     holding_days: int = 0
-
     extending: bool = False
-    extend_days: int = 0      # how many days we've been in extending mode
 
     max_leverage_pct: float = 0.0
     max_equity: float = 0.0
@@ -122,8 +120,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
             "Single-cycle engine with TopK (1~2), TP1 partial, trailing stop, leverage cap on ALL buys.\n"
-            "Adds: max_extend_days = floor(max_days/2) hard cap, and TP1 trailing unlimited mode (A) vs capped (B).\n"
-            "Always forces liquidation at the last backtest date (close)."
+            "Lookahead-safe entry: use previous trading day's picks to trade today (T-1 signal -> T execution)."
         )
     )
     ap.add_argument("--picks-path", required=True, type=str, help="CSV with columns Date,Ticker (TopK rows/day).")
@@ -132,22 +129,19 @@ def main() -> None:
 
     ap.add_argument("--initial-seed", default=40_000_000, type=float)
 
-    ap.add_argument("--profit-target", required=True, type=float)   # PT (e.g. 0.10)
-    ap.add_argument("--max-days", required=True, type=int)          # H
-    ap.add_argument("--stop-level", required=True, type=float)      # stop threshold for extend decision (e.g. -0.10)
-    ap.add_argument("--max-extend-days", required=True, type=int)   # kept for compatibility, but we will override by H//2
+    ap.add_argument("--profit-target", required=True, type=float)
+    ap.add_argument("--max-days", required=True, type=int)
+    ap.add_argument("--stop-level", required=True, type=float)
+    ap.add_argument("--max-extend-days", required=True, type=int)
 
-    ap.add_argument("--max-leverage-pct", default=1.0, type=float)  # 1.0 => 100%
+    ap.add_argument("--max-leverage-pct", default=1.0, type=float)
 
     ap.add_argument("--enable-trailing", default="true", type=str)
     ap.add_argument("--tp1-frac", default=0.50, type=float)
     ap.add_argument("--trail-stop", default=0.10, type=float)
 
-    ap.add_argument("--tp1-trail-unlimited", default="false", type=str,
-                    help="true=Option A (after TP1, ignore H+E time cap; trailing only). false=Option B (time cap always applies).")
-
-    ap.add_argument("--topk", default=1, type=int)                  # 1 or 2
-    ap.add_argument("--weights", default="1.0", type=str)           # "1.0" or "0.7,0.3" etc
+    ap.add_argument("--topk", default=1, type=int)
+    ap.add_argument("--weights", default="1.0", type=str)
 
     ap.add_argument("--tag", default="", type=str)
     ap.add_argument("--suffix", default="", type=str)
@@ -156,8 +150,6 @@ def main() -> None:
     args = ap.parse_args()
 
     enable_trailing = str(args.enable_trailing).lower() in ("1", "true", "yes", "y")
-    tp1_trail_unlimited = str(args.tp1_trail_unlimited).lower() in ("1", "true", "yes", "y")
-
     topk = int(args.topk)
     if topk < 1 or topk > 2:
         raise ValueError("--topk should be 1 or 2")
@@ -165,13 +157,6 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # H and E (override): E = floor(H/2)
-    H = int(args.max_days)
-    if H <= 0:
-        raise ValueError("--max-days must be > 0")
-    E = max(1, H // 2)
-    H_plus_E = H + E
 
     # ---------- picks
     picks_path = Path(args.picks_path)
@@ -205,10 +190,9 @@ def main() -> None:
 
     grouped = prices.groupby("Date", sort=True)
     all_dates = list(grouped.groups.keys())
-    if not all_dates:
-        raise ValueError("No price dates found.")
-    last_date = all_dates[-1]
+    all_dates = [pd.Timestamp(d) for d in all_dates]
 
+    # ---------- state
     st = CycleState(
         seed=float(args.initial_seed),
         max_equity=float(args.initial_seed),
@@ -222,7 +206,6 @@ def main() -> None:
 
     def close_cycle(exit_date: pd.Timestamp, day_prices_close: dict[str, float], reason: str) -> None:
         nonlocal cooldown_today, st, trades
-
         proceeds = 0.0
         invested_total = 0.0
 
@@ -242,44 +225,42 @@ def main() -> None:
             "Tickers": ",".join([l.ticker for l in st.legs]),
             "Weights": ",".join([f"{l.weight:.4f}" for l in st.legs]),
             "EntrySeed": st.entry_seed,
-            "ProfitTarget": float(args.profit_target),
+            "ProfitTarget": args.profit_target,
             "TP1_Frac": float(args.tp1_frac),
             "TrailStop": float(args.trail_stop) if enable_trailing else np.nan,
-            "TP1TrailUnlimited": int(tp1_trail_unlimited),
-            "MaxDays": H,
-            "MaxExtendDaysUsed": E,
-            "MaxHoldingDaysCap": H_plus_E,
-            "StopLevel": float(args.stop_level),
-            "MaxLeveragePctCap": float(args.max_leverage_pct),
-            "MaxLeveragePct": float(st.max_leverage_pct),
+            "MaxDays": args.max_days,
+            "StopLevel": args.stop_level,
+            "MaxExtendDaysParam": args.max_extend_days,
+            "MaxLeveragePctCap": args.max_leverage_pct,
+            "MaxLeveragePct": st.max_leverage_pct,
             "Invested": invested_total,
             "Proceeds": proceeds,
             "CycleReturn": cycle_return,
-            "HoldingDays": int(st.holding_days),
+            "HoldingDays": st.holding_days,
             "Extending": int(st.extending),
-            "ExtendDays": int(st.extend_days),
             "Reason": reason,
-            "MaxDrawdown": float(st.max_dd),
+            "MaxDrawdown": st.max_dd,
             "Win": win,
         })
 
         st.seed += proceeds
 
-        # reset
         st.in_cycle = False
         st.entry_date = None
         st.entry_seed = 0.0
         st.unit = 0.0
         st.holding_days = 0
         st.extending = False
-        st.extend_days = 0
         st.max_leverage_pct = 0.0
         st.legs = []
 
         cooldown_today = True
 
-    # simulate
+    # ---------- simulate (IMPORTANT: T-1 picks -> T execution)
+    prev_date: pd.Timestamp | None = None
+
     for date, day_df in grouped:
+        date = pd.Timestamp(date)
         day_df = day_df.set_index("Ticker", drop=False)
         cooldown_today = False
 
@@ -293,11 +274,9 @@ def main() -> None:
             day_prices_high[t] = float(r["High"])
             day_prices_low[t] = float(r["Low"])
 
-        # ----- in cycle: update + exits + buys
+        # ----- in cycle: update exits + buys
         if st.in_cycle:
             st.holding_days += 1
-            if st.extending:
-                st.extend_days += 1
 
             # 1) TP1 + trailing per leg
             if enable_trailing:
@@ -308,7 +287,7 @@ def main() -> None:
                     low_px = day_prices_low[leg.ticker]
                     avg = leg.avg_price()
 
-                    # TP1 trigger (uses intraday high)
+                    # TP1 trigger (intraday high touches)
                     if (not leg.tp1_done) and np.isfinite(avg) and high_px >= avg * (1.0 + float(args.profit_target)):
                         tp_px = avg * (1.0 + float(args.profit_target))
                         sell_shares = leg.shares * float(args.tp1_frac)
@@ -321,7 +300,6 @@ def main() -> None:
                         st.seed += proceeds
                         leg.tp1_done = True
                         leg.peak = float(max(high_px, tp_px))
-
                         st.update_lev(float(args.max_leverage_pct))
 
                     # trailing stop after TP1
@@ -339,9 +317,9 @@ def main() -> None:
             if st.in_cycle and all((leg.shares <= 0 for leg in st.legs)):
                 close_cycle(date, day_prices_close, reason="TRAIL_EXIT_ALL")
 
-            # 3) max_days decision to enter extending (one-time)
+            # 3) max_days decision (only if still holding)
             if st.in_cycle:
-                if (st.holding_days >= H) and (not st.extending):
+                if st.holding_days >= int(args.max_days) and (not st.extending):
                     rets = []
                     for leg in st.legs:
                         if leg.ticker in day_df.index and leg.shares > 0:
@@ -355,25 +333,10 @@ def main() -> None:
                         close_cycle(date, day_prices_close, reason="MAXDAY_CLOSE")
                     else:
                         st.extending = True
-                        st.extend_days = 0
 
-            # 4) hard time cap (H+E) rule with Option A/B nuance
-            # - Always enforce before buys (so we don't buy on the forced-exit day)
+            # 4) buys (DCA), leverage cap applies ALWAYS
             if st.in_cycle:
-                all_tp1 = all((leg.tp1_done for leg in st.legs)) if st.legs else False
-
-                # Option A: after TP1, ignore the time cap; before TP1, enforce cap.
-                # Option B: always enforce cap.
-                enforce_cap = True
-                if tp1_trail_unlimited and all_tp1:
-                    enforce_cap = False
-
-                if enforce_cap and (st.holding_days >= H_plus_E):
-                    close_cycle(date, day_prices_close, reason="H_PLUS_E_FORCE_CLOSE")
-
-            # 5) buys (DCA) - leverage cap applies ALWAYS
-            if st.in_cycle:
-                all_tp1 = all((leg.tp1_done for leg in st.legs)) if st.legs else False
+                all_tp1 = all((leg.tp1_done for leg in st.legs))
                 if not all_tp1:
                     desired_total = float(st.unit)
                     for leg in st.legs:
@@ -386,7 +349,6 @@ def main() -> None:
                         avg = leg.avg_price()
                         desired_leg = desired_total * float(leg.weight)
 
-                        # normal zone buy rule (only when not extending)
                         if not st.extending:
                             if np.isfinite(avg) and avg > 0:
                                 if close_px <= avg:
@@ -409,18 +371,21 @@ def main() -> None:
             else:
                 st.update_dd({})
 
-        # ----- entry: not in cycle and not cooldown day
-        if (not st.in_cycle) and (not cooldown_today):
-            picks_today = picks_by_date.get(date, [])
-            if picks_today:
-                valid = [t for t in picks_today if t in day_df.index and np.isfinite(day_prices_close.get(t, np.nan))]
+        # ----- entry: NOT in cycle and NOT cooldown
+        # IMPORTANT: use prev_date picks to enter today (T-1 signal -> T execution)
+        if (not st.in_cycle) and (not cooldown_today) and (prev_date is not None):
+            picks_prev = picks_by_date.get(prev_date, [])
+            if picks_prev:
+                valid = [t for t in picks_prev if t in day_df.index and np.isfinite(day_prices_close.get(t, np.nan))]
                 if len(valid) >= 1:
                     chosen = valid[:topk]
 
                     S0 = float(st.seed)
-                    unit = (S0 / float(H)) if H > 0 else 0.0
+                    unit = (S0 / float(args.max_days)) if args.max_days > 0 else 0.0
 
-                    legs = [Leg(ticker=t, weight=float(weights[i])) for i, t in enumerate(chosen)]
+                    legs: list[Leg] = []
+                    for i, t in enumerate(chosen):
+                        legs.append(Leg(ticker=t, weight=float(weights[i])))
 
                     invested_total = 0.0
                     for leg in legs:
@@ -435,12 +400,11 @@ def main() -> None:
 
                     if invested_total > 0:
                         st.in_cycle = True
-                        st.entry_date = date
+                        st.entry_date = date  # execution date
                         st.entry_seed = S0
                         st.unit = float(unit)
                         st.holding_days = 1
                         st.extending = False
-                        st.extend_days = 0
                         st.max_leverage_pct = 0.0
                         st.legs = legs
                         st.update_lev(float(args.max_leverage_pct))
@@ -458,22 +422,11 @@ def main() -> None:
             "Tickers": ",".join([l.ticker for l in st.legs]) if st.in_cycle else "",
             "HoldingDays": st.holding_days if st.in_cycle else 0,
             "Extending": int(st.extending) if st.in_cycle else 0,
-            "ExtendDays": int(st.extend_days) if st.in_cycle else 0,
             "MaxLeveragePctCycle": st.max_leverage_pct if st.in_cycle else 0.0,
             "MaxDrawdownPortfolio": st.max_dd,
-            "MaxDays": H,
-            "MaxExtendDaysUsed": E,
-            "MaxHoldingDaysCap": H_plus_E,
-            "TP1TrailUnlimited": int(tp1_trail_unlimited),
         })
 
-    # ---- FORCE CLOSE at last date (both A and B)
-    # If still holding at end of dataset, liquidate at last_date close.
-    if st.in_cycle:
-        # Build last_date close map
-        last_df = grouped.get_group(last_date).set_index("Ticker", drop=False)
-        last_close = {t: float(last_df.loc[t]["Close"]) for t in last_df.index}
-        close_cycle(last_date, last_close, reason="BACKTEST_END_FORCE_CLOSE")
+        prev_date = date
 
     trades_df = pd.DataFrame(trades)
     curve_df = pd.DataFrame(curve)
@@ -492,7 +445,6 @@ def main() -> None:
     print(f"[DONE] wrote curve : {curve_path} rows={len(curve_df)}")
     if not curve_df.empty:
         print(f"[INFO] final SeedMultiple={float(curve_df['SeedMultiple'].iloc[-1]):.4f} maxDD={float(st.max_dd):.4f}")
-    print(f"[INFO] H={H} E=floor(H/2)={E} cap(H+E)={H_plus_E} tp1_trail_unlimited={tp1_trail_unlimited}")
 
 
 if __name__ == "__main__":
