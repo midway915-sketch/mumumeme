@@ -28,6 +28,10 @@ on:
         description: "comma-separated utility quantiles (e.g. 0.60,0.75,0.90)"
         required: true
         default: "0.60,0.75,0.90"
+      ps_mins:
+        description: "comma-separated p_success minimum cutoffs (e.g. 0.50,0.60,0.70)"
+        required: true
+        default: "0.00,0.50,0.60,0.70"
       rank_metrics:
         description: "comma-separated rank metric (utility|ret_score|p_success). e.g. utility,ret_score"
         required: true
@@ -268,7 +272,7 @@ jobs:
           TOPK_CONFIGS: "1|1.0;2|0.7,0.3;2|0.6,0.4"
 
           # ✅ p_success 최소컷도 같이 그리드(너가 원했던 것)
-          PS_MINS: "0.00,0.50,0.60,0.70"
+          PS_MINS: ${{ inputs.ps_mins }}
 
           # ✅ 레버 상한(진입~연장 전구간)
           MAX_LEVERAGE_PCT: "1.00"
