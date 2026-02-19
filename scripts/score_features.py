@@ -91,6 +91,7 @@ def main() -> None:
     args = ap.parse_args()
 
     feats = read_table(Path(args.features_parq), Path(args.features_csv)).copy()
+    print("[DEBUG] features_scored cols:", list(feats.columns)[:30], " index.name:", feats.index.name)
     if "Date" not in feats.columns or "Ticker" not in feats.columns:
         raise ValueError("features_model must contain Date,Ticker")
 
@@ -137,8 +138,6 @@ def main() -> None:
         print(f"[WARN] parquet save failed ({e}) -> writing csv")
         feats.to_csv(out_csv, index=False)
         print(f"[DONE] wrote: {out_csv} rows={len(feats)}")
-
-print("[DEBUG] features_scored cols:", list(feats.columns)[:30], " index.name:", feats.index.name)
 
 if __name__ == "__main__":
     main()
