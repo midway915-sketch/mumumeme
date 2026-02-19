@@ -20,7 +20,9 @@ APP_DIR = Path("app")
 META_DIR = Path("data/meta")
 LABELS_DIR = Path("data/labels")
 
+# ✅ build_features.py 기준(16) + (옵션) 섹터(2)
 DEFAULT_FEATURES = [
+    # base (9)
     "Drawdown_252",
     "Drawdown_60",
     "ATR_ratio",
@@ -29,6 +31,18 @@ DEFAULT_FEATURES = [
     "MA20_slope",
     "Market_Drawdown",
     "Market_ATR_ratio",
+    "ret_score",
+    # new (7)
+    "ret_5",
+    "ret_10",
+    "ret_20",
+    "breakout_20",
+    "vol_surge",
+    "trend_align",
+    "beta_60",
+    # optional sector (2) - 있으면 쓰고, 없으면 choose_features가 보강
+    "Sector_Ret_20",
+    "RelStrength",
 ]
 
 
@@ -43,10 +57,14 @@ def read_table(parq: Path, csv: Path) -> pd.DataFrame:
 def choose_features(df: pd.DataFrame, requested: list[str]) -> list[str]:
     cols = set(df.columns)
     feats = [c for c in requested if c in cols]
+
+    # 최소 4개 미만이면 숫자 컬럼에서 자동 보강
     if len(feats) < 4:
-        banned = {"TailTarget","Target","Success","Date","Ticker"}
+        banned = {"TailTarget", "Target", "Success", "Date", "Ticker"}
         numeric = [c for c in df.columns if c not in banned and pd.api.types.is_numeric_dtype(df[c])]
         feats = feats + [c for c in numeric if c not in feats][:12]
+
+    # unique 유지
     out, seen = [], set()
     for c in feats:
         if c not in seen:
@@ -113,10 +131,14 @@ def main() -> None:
 
     use = df.dropna(subset=feature_cols + ["TailTarget"]).copy()
     for c in feature_cols:
-        use[c] = pd.to_numeric(use[c], errors="coerce").fillna(0.0)
-    y = pd.to_numeric(use["TailTarget"], errors="coerce").fillna(0).astype(int)
+        use[c] = pd.to_numeric(use[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
+    y = pd.to_numeric(use["TailTarget"], errors="coerce").fillna(0).astype(int)
     X = use[feature_cols]
+
+    if len(use) < 200:
+        raise RuntimeError(f"Not enough training rows: {len(use)} (src={src})")
+
     split_idx = int(len(use) * float(args.train_ratio))
     split_idx = max(1, min(split_idx, len(use) - 1))
 
@@ -135,6 +157,7 @@ def main() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ✅ 파이프라인 호환: 고정 파일명 유지
     joblib.dump(model, APP_DIR / "tail_model.pkl")
     joblib.dump(scaler, APP_DIR / "tail_scaler.pkl")
 
