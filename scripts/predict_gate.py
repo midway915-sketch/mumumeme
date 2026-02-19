@@ -100,17 +100,27 @@ def main() -> None:
 
     ap.add_argument("--features-parq", default="data/features/features_scored.parquet", type=str)
     ap.add_argument("--features-csv", default="data/features/features_scored.csv", type=str)
-    # fallback: if scored doesn't exist, use features_model
+    # prefer scored features
     f_parq = Path(args.features_parq)
-    f_csv = Path(args.features_csv)
-    if not f_parq.exists() and not f_csv.exists():
+    f_csv  = Path(args.features_csv)
+    
+    # fallback: if scored doesn't exist, use features_model
+    if (not f_parq.exists()) and (not f_csv.exists()):
         f_parq = Path("data/features/features_model.parquet")
-        f_csv = Path("data/features/features_model.csv")
+        f_csv  = Path("data/features/features_model.csv")
     
     feats = read_table(str(f_parq), str(f_csv)).copy()
     
-    # meta에도 실제로 쓴 소스를 기록
-    "features_src": str(f_parq) if f_parq.exists() else str(f_csv),
+    features_src = str(f_parq) if f_parq.exists() else str(f_csv)
+    
+    # ---- meta (예시: 네 코드에서 meta dict 만드는 곳에 이렇게 추가)
+    meta = {
+        "label_key": args.tag if hasattr(args, "tag") else None,
+        # ... 기존 meta 키들 ...
+    }
+    
+    # ✅ 여기서 안전하게 추가
+    meta["features_src"] = features_src
     ap.add_argument("--universe-csv", default="data/universe.csv", type=str)
     ap.add_argument("--exclude-tickers", default="SPY,^VIX", type=str, help="comma-separated tickers to force-exclude")
 
