@@ -83,13 +83,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          # max_extend_days = H/2 (정수 내림)
-          echo "MAX_EXTEND_DAYS=$(python - <<'PY'
+          # max_extend_days = H/2 (정수 내림)  -> 로컬 변수로 먼저 잡기
+          MAX_EXTEND_DAYS="$(python - <<'PY'
           h=int("${{ inputs.max_days }}")
           print(max(1, h//2))
           PY
-          )" >> $GITHUB_ENV
+          )"
 
+          echo "MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS" >> "$GITHUB_ENV"
+
+          # LABEL_KEY에도 동일 로컬 변수 사용 (여기서 ${MAX_EXTEND_DAYS} 쓰면 안됨!)
           echo "LABEL_KEY=pt$(python - <<'PY'
           pt=float("${{ inputs.profit_target }}")
           print(int(round(pt*100)))
@@ -98,11 +101,10 @@ jobs:
           sl=float("${{ inputs.stop_level }}")
           print(int(round(abs(sl)*100)))
           PY
-          )_ex${MAX_EXTEND_DAYS}" >> $GITHUB_ENV
+          )_ex${MAX_EXTEND_DAYS}" >> "$GITHUB_ENV"
 
           # 10년만
-          echo "PRICE_START=2015-02-21" >> $GITHUB_ENV
-
+          echo "PRICE_START=2015-02-21" >> "$GITHUB_ENV"
       - name: Restore cache (PRICES)
         uses: actions/cache@v4
         with:
