@@ -25,7 +25,7 @@ def _infer_curve_from_trades(trades_path: Path) -> Path:
 
 
 def _safe_num(s: pd.Series, default=np.nan) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").fillna(default)
+    return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
 
 
 def _seed_multiple_from_curve(curve: pd.DataFrame) -> float | None:
@@ -78,7 +78,21 @@ def _recent10y_seed_multiple_from_curve(curve: pd.DataFrame) -> float | None:
     return None
 
 
+def _pick_first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
 def _cycle_stats(trades: pd.DataFrame) -> dict:
+    """
+    trades(사이클 단위 테이블)에서 요약 통계 산출.
+
+    호환:
+      - trailing entry: TrailingEntries(신규) 또는 TrailEntryCount(구버전)
+      - peak cycle return: CycleMaxReturn(신규) 또는 PeakCycleReturn(구버전)
+    """
     if trades is None or trades.empty:
         return {
             "CycleCount": 0,
@@ -110,23 +124,25 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
 
     # max leverage pct
     max_lev = np.nan
-    for c in ["MaxLeveragePct", "max_leverage_pct", "LeveragePct", "leverage_pct"]:
-        if c in trades.columns:
-            mv = _safe_num(trades[c]).max()
-            max_lev = float(mv) if np.isfinite(mv) else np.nan
-            break
+    lev_col = _pick_first_existing_col(trades, ["MaxLeveragePct", "max_leverage_pct", "LeveragePct", "leverage_pct"])
+    if lev_col:
+        mv = _safe_num(trades[lev_col]).max()
+        max_lev = float(mv) if np.isfinite(mv) else np.nan
 
-    # ✅ NEW: trailing entry stats + max peak return
+    # ✅ trailing entry stats (신규/구버전 둘 다)
+    trail_col = _pick_first_existing_col(trades, ["TrailingEntries", "TrailEntryCount"])
     trail_total = 0
     trail_avg = 0.0
-    if "TrailEntryCount" in trades.columns:
-        te = _safe_num(trades["TrailEntryCount"], 0.0).fillna(0).astype(int)
+    if trail_col:
+        te = _safe_num(trades[trail_col], 0.0).fillna(0).astype(int)
         trail_total = int(te.sum())
         trail_avg = float(te.mean()) if cycle_cnt > 0 else 0.0
 
+    # ✅ peak cycle return (신규/구버전 둘 다)
+    peak_col = _pick_first_existing_col(trades, ["CycleMaxReturn", "PeakCycleReturn"])
     max_peak_ret = np.nan
-    if "PeakCycleReturn" in trades.columns:
-        mpr = _safe_num(trades["PeakCycleReturn"]).max()
+    if peak_col:
+        mpr = _safe_num(trades[peak_col]).max()
         max_peak_ret = float(mpr) if np.isfinite(mpr) else np.nan
 
     return {
