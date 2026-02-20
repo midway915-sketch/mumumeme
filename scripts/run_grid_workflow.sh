@@ -30,6 +30,15 @@ echo "[INFO] OUT_DIR=$OUT_DIR"
 : "${EXCLUDE_TICKERS:?}"
 : "${REQUIRE_FILES:?}"
 
+# ✅ dedupe on/off (default: true)
+DEDUP_PICKS="${DEDUP_PICKS:-true}"
+DEDUP_PICKS="$(echo "$DEDUP_PICKS" | tr '[:upper:]' '[:lower:]' | xargs)"
+if [[ "$DEDUP_PICKS" != "true" && "$DEDUP_PICKS" != "false" ]]; then
+  echo "[ERROR] DEDUP_PICKS must be true/false (got: $DEDUP_PICKS)"
+  exit 1
+fi
+echo "[INFO] DEDUP_PICKS=$DEDUP_PICKS"
+
 # ✅ MAX_EXTEND_DAYS는 "있으면 사용", 없으면 H//2 자동계산
 if [ -z "${MAX_EXTEND_DAYS:-}" ]; then
   MAX_EXTEND_DAYS="$(python - <<PY
@@ -217,12 +226,14 @@ PY
                 continue
               fi
 
-              h="$(picks_hash "$picks_path")"
-              if is_hash_seen "$h"; then
-                echo "[INFO] duplicate picks hash=$h -> skip simulate/summarize (suffix=$suffix)"
-                continue
+              if [ "$DEDUP_PICKS" = "true" ]; then
+                h="$(picks_hash "$picks_path")"
+                if is_hash_seen "$h"; then
+                  echo "[INFO] duplicate picks hash=$h -> skip simulate/summarize (suffix=$suffix)"
+                  continue
+                fi
+                mark_hash_seen "$h"
               fi
-              mark_hash_seen "$h"
 
               python "$SIM" \
                 --picks-path "$picks_path" \
@@ -263,5 +274,7 @@ PY
 done < <(split_csv "$GATE_MODES")
 
 echo "[DONE] grid finished"
-echo "[INFO] unique picks hashes: $(wc -l < "$seen_hash_file" | tr -d ' ')"
+if [ "$DEDUP_PICKS" = "true" ]; then
+  echo "[INFO] unique picks hashes: $(wc -l < "$seen_hash_file" | tr -d ' ')"
+fi
 ls -la "$OUT_DIR" | sed -n '1,200p'
