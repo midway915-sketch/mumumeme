@@ -46,38 +46,11 @@ on:
     # 매일 한국시간 08:10 (UTC 23:10)
     - cron: "10 23 * * *"
 
-# ✅ schedule에서도 안전하게 돌아가도록 “기본값 env”를 먼저 선언
-env:
-  PROFIT_TARGET: ${{ github.event.inputs.profit_target || '0.10' }}
-  MAX_DAYS: ${{ github.event.inputs.max_days || '40' }}
-  STOP_LEVEL: ${{ github.event.inputs.stop_level || '-0.10' }}
-
-  P_TAIL_THRESHOLDS: ${{ github.event.inputs.p_tail_thresholds || '0.10,0.20,0.30' }}
-  UTILITY_QUANTILES: ${{ github.event.inputs.utility_quantiles || '0.60,0.75,0.90' }}
-  PS_MINS: ${{ github.event.inputs.ps_mins || '0.00,0.50,0.60,0.70' }}
-  RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility,ret_score' }}
-  LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.05' }}
-
-  REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'false' }}
-
 jobs:
   grid:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-
-    env:
-      PROFIT_TARGET: ${{ github.event.inputs.profit_target || '0.10' }}
-      MAX_DAYS: ${{ github.event.inputs.max_days || '40' }}
-      STOP_LEVEL: ${{ github.event.inputs.stop_level || '-0.10' }}
-
-      P_TAIL_THRESHOLDS: ${{ github.event.inputs.p_tail_thresholds || '0.10,0.20,0.30' }}
-      UTILITY_QUANTILES: ${{ github.event.inputs.utility_quantiles || '0.60,0.75,0.90' }}
-      PS_MINS: ${{ github.event.inputs.ps_mins || '0.00,0.50,0.60,0.70' }}
-      RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility,ret_score' }}
-      LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.05' }}
-
-      REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'false' }}
 
     steps:
       - name: Checkout
@@ -107,32 +80,24 @@ jobs:
 
       - name: Set env keys (LABEL_KEY + PRICE_START + MAX_EXTEND_DAYS auto)
         shell: bash
+        env:
+          PROFIT_TARGET: ${{ inputs.profit_target }}
+          MAX_DAYS: ${{ inputs.max_days }}
+          STOP_LEVEL: ${{ inputs.stop_level }}
         run: |
           set -euo pipefail
 
-          # LABEL_KEY: pt10_h40_sl10 형태
-          echo "LABEL_KEY=pt$(python - <<'PY'
-          import os
-          pt=float(os.environ["PROFIT_TARGET"])
-          print(int(round(pt*100)))
-          PY
-          )_h${MAX_DAYS}_sl$(python - <<'PY'
-          import os
-          sl=float(os.environ["STOP_LEVEL"])
-          print(int(round(abs(sl)*100)))
-          PY
-          )" >> $GITHUB_ENV
+          PT_TAG="$(python -c "import os; print(int(round(float(os.environ['PROFIT_TARGET'])*100)))")"
+          SL_TAG="$(python -c "import os; print(int(round(abs(float(os.environ['STOP_LEVEL']))*100)))")"
+
+          # LABEL_KEY: ex(extend)는 캐시/태그에 넣지 않음 (H/2 자동계산)
+          echo "LABEL_KEY=pt${PT_TAG}_h${MAX_DAYS}_sl${SL_TAG}" >> "$GITHUB_ENV"
 
           # 10년만 돌릴 거니까 가격 시작일 고정
-          echo "PRICE_START=2015-02-21" >> $GITHUB_ENV
+          echo "PRICE_START=2015-02-21" >> "$GITHUB_ENV"
 
-          # MAX_EXTEND_DAYS = H/2
-          echo "MAX_EXTEND_DAYS=$(python - <<'PY'
-          import os
-          H=int(os.environ["MAX_DAYS"])
-          print(max(1, H//2))
-          PY
-          )" >> $GITHUB_ENV
+          # ✅ MAX_EXTEND_DAYS = H/2 (정수)
+          echo "MAX_EXTEND_DAYS=$(python -c "import os; H=int(os.environ['MAX_DAYS']); print(max(1, H//2))")" >> "$GITHUB_ENV"
 
       # ---- PRICES cache
       - name: Restore cache (PRICES)
@@ -167,8 +132,6 @@ jobs:
             data/labels/labels_model.csv
             app/model.pkl
             app/scaler.pkl
-            app/model_*.pkl
-            app/scaler_*.pkl
             data/meta/train_model_report*.json
           key: mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py') }}
           restore-keys: |
@@ -225,33 +188,6 @@ jobs:
             rm -rf data/raw/* data/features/* data/labels/* app/* data/signals/* data/meta/* || true
           fi
 
-          # helper: check if a parquet/csv has required columns
-          check_cols() {
-            local parq="$1"
-            local csv="$2"
-            shift 2
-            python - <<PY
-          import sys, pandas as pd
-          parq="$parq"; csv="$csv"
-          req=${@:-}
-          cols=[]
-          if parq and __import__("pathlib").Path(parq).exists():
-              df=pd.read_parquet(parq)
-              cols=list(df.columns)
-          elif csv and __import__("pathlib").Path(csv).exists():
-              df=pd.read_csv(csv, nrows=5)
-              cols=list(df.columns)
-          else:
-              print("MISSING_FILE")
-              sys.exit(2)
-          missing=[c for c in sys.argv[1:] if c not in cols]
-          if missing:
-              print("MISSING_COLS:" + ",".join(missing))
-              sys.exit(1)
-          print("OK")
-          PY "$@"
-          }
-
           # 1) universe + prices (10y만)
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
@@ -260,64 +196,32 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "$PRICE_START"
           fi
 
-          # 2) features (섹터 필수: 없으면 무조건 재빌드)
-          NEED_REBUILD_FEATURES="false"
-          if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
-            if ! check_cols "data/features/features_model.parquet" "data/features/features_model.csv" "Sector_Ret_20" "RelStrength" >/dev/null 2>&1; then
-              echo "[WARN] features_model exists but missing sector cols -> rebuild"
-              NEED_REBUILD_FEATURES="true"
-            fi
-          else
-            NEED_REBUILD_FEATURES="true"
-          fi
-
-          if [ "$NEED_REBUILD_FEATURES" = "true" ]; then
-            rm -f data/features/features_model.parquet data/features/features_model.csv data/meta/feature_cols.json || true
+          # 2) features (✅ 섹터 무조건)
+          if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             python scripts/build_features.py --enable-sector-strength
           else
-            echo "[INFO] features_model exists (sector OK) -> reuse"
+            echo "[INFO] features_model exists -> reuse"
           fi
 
-          # 3) labels (p_success 학습 데이터) : 섹터 피처 포함이므로, labels도 섹터 없으면 재빌드
-          NEED_REBUILD_LABELS="false"
-          if [ -f data/labels/labels_model.parquet ] || [ -f data/labels/labels_model.csv ]; then
-            if ! check_cols "data/labels/labels_model.parquet" "data/labels/labels_model.csv" "Sector_Ret_20" "RelStrength" >/dev/null 2>&1; then
-              echo "[WARN] labels_model exists but missing sector cols -> rebuild"
-              NEED_REBUILD_LABELS="true"
-            fi
-          else
-            NEED_REBUILD_LABELS="true"
-          fi
-
-          if [ "$NEED_REBUILD_LABELS" = "true" ]; then
-            rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
+          # 3) labels (p_success 학습 데이터)
+          if [ ! -f data/labels/labels_model.parquet ] && [ ! -f data/labels/labels_model.csv ]; then
             python scripts/build_labels.py \
               --profit-target "$PROFIT_TARGET" \
               --max-days "$MAX_DAYS" \
               --stop-level "$STOP_LEVEL"
-            # labels 재빌드했으면 모델도 같이 갈아엎는 게 안전
-            rm -f app/model*.pkl app/scaler*.pkl data/meta/train_model_report*.json || true
           else
-            echo "[INFO] labels_model exists (sector OK) -> reuse"
+            echo "[INFO] labels_model exists -> reuse"
           fi
 
-          # 4) p_success model.pkl / scaler.pkl (가능하면 tag 맞춰 저장)
+          # 4) p_success model.pkl / scaler.pkl
           if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
-            python scripts/train_model.py --tag "$LABEL_KEY"
+            python scripts/train_model.py
           else
             echo "[INFO] p_success model exists -> reuse"
           fi
 
           # 4b) labels_tail_{EX_TAG}
-          EX_TAG="pt$(python - <<PY
-          pt=float("$PROFIT_TARGET")
-          print(int(round(pt*100)))
-          PY
-          )_h${MAX_DAYS}_sl$(python - <<PY
-          sl=float("$STOP_LEVEL")
-          print(int(round(abs(sl)*100)))
-          PY
-          )_ex${MAX_EXTEND_DAYS}"
+          EX_TAG="pt$(python -c "import math; print(int(round(float('$PROFIT_TARGET')*100)))")_h${MAX_DAYS}_sl$(python -c "import math; print(int(round(abs(float('$STOP_LEVEL'))*100)))")_ex${MAX_EXTEND_DAYS}"
 
           if [ ! -f "data/labels/labels_tail_${EX_TAG}.parquet" ] && [ ! -f "data/labels/labels_tail_${EX_TAG}.csv" ]; then
             python scripts/build_tail_labels.py \
@@ -379,15 +283,15 @@ jobs:
           LABEL_KEY: ${{ env.LABEL_KEY }}
           PRICE_START: ${{ env.PRICE_START }}
 
-          PROFIT_TARGET: ${{ env.PROFIT_TARGET }}
-          MAX_DAYS: ${{ env.MAX_DAYS }}
-          STOP_LEVEL: ${{ env.STOP_LEVEL }}
+          PROFIT_TARGET: ${{ inputs.profit_target }}
+          MAX_DAYS: ${{ inputs.max_days }}
+          STOP_LEVEL: ${{ inputs.stop_level }}
           MAX_EXTEND_DAYS: ${{ env.MAX_EXTEND_DAYS }}
 
-          P_TAIL_THRESHOLDS: ${{ env.P_TAIL_THRESHOLDS }}
-          UTILITY_QUANTILES: ${{ env.UTILITY_QUANTILES }}
-          RANK_METRICS: ${{ env.RANK_METRICS }}
-          LAMBDA_TAIL: ${{ env.LAMBDA_TAIL }}
+          P_TAIL_THRESHOLDS: ${{ inputs.p_tail_thresholds }}
+          UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
+          RANK_METRICS: ${{ inputs.rank_metrics }}
+          LAMBDA_TAIL: ${{ inputs.lambda_tail }}
 
           GATE_MODES: "none,tail,utility,tail_utility"
 
@@ -396,7 +300,7 @@ jobs:
           TRAIL_STOPS: "0.08,0.10,0.12"
 
           TOPK_CONFIGS: "1|1.0;2|0.7,0.3;2|0.6,0.4"
-          PS_MINS: ${{ env.PS_MINS }}
+          PS_MINS: ${{ inputs.ps_mins }}
 
           MAX_LEVERAGE_PCT: "1.00"
 
