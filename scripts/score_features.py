@@ -110,25 +110,18 @@ def _load_feature_cols_from_ssot() -> list[str] | None:
 
 
 def load_ps_feature_cols(tag: str) -> list[str] | None:
-    # train_model.py writes: data/meta/train_model_report_{tag}.json
     return _load_feature_cols_from_report(META_DIR / f"train_model_report_{tag}.json")
 
 
 def load_tail_feature_cols(tag: str) -> list[str] | None:
-    # train_tail_model.py writes: data/meta/train_tail_report_{tag}.json
     return _load_feature_cols_from_report(META_DIR / f"train_tail_report_{tag}.json")
 
 
 def load_tau_feature_cols(tag: str) -> list[str] | None:
-    # train_tau_model.py writes: data/meta/train_tau_report_{tag}.json
     return _load_feature_cols_from_report(META_DIR / f"train_tau_report_{tag}.json")
 
 
 def parse_tau_h_map(s: str) -> list[int]:
-    """
-    "20,40,60" -> [20,40,60]
-    tau_class k -> tau_H = map[k] (out of range면 마지막 값 사용)
-    """
     parts = [p.strip() for p in (s or "").split(",") if p.strip()]
     if not parts:
         return [20, 40, 60]
@@ -235,7 +228,6 @@ def main() -> None:
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
-    # 공통 SSOT cols (report 없을 때 우선)
     ssot_cols = _load_feature_cols_from_ssot()
 
     # -------------------------
@@ -246,7 +238,7 @@ def main() -> None:
         raise FileNotFoundError(
             f"Missing p_success model/scaler.\n"
             f"-> tried: {ps_model_path} / {ps_scaler_path}\n"
-            f"-> (tag fallback) you may need to train_model.py first."
+            f"-> (tag fallback) you may need to run train_model.py first."
         )
 
     ps_model = joblib.load(ps_model_path)
@@ -333,7 +325,6 @@ def main() -> None:
         X_tau = feats_tau[tau_cols].to_numpy(dtype=float)
         X_tau_s = tau_scaler.transform(X_tau)
 
-        # predict class
         try:
             tau_class = tau_model.predict(X_tau_s)
             tau_class = np.asarray(tau_class).astype(int)
@@ -343,7 +334,6 @@ def main() -> None:
 
         feats["tau_class"] = tau_class.astype(int)
 
-        # best-prob
         try:
             proba = tau_model.predict_proba(X_tau_s)
             feats["tau_pmax"] = np.max(proba, axis=1).astype(float)
