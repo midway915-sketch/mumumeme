@@ -1,44 +1,47 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+scripts/predict_gate.py
+
+Gate picks generator.
+
+Supports two call styles (for pipeline compatibility):
+
+1) Workflow style (recommended)
+   - Provide: --out-dir (and optionally --require-files)
+   - Output paths derived as:
+       picks_{tag}_gate_{suffix}.csv
+       picks_meta_{tag}_gate_{suffix}.json
+
+2) Explicit style (legacy / ad-hoc)
+   - Provide: --out-csv (and optionally --meta-json)
+
+Either way, the content is identical.
+"""
+
 import argparse
 import json
-import os
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-DATA_DIR = Path("data")
-FEAT_DIR = DATA_DIR / "features"
-SIG_DIR = DATA_DIR / "signals"
-
-DEFAULT_FEATS_SCORED_PARQ = FEAT_DIR / "features_scored.parquet"
-DEFAULT_FEATS_SCORED_CSV = FEAT_DIR / "features_scored.csv"
-DEFAULT_FEATS_MODEL_PARQ = FEAT_DIR / "features_model.parquet"
-DEFAULT_FEATS_MODEL_CSV = FEAT_DIR / "features_model.csv"
-
-
 # ----------------------------
-# misc
+# IO helpers
 # ----------------------------
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def norm_date(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
-
-
 def read_table(parq_path: Path, csv_path: Path) -> pd.DataFrame:
     if parq_path.exists():
         return pd.read_parquet(parq_path)
     if csv_path.exists():
         return pd.read_csv(csv_path)
     raise FileNotFoundError(f"Missing file: {parq_path} (or {csv_path})")
+
+
+def norm_date(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
 def coerce_num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
@@ -48,11 +51,22 @@ def coerce_num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
     return x.astype(float)
 
 
+def parse_require_files(s: str) -> List[Path]:
+    parts = [p.strip() for p in (s or "").split(",") if p.strip()]
+    return [Path(p) for p in parts]
+
+
+def ensure_required_files_exist(require_files: List[Path]) -> None:
+    missing = [str(p) for p in require_files if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing required files: {missing}")
+
+
+# ----------------------------
+# Column normalization
+# ----------------------------
 def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure 'Date' and 'Ticker' exist as columns.
-    Robust to Date as index / date-like alternative names.
-    """
+    """Ensure 'Date' and 'Ticker' exist as columns."""
     out = df.copy()
 
     if "Date" not in out.columns:
@@ -73,6 +87,7 @@ def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
                     pass
 
     colmap = {c.lower(): c for c in out.columns}
+
     if "date" in colmap and "Date" not in out.columns:
         out = out.rename(columns={colmap["date"]: "Date"})
     if "datetime" in colmap and "Date" not in out.columns:
@@ -86,9 +101,9 @@ def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
         out = out.rename(columns={colmap["symbol"]: "Ticker"})
 
     if "Date" not in out.columns:
-        raise KeyError(f"Date column missing. cols(head)={list(out.columns)[:30]} index.type={type(out.index).__name__}")
+        raise KeyError(f"Date column missing. cols(head)={list(out.columns)[:30]} index.name={out.index.name}")
     if "Ticker" not in out.columns:
-        raise KeyError(f"Ticker column missing. cols(head)={list(out.columns)[:30]} index.type={type(out.index).__name__}")
+        raise KeyError(f"Ticker column missing. cols(head)={list(out.columns)[:30]} index.name={out.index.name}")
 
     return out
 
@@ -100,17 +115,31 @@ def apply_exclude_tickers(df: pd.DataFrame, exclude_csv: str) -> pd.DataFrame:
     return df[~df["Ticker"].isin(ex)].copy()
 
 
+# ----------------------------
+# Features source selection
+# ----------------------------
+def pick_features_source(require_files: List[Path]) -> Tuple[Path, Path]:
+    """Prefer features_scored if present in require_files."""
+    for p in require_files:
+        name = p.name
+        if "features_scored" in name and (name.endswith(".parquet") or name.endswith(".csv")):
+            if name.endswith(".parquet"):
+                return p, p.with_suffix(".csv")
+            return p.with_suffix(".parquet"), p
+
+    return Path("data/features/features_scored.parquet"), Path("data/features/features_scored.csv")
+
+
+# ----------------------------
+# Utility / gating / ranking
+# ----------------------------
 def build_utility(df: pd.DataFrame, lambda_tail: float) -> pd.Series:
-    # utility = ret_score - lambda * p_tail
     ret = coerce_num(df, "ret_score", 0.0)
     p_tail = coerce_num(df, "p_tail", 0.0)
     return ret - float(lambda_tail) * p_tail
 
 
 def gate_filter(df: pd.DataFrame, mode: str, tail_threshold: float, utility_quantile: float) -> pd.DataFrame:
-    """
-    No groupby().apply() to avoid Date column loss.
-    """
     d = ensure_date_ticker_columns(df)
     mode = (mode or "none").strip().lower()
 
@@ -139,90 +168,43 @@ def gate_filter(df: pd.DataFrame, mode: str, tail_threshold: float, utility_quan
     raise ValueError(f"Unknown mode: {mode} (expected none|tail|utility|tail_utility)")
 
 
-def parse_rank_by_list(rank_by: str) -> List[str]:
-    """
-    Accept:
-      - "utility"
-      - "utility,ret_score"
-      - "ret_score,p_success"
-    """
-    items = [x.strip().lower() for x in (rank_by or "").split(",") if x.strip()]
-    return items or ["utility"]
-
-
-def ensure_rank_columns(d: pd.DataFrame, metrics: List[str]) -> None:
-    ok = {"utility", "ret_score", "p_success"}
-    bad = [m for m in metrics if m not in ok]
-    if bad:
-        raise ValueError(f"Unknown rank_by metrics: {bad} (allowed: utility|ret_score|p_success)")
-    # columns presence is handled by coerce_num + utility build
-
-
-def rank_topk_per_day_multi(df: pd.DataFrame, rank_by: str, topk: int) -> pd.DataFrame:
+def rank_topk_per_day(df: pd.DataFrame, rank_by: str, topk: int) -> pd.DataFrame:
     d = ensure_date_ticker_columns(df)
     if d.empty:
         return d
 
-    metrics = parse_rank_by_list(rank_by)
-    ensure_rank_columns(d, metrics)
+    rb = (rank_by or "utility").strip().lower()
+    if rb == "utility":
+        metric = d["utility"]
+    elif rb == "ret_score":
+        metric = d["ret_score"]
+    elif rb == "p_success":
+        metric = d["p_success"]
+    else:
+        raise ValueError(f"Unknown rank_by: {rank_by} (expected utility|ret_score|p_success)")
 
-    # build sort keys (descending)
-    sort_cols = []
-    for m in metrics:
-        if m == "utility":
-            sort_cols.append("utility")
-        elif m == "ret_score":
-            sort_cols.append("ret_score")
-        elif m == "p_success":
-            sort_cols.append("p_success")
-
-    # 안정 tie-break
-    sort_cols_full = ["Date"] + sort_cols + ["Ticker"]
-    ascending = [True] + [False] * len(sort_cols) + [True]
-
-    d2 = d.copy()
-    d2 = d2.sort_values(sort_cols_full, ascending=ascending)
+    d = d.copy()
+    d["_metric"] = metric
+    d = d.sort_values(["Date", "_metric"], ascending=[True, False])
 
     picks = (
-        d2.groupby("Date", as_index=False, group_keys=False)
+        d.groupby("Date", as_index=False, group_keys=False)
         .head(int(topk))
+        .drop(columns=["_metric"])
         .reset_index(drop=True)
     )
     return picks
 
 
-def resolve_features_source(features_path: str | None) -> tuple[Path, Path, str]:
-    """
-    Priority:
-      1) --features-path (parquet/csv)
-      2) data/features/features_scored.(parquet|csv)
-      3) data/features/features_model.(parquet|csv)
-    """
-    if features_path:
-        fp = Path(features_path)
-        if not fp.exists():
-            raise FileNotFoundError(f"--features-path not found: {fp}")
-        if fp.suffix.lower() == ".parquet":
-            return fp, fp.with_suffix(".csv"), str(fp)
-        return fp.with_suffix(".parquet"), fp, str(fp)
-
-    if DEFAULT_FEATS_SCORED_PARQ.exists() or DEFAULT_FEATS_SCORED_CSV.exists():
-        return DEFAULT_FEATS_SCORED_PARQ, DEFAULT_FEATS_SCORED_CSV, "features_scored"
-
-    return DEFAULT_FEATS_MODEL_PARQ, DEFAULT_FEATS_MODEL_CSV, "features_model"
+def _default_out_paths(out_dir: Path, tag: str, suffix: str) -> tuple[Path, Path]:
+    return (
+        out_dir / f"picks_{tag}_gate_{suffix}.csv",
+        out_dir / f"picks_meta_{tag}_gate_{suffix}.json",
+    )
 
 
-def fmt_tag(pt: float, H: int, sl: float, ex: int) -> str:
-    pt_i = int(round(pt * 100))
-    sl_i = int(round(abs(sl) * 100))
-    return f"pt{pt_i}_h{int(H)}_sl{sl_i}_ex{int(ex)}"
-
-
-# ----------------------------
-# main
-# ----------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Gate picks generator (features_scored preferred).")
+    ap = argparse.ArgumentParser(description="Gate picks generator (reads features_scored if available).")
 
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
@@ -232,64 +214,71 @@ def main() -> None:
     ap.add_argument("--mode", type=str, required=True, help="none|tail|utility|tail_utility")
     ap.add_argument("--tail-threshold", type=float, required=True)
     ap.add_argument("--utility-quantile", type=float, required=True)
-
-    # ✅ allow "utility,ret_score"
-    ap.add_argument("--rank-by", type=str, required=True, help="utility|ret_score|p_success or comma-list")
+    ap.add_argument("--rank-by", type=str, required=True, help="utility|ret_score|p_success")
     ap.add_argument("--lambda-tail", type=float, required=True)
 
-    # grid-lib passes these; keep for compatibility even if unused here
-    ap.add_argument("--tau-gamma", type=float, default=float(os.getenv("TAU_GAMMA", "0.0")))
+    ap.add_argument("--topk", type=int, default=1)
+    ap.add_argument("--ps-min", type=float, default=0.0)
+
+    ap.add_argument("--tag", type=str, required=True)
     ap.add_argument("--suffix", type=str, required=True)
 
-    # outputs / misc
-    ap.add_argument("--out-csv", type=str, required=True)
-    ap.add_argument("--meta-json", type=str, default="")
-    ap.add_argument("--features-path", type=str, default=None)
     ap.add_argument("--exclude-tickers", type=str, default="")
 
-    # ✅ grid-lib에서 안 넘겨도 돌아가게 기본값 제공
-    ap.add_argument("--topk", type=int, default=int(os.getenv("TOPK", "1")))
-    ap.add_argument("--ps-min", type=float, default=float(os.getenv("PS_MIN", "0.0")))
+    # compat outputs
+    ap.add_argument("--out-dir", type=str, default="")
+    ap.add_argument("--require-files", type=str, default="")
+    ap.add_argument("--out-csv", type=str, default="")
+    ap.add_argument("--meta-json", type=str, default="")
+
+    ap.add_argument("--features-path", type=str, default="")
 
     args = ap.parse_args()
 
-    pt = float(args.profit_target)
-    H = int(args.max_days)
-    sl = float(args.stop_level)
-    ex = int(args.max_extend_days)
+    out_dir = Path(args.out_dir) if str(args.out_dir).strip() else Path("data/signals")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    tag = fmt_tag(pt, H, sl, ex)
+    if str(args.out_csv).strip():
+        picks_path = Path(args.out_csv)
+        meta_path = Path(args.meta_json) if str(args.meta_json).strip() else picks_path.with_name(
+            picks_path.name.replace("picks_", "picks_meta_").replace(".csv", ".json")
+        )
+    else:
+        picks_path, meta_path = _default_out_paths(out_dir, args.tag, args.suffix)
 
-    out_csv = Path(args.out_csv)
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    require_files = parse_require_files(args.require_files)
+    if require_files:
+        ensure_required_files_exist(require_files)
 
-    meta_json = Path(args.meta_json) if args.meta_json else out_csv.with_suffix(".json")
-
-    f_parq, f_csv, src_name = resolve_features_source(args.features_path)
-    feats = read_table(f_parq, f_csv).copy()
-    feats_src = str(f_parq if f_parq.exists() else f_csv)
+    # load features
+    if str(args.features_path).strip():
+        fp = Path(args.features_path)
+        if not fp.exists():
+            raise FileNotFoundError(f"features-path not found: {fp}")
+        feats = pd.read_parquet(fp) if fp.suffix.lower() == ".parquet" else pd.read_csv(fp)
+        features_src = str(fp)
+    else:
+        f_parq, f_csv = pick_features_source(require_files)
+        if (not f_parq.exists()) and (not f_csv.exists()):
+            f_parq = Path("data/features/features_model.parquet")
+            f_csv = Path("data/features/features_model.csv")
+        feats = read_table(f_parq, f_csv)
+        features_src = str(f_parq) if f_parq.exists() else str(f_csv)
 
     feats = ensure_date_ticker_columns(feats)
     feats["Date"] = norm_date(feats["Date"])
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
-    feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"]).reset_index(drop=True)
+    feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
-    # required model scores (없으면 0으로 채우고, 이후 gate에서 자연스럽게 걸러짐)
     feats["p_success"] = coerce_num(feats, "p_success", 0.0)
     feats["p_tail"] = coerce_num(feats, "p_tail", 0.0)
     feats["ret_score"] = coerce_num(feats, "ret_score", 0.0)
 
     feats = apply_exclude_tickers(feats, args.exclude_tickers)
 
-    # base gate: p_success min
-    ps_min = float(args.ps_min)
-    if ps_min > 0:
-        feats = feats[feats["p_success"] >= ps_min].copy()
-
-    # utility build
+    feats = feats[feats["p_success"] >= float(args.ps_min)].copy()
     feats["utility"] = build_utility(feats, float(args.lambda_tail))
 
-    # gate
     gated = gate_filter(
         feats,
         mode=args.mode,
@@ -297,42 +286,41 @@ def main() -> None:
         utility_quantile=float(args.utility_quantile),
     )
 
-    # rank + topk
-    picks = rank_topk_per_day_multi(gated, rank_by=args.rank_by, topk=int(args.topk))
+    picks = rank_topk_per_day(gated, rank_by=args.rank_by, topk=int(args.topk))
 
     keep_cols = [c for c in ["Date", "Ticker", "p_success", "p_tail", "ret_score", "utility"] if c in picks.columns]
     picks_out = picks[keep_cols].copy()
 
-    picks_out.to_csv(out_csv, index=False)
+    picks_path.parent.mkdir(parents=True, exist_ok=True)
+    picks_out.to_csv(picks_path, index=False)
 
     meta = {
-        "updated_at_utc": now_utc_iso(),
-        "tag": tag,
+        "tag": args.tag,
         "suffix": args.suffix,
         "mode": args.mode,
         "rank_by": args.rank_by,
         "topk": int(args.topk),
-        "ps_min": float(ps_min),
+        "ps_min": float(args.ps_min),
         "tail_threshold": float(args.tail_threshold),
         "utility_quantile": float(args.utility_quantile),
         "lambda_tail": float(args.lambda_tail),
-        "tau_gamma": float(args.tau_gamma),
         "exclude_tickers": args.exclude_tickers,
-        "features_src": feats_src,
-        "features_kind": src_name,
+        "features_src": features_src,
         "rows_in_features": int(len(feats)),
         "rows_after_gate": int(len(gated)),
         "rows_picks": int(len(picks_out)),
-        "profit_target": float(pt),
-        "max_days": int(H),
-        "stop_level": float(sl),
-        "max_extend_days": int(ex),
-        "out_csv": str(out_csv),
+        "profit_target": float(args.profit_target),
+        "max_days": int(args.max_days),
+        "stop_level": float(args.stop_level),
+        "max_extend_days": int(args.max_extend_days),
+        "require_files": [str(p) for p in require_files],
     }
-    meta_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"[DONE] wrote: {out_csv} rows={len(picks_out)}")
-    print(f"[DONE] wrote: {meta_json}")
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"[DONE] wrote: {picks_path} rows={len(picks_out)}")
+    print(f"[DONE] wrote: {meta_path}")
 
 
 if __name__ == "__main__":
