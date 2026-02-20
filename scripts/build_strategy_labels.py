@@ -1,5 +1,12 @@
-# scripts/build_strategy_labels.py
+#!/usr/bin/env python3
 from __future__ import annotations
+
+# ✅ FIX(A): "python scripts/xxx.py" 실행에서도 scripts.* import 되도록 repo root를 sys.path에 추가
+import sys
+from pathlib import Path as _Path
+_REPO_ROOT = _Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import argparse
 import json
@@ -157,11 +164,10 @@ def main() -> None:
 
     # ✅ feature cols 결정 정책:
     # 1) args.feature_cols 명시 > 2) data/meta/feature_cols.json > 3) SSOT 기본 (sector off)
-    feature_cols: list[str]
     if str(args.feature_cols).strip():
         feature_cols = [c.strip() for c in args.feature_cols.split(",") if c.strip()]
     else:
-        cols_meta, sector_enabled = read_feature_cols_meta()
+        cols_meta, _sector_enabled = read_feature_cols_meta()
         if cols_meta:
             feature_cols = cols_meta
         else:
@@ -184,7 +190,7 @@ def main() -> None:
     tail_h = max_days + ex
 
     out = []
-    for tkr, g in base.groupby("Ticker", sort=False):
+    for _tkr, g in base.groupby("Ticker", sort=False):
         g = g.sort_values("Date").reset_index(drop=True)
 
         close = g["Close"].astype(float)
@@ -211,7 +217,9 @@ def main() -> None:
         g["RetAtMaxDays"] = ret_at_max
         g["ExtendNeeded"] = extend_needed
 
-        g = g.dropna(subset=["Success", "Tail", "FutureMinDD_TailH", "RetAtMaxDays", "ExtendNeeded"]).reset_index(drop=True)
+        g = g.dropna(
+            subset=["Success", "Tail", "FutureMinDD_TailH", "RetAtMaxDays", "ExtendNeeded"]
+        ).reset_index(drop=True)
         out.append(g)
 
     labeled = pd.concat(out, ignore_index=True) if out else pd.DataFrame()
