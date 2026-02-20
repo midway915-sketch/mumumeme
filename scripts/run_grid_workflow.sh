@@ -1,136 +1,124 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# This script orchestrates the gate grid runs using env vars.
-# It relies on scripts/gate_grid_lib.sh and the Python scripts it calls.
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
-
 source scripts/gate_grid_lib.sh
 
-# -------- required env (fail fast)
-: "${PROFIT_TARGET:?missing env PROFIT_TARGET}"
-: "${MAX_DAYS:?missing env MAX_DAYS}"
-: "${STOP_LEVEL:?missing env STOP_LEVEL}"
-: "${MAX_EXTEND_DAYS:?missing env MAX_EXTEND_DAYS}"
-: "${LABEL_KEY:?missing env LABEL_KEY}"
-: "${OUT_DIR:?missing env OUT_DIR}"
+# Required envs
+: "${PROFIT_TARGET:?}"
+: "${MAX_DAYS:?}"
+: "${STOP_LEVEL:?}"
+: "${P_TAIL_THRESHOLDS:?}"
+: "${UTILITY_QUANTILES:?}"
+: "${RANK_METRICS:?}"
+: "${LAMBDA_TAIL:?}"
+: "${GATE_MODES:?}"
+: "${TRAIL_STOPS:?}"
+: "${TP1_FRAC:?}"
+: "${ENABLE_TRAILING:?}"
+: "${TOPK_CONFIGS:?}"
+: "${PS_MINS:?}"
+: "${MAX_LEVERAGE_PCT:?}"
+: "${EXCLUDE_TICKERS:?}"
+: "${REQUIRE_FILES:?}"
+: "${LABEL_KEY:?}"
 
-# optional env
-GATE_MODES="${GATE_MODES:-none,tail,utility,tail_utility}"
-P_TAIL_THRESHOLDS="${P_TAIL_THRESHOLDS:-0.10,0.20,0.30}"
-UTILITY_QUANTILES="${UTILITY_QUANTILES:-0.60,0.75,0.90}"
-RANK_METRICS="${RANK_METRICS:-utility,ret_score}"
-PS_MINS="${PS_MINS:-0.00,0.50,0.60,0.70}"
-TOPK_CONFIGS="${TOPK_CONFIGS:-1|1.0}"
-LAMBDA_TAIL="${LAMBDA_TAIL:-0.05}"
+# ✅ MAX_EXTEND_DAYS 없으면 H//2
+if [ -z "${MAX_EXTEND_DAYS:-}" ]; then
+  MAX_EXTEND_DAYS="$(python - <<PY
+H=int("${MAX_DAYS}")
+print(max(1, H//2))
+PY
+)"
+  export MAX_EXTEND_DAYS
+fi
 
-echo "[INFO] PROFIT_TARGET=${PROFIT_TARGET} MAX_DAYS=${MAX_DAYS} STOP_LEVEL=${STOP_LEVEL} MAX_EXTEND_DAYS=${MAX_EXTEND_DAYS}"
-echo "[INFO] LABEL_KEY=${LABEL_KEY}"
-echo "[INFO] MODES=${GATE_MODES}"
-echo "[INFO] P_TAIL_THRESHOLDS=${P_TAIL_THRESHOLDS}"
-echo "[INFO] UTILITY_QUANTILES=${UTILITY_QUANTILES}"
-echo "[INFO] RANK_METRICS=${RANK_METRICS}"
-echo "[INFO] PS_MINS=${PS_MINS}"
-echo "[INFO] TOPK_CONFIGS=${TOPK_CONFIGS}"
-echo "[INFO] LAMBDA_TAIL=${LAMBDA_TAIL}"
-echo "[INFO] OUT_DIR=${OUT_DIR}"
+# tau_gamma는 지금 파이프라인에서 고정값으로라도 세팅(없으면 0.0)
+TAU_GAMMA="${TAU_GAMMA:-0.0}"
 
-# helpers: split CSV into bash arrays
-IFS=',' read -r -a MODES_ARR <<< "${GATE_MODES}"
-IFS=',' read -r -a TAIL_ARR  <<< "${P_TAIL_THRESHOLDS}"
-IFS=',' read -r -a UQ_ARR    <<< "${UTILITY_QUANTILES}"
-IFS=',' read -r -a RANK_ARR  <<< "${RANK_METRICS}"
-IFS=',' read -r -a PSMIN_ARR <<< "${PS_MINS}"
+OUT_DIR="${OUT_DIR:-data/signals}"
+mkdir -p "$OUT_DIR"
 
-# TOPK_CONFIGS is ';' separated
-IFS=';' read -r -a TOPK_ARR <<< "${TOPK_CONFIGS}"
-
-# suffix maker (safe)
-mk_suffix () {
-  local mode="$1" tail="$2" uq="$3" rank="$4" topk="$5" psmin="$6"
-  # normalize dots
-  local tail_s="${tail//./p}"
-  local uq_s="${uq//./p}"
-  local ps_s="${psmin//./p}"
-  echo "${mode}_t${tail_s}_u${uq_s}_r${rank}_k${topk//|/_}_ps${ps_s}_ex${MAX_EXTEND_DAYS}"
+split_csv() {
+  local s="$1"
+  python - <<PY
+s = """$s"""
+parts=[p.strip() for p in s.split(",") if p.strip()]
+for p in parts:
+  print(p)
+PY
 }
 
-run_mode_none () {
-  local rank="${RANK_ARR[0]:-ret_score}"
-  for topk in "${TOPK_ARR[@]}"; do
-    for psmin in "${PSMIN_ARR[@]}"; do
-      local suffix
-      suffix="$(mk_suffix "none" "0" "0" "${rank}" "${topk}" "${psmin}")"
-      echo "[RUN] mode=none rank=${rank} topk=${topk} psmin=${psmin} suffix=${suffix}"
-      PS_MIN="${psmin}" TOPK="${topk}" \
-      run_one_gate "none" "${LABEL_KEY}" "${suffix}" "0" "0" "${rank}" "${LAMBDA_TAIL}" "${OUT_DIR}"
-    done
-  done
+split_scsv() {
+  local s="$1"
+  python - <<PY
+s = """$s"""
+parts=[p.strip() for p in s.split(";") if p.strip()]
+for p in parts:
+  print(p)
+PY
 }
 
-run_mode_tail () {
-  local rank="${RANK_ARR[0]:-ret_score}"
-  for tail in "${TAIL_ARR[@]}"; do
-    for topk in "${TOPK_ARR[@]}"; do
-      for psmin in "${PSMIN_ARR[@]}"; do
-        local suffix
-        suffix="$(mk_suffix "tail" "${tail}" "0" "${rank}" "${topk}" "${psmin}")"
-        echo "[RUN] mode=tail tail=${tail} rank=${rank} topk=${topk} psmin=${psmin} suffix=${suffix}"
-        PS_MIN="${psmin}" TOPK="${topk}" \
-        run_one_gate "tail" "${LABEL_KEY}" "${suffix}" "${tail}" "0" "${rank}" "${LAMBDA_TAIL}" "${OUT_DIR}"
-      done
-    done
-  done
+first_csv_item() {
+  local s="$1"
+  python - <<PY
+s = """$s"""
+parts=[p.strip() for p in s.split(",") if p.strip()]
+print(parts[0] if parts else "")
+PY
 }
 
-run_mode_utility () {
-  # utility mode: vary utility quantile and rank metric
-  for uq in "${UQ_ARR[@]}"; do
-    for rank in "${RANK_ARR[@]}"; do
-      for topk in "${TOPK_ARR[@]}"; do
-        for psmin in "${PSMIN_ARR[@]}"; do
-          local suffix
-          suffix="$(mk_suffix "utility" "0" "${uq}" "${rank}" "${topk}" "${psmin}")"
-          echo "[RUN] mode=utility uq=${uq} rank=${rank} topk=${topk} psmin=${psmin} suffix=${suffix}"
-          PS_MIN="${psmin}" TOPK="${topk}" \
-          run_one_gate "utility" "${LABEL_KEY}" "${suffix}" "0" "${uq}" "${rank}" "${LAMBDA_TAIL}" "${OUT_DIR}"
-        done
-      done
-    done
-  done
-}
+DEFAULT_TMAX="$(first_csv_item "$P_TAIL_THRESHOLDS")"
+DEFAULT_UQ="$(first_csv_item "$UTILITY_QUANTILES")"
 
-run_mode_tail_utility () {
-  for tail in "${TAIL_ARR[@]}"; do
-    for uq in "${UQ_ARR[@]}"; do
-      for rank in "${RANK_ARR[@]}"; do
-        for topk in "${TOPK_ARR[@]}"; do
-          for psmin in "${PSMIN_ARR[@]}"; do
-            local suffix
-            suffix="$(mk_suffix "tail_utility" "${tail}" "${uq}" "${rank}" "${topk}" "${psmin}")"
-            echo "[RUN] mode=tail_utility tail=${tail} uq=${uq} rank=${rank} topk=${topk} psmin=${psmin} suffix=${suffix}"
-            PS_MIN="${psmin}" TOPK="${topk}" \
-            run_one_gate "tail_utility" "${LABEL_KEY}" "${suffix}" "${tail}" "${uq}" "${rank}" "${LAMBDA_TAIL}" "${OUT_DIR}"
-          done
-        done
-      done
-    done
-  done
-}
+while read -r mode; do
+  mode="$(echo "$mode" | tr '[:upper:]' '[:lower:]' | xargs)"
+  [ -z "$mode" ] && continue
 
-# main
-for mode in "${MODES_ARR[@]}"; do
-  case "${mode}" in
-    none)         run_mode_none ;;
-    tail)         run_mode_tail ;;
-    utility)      run_mode_utility ;;
-    tail_utility) run_mode_tail_utility ;;
-    *)
-      echo "[WARN] unknown mode: ${mode} (skip)"
-      ;;
-  esac
-done
+  if [ "$mode" = "none" ]; then
+    TMAX_LIST="$DEFAULT_TMAX"
+    UQ_LIST="$DEFAULT_UQ"
+  elif [ "$mode" = "tail" ]; then
+    TMAX_LIST="$P_TAIL_THRESHOLDS"
+    UQ_LIST="$DEFAULT_UQ"
+  elif [ "$mode" = "utility" ]; then
+    TMAX_LIST="$DEFAULT_TMAX"
+    UQ_LIST="$UTILITY_QUANTILES"
+  elif [ "$mode" = "tail_utility" ]; then
+    TMAX_LIST="$P_TAIL_THRESHOLDS"
+    UQ_LIST="$UTILITY_QUANTILES"
+  else
+    echo "[ERROR] Unknown mode: $mode"
+    exit 1
+  fi
 
-echo "[DONE] run_grid_workflow.sh finished"
+  while read -r tmax; do
+    while read -r uq; do
+      while read -r rank_by; do
+        while read -r psmin; do
+          while read -r topk_line; do
+            K="${topk_line%%|*}"
+            W="${topk_line#*|}"
+
+            # ✅ 여기서 run_one_gate 호출을 “항상 10개 인자”로 통일
+            # (pt, h, sl, ex, mode, tail_max, u_q, rank_by, lambda_tail, tau_gamma)
+            run_one_gate \
+              "${PROFIT_TARGET}" \
+              "${MAX_DAYS}" \
+              "${STOP_LEVEL}" \
+              "${MAX_EXTEND_DAYS}" \
+              "${mode}" \
+              "${tmax}" \
+              "${uq}" \
+              "${rank_by}" \
+              "${LAMBDA_TAIL}" \
+              "${TAU_GAMMA}"
+
+          done < <(split_scsv "$TOPK_CONFIGS")
+        done < <(split_csv "$PS_MINS")
+      done < <(split_csv "$RANK_METRICS")
+    done < <(split_csv "$UQ_LIST")
+  done < <(split_csv "$TMAX_LIST")
+
+done < <(split_csv "$GATE_MODES")
+
+echo "[DONE] grid finished"
