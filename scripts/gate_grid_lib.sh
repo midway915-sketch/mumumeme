@@ -21,10 +21,12 @@ PY
 }
 
 run_one_gate() {
-  # ✅ 안전장치: 인자 부족해도 -u에서 안 죽도록 기본값 부여
-  local pt="${1:?missing pt}"; local h="${2:?missing h}"; local sl="${3:?missing sl}"; local ex="${4:?missing ex}"
-  local mode="${5:?missing mode}"; local tail_max="${6:-0.0}"; local u_q="${7:-0.0}"; local rank_by="${8:-utility}"
-  local lambda_tail="${9:-0.05}"; local tau_gamma="${10:-0.0}"
+  local pt="$1"; local h="$2"; local sl="$3"; local ex="$4"
+  local mode="$5"; local tail_max="$6"; local u_q="$7"; local rank_by="$8"
+
+  # ✅ FIX: 9/10번째 인자 없어도 안 죽게 기본값 처리
+  local lambda_tail="${9:-${LAMBDA_TAIL:-0.05}}"
+  local tau_gamma="${10:-${TAU_GAMMA:-1.0}}"
 
   local tag; tag="$(build_tag "$pt" "$h" "$sl" "$ex")"
   local suffix="${mode}_t$(tok "$tail_max")_q$(tok "$u_q")_r${rank_by}"
@@ -42,20 +44,22 @@ run_one_gate() {
   echo "[RUN] picks=${picks}"
   echo "=============================="
 
-  # 1) picks 생성
   python scripts/predict_gate.py \
     --profit-target "$pt" \
     --max-days "$h" \
     --stop-level "$sl" \
     --max-extend-days "$ex" \
     --mode "$mode" \
+    --tag "$tag" \
+    --suffix "$suffix" \
     --tail-threshold "$tail_max" \
     --utility-quantile "$u_q" \
     --rank-by "$rank_by" \
     --lambda-tail "$lambda_tail" \
-    --tau-gamma "$tau_gamma" \
-    --suffix "$suffix" \
-    --out-csv "$picks"
+    --topk 1 \
+    --ps-min 0.0 \
+    --out-dir "data/signals" \
+    --require-files "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl"
 
   if [ ! -f "$picks" ]; then
     echo "[ERROR] picks not created: $picks"
@@ -63,7 +67,6 @@ run_one_gate() {
     exit 1
   fi
 
-  # 2) 시뮬
   python scripts/simulate_single_position_engine.py \
     --profit-target "$pt" \
     --max-days "$h" \
@@ -71,16 +74,15 @@ run_one_gate() {
     --max-extend-days "$ex" \
     --picks-path "$picks" \
     --tag "$tag" \
-    --suffix "$suffix"
+    --suffix "$suffix" \
+    --out-dir "data/signals"
 
   if [ ! -f "$trades" ]; then
     echo "[ERROR] trades parquet not created: $trades"
-    echo "[DEBUG] signals dir:"
     ls -la data/signals | sed -n '1,200p' || true
     exit 1
   fi
 
-  # 3) 요약
   python scripts/summarize_sim_trades.py \
     --trades-path "$trades" \
     --tag "$tag" \
