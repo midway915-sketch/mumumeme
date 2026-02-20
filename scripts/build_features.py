@@ -5,14 +5,16 @@ from __future__ import annotations
 # ✅ FIX: "python scripts/xxx.py"로 실행될 때도 scripts.* import가 되도록 repo root를 sys.path에 추가
 import sys
 from pathlib import Path as _Path
+
 _REPO_ROOT = _Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import argparse
 from pathlib import Path
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 
 from scripts.feature_spec import (
     get_feature_cols,
@@ -30,7 +32,7 @@ PRICES_CSV = RAW_DIR / "prices.csv"
 OUT_PARQ = FEAT_DIR / "features_model.parquet"
 OUT_CSV = FEAT_DIR / "features_model.csv"
 
-MARKET_TICKER = "SPY"   # market proxy (must exist in raw prices)
+MARKET_TICKER = "SPY"  # market proxy (must exist in raw prices)
 
 
 # -----------------------------
@@ -112,6 +114,9 @@ def compute_market_features(prices: pd.DataFrame) -> pd.DataFrame:
     if m.empty:
         raise ValueError(f"Market ticker {MARKET_TICKER} not found. Use fetch_prices.py --include-extra")
 
+    m["Date"] = pd.to_datetime(m["Date"], errors="coerce").dt.tz_localize(None)
+    m = m.dropna(subset=["Date"]).reset_index(drop=True)
+
     c = pd.to_numeric(m["Close"], errors="coerce")
 
     roll_max_252 = c.rolling(252, min_periods=252).max()
@@ -122,17 +127,24 @@ def compute_market_features(prices: pd.DataFrame) -> pd.DataFrame:
     # daily returns for beta
     mret = c.pct_change()
 
-    out = pd.DataFrame({
-        "Date": pd.to_datetime(m["Date"], errors="coerce").dt.tz_localize(None).values,
-        "Market_Drawdown": mdd.values,
-        "Market_ATR_ratio": atr_ratio.values,
-        "Market_ret_1d": mret.values,
-    }).sort_values("Date").reset_index(drop=True)
+    out = pd.DataFrame(
+        {
+            "Date": m["Date"].to_numpy(),
+            "Market_Drawdown": mdd.to_numpy(),
+            "Market_ATR_ratio": atr_ratio.to_numpy(),
+            "Market_ret_1d": mret.to_numpy(),
+        }
+    ).sort_values("Date").reset_index(drop=True)
 
     return out
 
 
 def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> pd.DataFrame:
+    """
+    ✅ 핵심 FIX:
+      - r(티커 수익률)과 mret(시장 수익률)을 "같은 index(g.index)"로 맞춰서
+        rolling.cov/var에서 pandas align로 길이 꼬이는 문제를 막음.
+    """
     g = g.sort_values("Date").copy()
     dt = pd.to_datetime(g["Date"], errors="coerce").dt.tz_localize(None)
 
@@ -174,35 +186,67 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
     ema50 = ema(c, 50)
     trend_align = (c / ema50) - 1.0
 
-    r = c.pct_change()
-    mret = market_ret_by_date.reindex(dt).astype(float)
+    # --- beta_60 (✅ index 정렬)
+    r = c.pct_change()  # index = g.index
+    mret_np = market_ret_by_date.reindex(dt).to_numpy(dtype=float)  # length == len(g)
+    mret = pd.Series(mret_np, index=g.index)  # ✅ align index with r
+
     cov = r.rolling(60, min_periods=60).cov(mret)
     var = mret.rolling(60, min_periods=60).var()
     beta_60 = cov / var
 
-    out = pd.DataFrame({
-        "Date": dt.values,
-        "Ticker": g["Ticker"].values,
+    # ✅ 방어: 길이 체크(여기서 깨지면 바로 원인 찾기 쉬움)
+    n = len(g)
+    cols_for_len = {
+        "Date": len(dt),
+        "Ticker": len(g["Ticker"]),
+        "Drawdown_252": len(dd_252),
+        "Drawdown_60": len(dd_60),
+        "ATR_ratio": len(atr_ratio),
+        "Z_score": len(z),
+        "MACD_hist": len(macd_hist),
+        "MA20_slope": len(ma20_slope),
+        "ret_score": len(ret_score),
+        "ret_5": len(ret_5),
+        "ret_10": len(ret_10),
+        "ret_20": len(ret_20),
+        "breakout_20": len(breakout_20),
+        "vol_surge": len(vol_surge),
+        "trend_align": len(trend_align),
+        "beta_60": len(beta_60),
+        "Volume": len(v),
+        "Close": len(c),
+    }
+    bad = {k: v for k, v in cols_for_len.items() if v != n}
+    if bad:
+        raise ValueError(f"Feature length mismatch for ticker={g['Ticker'].iloc[0]}: expected={n}, got={bad}")
 
-        "Drawdown_252": dd_252.values,
-        "Drawdown_60": dd_60.values,
-        "ATR_ratio": atr_ratio.values,
-        "Z_score": z.values,
-        "MACD_hist": macd_hist.values,
-        "MA20_slope": ma20_slope.values,
-        "ret_score": ret_score.values,
+    out = pd.DataFrame(
+        {
+            "Date": dt.to_numpy(),
+            "Ticker": g["Ticker"].to_numpy(),
 
-        "ret_5": ret_5.values,
-        "ret_10": ret_10.values,
-        "ret_20": ret_20.values,
-        "breakout_20": breakout_20.values,
-        "vol_surge": vol_surge.values,
-        "trend_align": trend_align.values,
-        "beta_60": beta_60.values,
+            "Drawdown_252": dd_252.to_numpy(),
+            "Drawdown_60": dd_60.to_numpy(),
+            "ATR_ratio": atr_ratio.to_numpy(),
+            "Z_score": z.to_numpy(),
+            "MACD_hist": macd_hist.to_numpy(),
+            "MA20_slope": ma20_slope.to_numpy(),
+            "ret_score": ret_score.to_numpy(),
 
-        "Volume": v.values,
-        "Close": c.values,
-    })
+            "ret_5": ret_5.to_numpy(),
+            "ret_10": ret_10.to_numpy(),
+            "ret_20": ret_20.to_numpy(),
+            "breakout_20": breakout_20.to_numpy(),
+            "vol_surge": vol_surge.to_numpy(),
+            "trend_align": trend_align.to_numpy(),
+            "beta_60": beta_60.to_numpy(),
+
+            # optional debug columns (kept for future filters)
+            "Volume": v.to_numpy(),
+            "Close": c.to_numpy(),
+        }
+    )
 
     return out
 
@@ -217,14 +261,22 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict[str, s
         raise RuntimeError("feats missing ret_20 -> cannot build Sector_Ret_20 / RelStrength")
 
     x = feats.copy()
-    x["Group"] = x["Ticker"].map(ticker_to_group).fillna("UNKNOWN")
+    x["Group"] = x["Ticker"].map(ticker_to_group)
+
+    # Group이 없는 티커가 있으면 지금은 바로 실패시키는 게 안전(섹터 강제니까)
+    if x["Group"].isna().any():
+        missing = sorted(x.loc[x["Group"].isna(), "Ticker"].unique().tolist())
+        raise ValueError(
+            f"Missing Group mapping for tickers (sector features required): {missing}\n"
+            f"-> Fix data/universe.csv Group values."
+        )
 
     sector_ret = (
         x.groupby(["Date", "Group"], as_index=False)["ret_20"]
         .mean()
         .rename(columns={"ret_20": "Sector_Ret_20"})
     )
-    x = x.merge(sector_ret, on=["Date", "Group"], how="left")
+    x = x.merge(sector_ret, on=["Date", "Group"], how="left", validate="many_to_one")
     x["RelStrength"] = pd.to_numeric(x["ret_20"], errors="coerce") - pd.to_numeric(x["Sector_Ret_20"], errors="coerce")
 
     if "Sector_Ret_20" not in x.columns or "RelStrength" not in x.columns:
@@ -239,8 +291,6 @@ def main() -> None:
     ap.add_argument("--max-window", type=int, default=260, help="max rolling window used (controls lookback)")
     ap.add_argument("--buffer-days", type=int, default=40, help="extra days added to lookback for safety")
     ap.add_argument("--min-volume", type=float, default=0.0, help="optional: drop rows with Volume < min-volume")
-
-    # ✅ 섹터 피처는 '무조건' 사용 (옵션 제거/무시)
     args = ap.parse_args()
 
     FEAT_DIR.mkdir(parents=True, exist_ok=True)
@@ -259,35 +309,46 @@ def main() -> None:
 
     market = compute_market_features(prices)
     market = market.sort_values("Date").reset_index(drop=True)
+
     market_ret_by_date = pd.Series(
-        market["Market_ret_1d"].values,
-        index=pd.to_datetime(market["Date"]).dt.tz_localize(None),
+        market["Market_ret_1d"].to_numpy(dtype=float),
+        index=pd.to_datetime(market["Date"], errors="coerce").dt.tz_localize(None),
     )
 
-    feats_list = []
+    feats_list: list[pd.DataFrame] = []
     for _t, g in prices.groupby("Ticker", sort=False):
         feats_list.append(compute_ticker_features(g, market_ret_by_date=market_ret_by_date))
-    feats = pd.concat(feats_list, ignore_index=True)
+
+    feats = pd.concat(feats_list, ignore_index=True) if feats_list else pd.DataFrame()
+    if feats.empty:
+        raise RuntimeError("No features produced. Check prices input.")
 
     feats = feats.copy()
     feats["Date"] = pd.to_datetime(feats["Date"], errors="coerce").dt.tz_localize(None)
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
 
+    # merge market columns needed by SSOT
     market_merge_cols = ["Date", "Market_Drawdown", "Market_ATR_ratio"]
-    feats = feats.merge(market[market_merge_cols], on="Date", how="left")
+    feats = feats.merge(market[market_merge_cols], on="Date", how="left", validate="many_to_one")
 
     if args.min_volume and args.min_volume > 0:
         feats = feats.loc[pd.to_numeric(feats["Volume"], errors="coerce") >= float(args.min_volume)].copy()
 
-    # ✅ sector features are REQUIRED
+    # ✅ sector features are REQUIRED (always)
     ticker_to_group = read_universe_groups_strict()
     feats = add_sector_strength_strict(feats, ticker_to_group=ticker_to_group)
 
-    # ✅ 무조건 True
+    # ✅ sector always enabled => SSOT cols = 18 (9+7+2)
     sector_enabled = True
-
-    # ✅ SSOT 피처셋(섹터 포함)
     FEATURE_COLS = get_feature_cols(sector_enabled=sector_enabled)
+
+    # ✅ 18개 강제(SSOT 안정성)
+    if len(FEATURE_COLS) != 18:
+        raise RuntimeError(f"SSOT feature cols must be 18, got {len(FEATURE_COLS)}: {FEATURE_COLS}")
+
+    missing_cols = [c for c in FEATURE_COLS if c not in feats.columns]
+    if missing_cols:
+        raise RuntimeError(f"Computed features missing SSOT columns: {missing_cols}")
 
     # dropna (strict)
     feats = feats.dropna(subset=FEATURE_COLS + ["Date", "Ticker"]).copy()
@@ -295,16 +356,21 @@ def main() -> None:
     if start_date is not None:
         feats = feats.loc[pd.to_datetime(feats["Date"], errors="coerce") >= start_date].copy()
 
-    feats = feats.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
+    feats = (
+        feats.sort_values(["Date", "Ticker"])
+        .drop_duplicates(["Date", "Ticker"], keep="last")
+        .reset_index(drop=True)
+    )
 
     # save
     try:
         feats.to_parquet(OUT_PARQ, index=False)
     except Exception as e:
         print(f"[WARN] parquet save failed ({e}) -> writing csv only")
+
     feats.to_csv(OUT_CSV, index=False)
 
-    # ✅ FIX: feature_spec.py 시그니처에 맞게 cols= 로 호출
+    # ✅ SSOT meta write (cols= 시그니처)
     meta_path = write_feature_cols_meta(cols=FEATURE_COLS, sector_enabled=sector_enabled)
 
     print(f"[DONE] wrote: {OUT_PARQ} rows={len(feats)}")
@@ -312,7 +378,7 @@ def main() -> None:
         dmin = pd.to_datetime(feats["Date"]).min().date()
         dmax = pd.to_datetime(feats["Date"]).max().date()
         print(f"[INFO] range: {dmin}..{dmax}")
-        print(f"[INFO] sector strength: ENABLED (required)")
+        print("[INFO] sector strength: ENABLED (required)")
         print(f"[INFO] feature_cols_meta: {meta_path}")
         print(f"[INFO] feature_cols({len(FEATURE_COLS)}): {FEATURE_COLS}")
 
