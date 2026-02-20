@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import re
-import math
 import pandas as pd
 import numpy as np
 
@@ -23,9 +22,8 @@ def _read_prices(prices_parq: Path, prices_csv: Path) -> pd.DataFrame:
 
     if "Date" not in df.columns or "Ticker" not in df.columns:
         raise ValueError("prices must have Date,Ticker")
-    for c in ["Close"]:
-        if c not in df.columns:
-            raise ValueError(f"prices missing {c}")
+    if "Close" not in df.columns:
+        raise ValueError("prices missing Close")
 
     df = df.copy()
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
@@ -41,7 +39,6 @@ def _find_suffix_from_summary_path(p: Path) -> str:
     m = re.match(r"gate_summary_(.+)_gate_(.+)\.csv$", name)
     if m:
         return m.group(2)
-    # fallback
     return p.stem.replace("gate_summary_", "")
 
 
@@ -71,20 +68,20 @@ def _calc_cagr(start_equity: float, end_equity: float, days: float) -> float:
 def _qqq_stats(prices: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> tuple[float, float, float]:
     """
     Return (qqq_seed_multiple, qqq_cagr, days)
-    - Uses last available close on/after start and last available close on/before end
+    - Uses first available close with Date >= start
+    - Uses last available close with Date <= end
     """
     q = prices.loc[prices["Ticker"] == "QQQ"].copy()
     if q.empty:
         return (float("nan"), float("nan"), float("nan"))
 
     q = q.sort_values("Date")
-    # pick start price: first close with Date >= start
+
     q_start = q.loc[q["Date"] >= start]
     if q_start.empty:
         return (float("nan"), float("nan"), float("nan"))
     p0 = float(q_start["Close"].iloc[0])
 
-    # pick end price: last close with Date <= end
     q_end = q.loc[q["Date"] <= end]
     if q_end.empty:
         return (float("nan"), float("nan"), float("nan"))
@@ -95,15 +92,43 @@ def _qqq_stats(prices: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> 
 
     mult = p1 / p0
     days = float((end - start).days)
-    cagr = _calc_cagr(1.0, mult, days)  # treat as seed multiple
+    cagr = _calc_cagr(1.0, mult, days)
     return (float(mult), float(cagr), float(days))
 
 
-def enrich_one_summary(
-    row: pd.Series,
-    signals_dir: Path,
-    prices: pd.DataFrame,
-) -> dict:
+def _clean_curve(curve: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize curve columns:
+      - Date (datetime)
+      - Equity (float)
+      - InCycle (int 0/1) from InCycle or InPosition if present else 0
+    Also sorts by Date and drops duplicate Date keeping last.
+    """
+    c = curve.copy()
+
+    if "Date" not in c.columns or "Equity" not in c.columns:
+        return pd.DataFrame()
+
+    c["Date"] = _safe_to_dt(c["Date"])
+    c["Equity"] = pd.to_numeric(c["Equity"], errors="coerce")
+
+    if "InCycle" in c.columns:
+        inc = pd.to_numeric(c["InCycle"], errors="coerce").fillna(0).astype(int)
+    elif "InPosition" in c.columns:
+        inc = pd.to_numeric(c["InPosition"], errors="coerce").fillna(0).astype(int)
+    else:
+        inc = pd.Series([0] * len(c), index=c.index, dtype=int)
+
+    c["InCycle"] = (inc > 0).astype(int)
+
+    c = c.dropna(subset=["Date", "Equity"]).sort_values("Date").reset_index(drop=True)
+
+    # Date 중복이 있으면 "마지막 상태"를 남김
+    c = c.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+    return c
+
+
+def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) -> dict:
     """
     Add:
       - WarmupEndDate (first EntryDate)
@@ -111,6 +136,7 @@ def enrich_one_summary(
       - IdleDaysAfterWarmup / IdlePctAfterWarmup
       - CAGR_AfterWarmup
       - QQQ_SeedMultiple_SamePeriod / QQQ_CAGR_SamePeriod
+      - ExcessCAGR_AfterWarmup
       - ActiveDaysAfterWarmup
     """
     tag = str(row.get("TAG", "run"))
@@ -122,7 +148,6 @@ def enrich_one_summary(
     tpath = _trades_path(signals_dir, tag, suffix)
 
     if (not cpath.exists()) or (not tpath.exists()):
-        # if missing, just NaN fields
         out.update({
             "WarmupEndDate": "",
             "BacktestDaysAfterWarmup": np.nan,
@@ -132,6 +157,7 @@ def enrich_one_summary(
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
         })
         return out
 
@@ -146,6 +172,7 @@ def enrich_one_summary(
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
         })
         return out
 
@@ -160,13 +187,15 @@ def enrich_one_summary(
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
         })
         return out
 
     warmup_end = entry.min()
 
-    curve = pd.read_parquet(cpath)
-    if curve.empty or "Date" not in curve.columns or "Equity" not in curve.columns:
+    curve_raw = pd.read_parquet(cpath)
+    curve = _clean_curve(curve_raw)
+    if curve.empty:
         out.update({
             "WarmupEndDate": str(warmup_end.date()),
             "BacktestDaysAfterWarmup": np.nan,
@@ -176,20 +205,9 @@ def enrich_one_summary(
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
         })
         return out
-
-    curve = curve.copy()
-    curve["Date"] = _safe_to_dt(curve["Date"])
-    curve["Equity"] = pd.to_numeric(curve["Equity"], errors="coerce")
-    if "InCycle" in curve.columns:
-        inc = pd.to_numeric(curve["InCycle"], errors="coerce").fillna(0).astype(int)
-    elif "InPosition" in curve.columns:
-        inc = pd.to_numeric(curve["InPosition"], errors="coerce").fillna(0).astype(int)
-    else:
-        inc = pd.Series([0] * len(curve), index=curve.index)
-
-    curve = curve.dropna(subset=["Date", "Equity"]).sort_values("Date").reset_index(drop=True)
 
     # only after warmup_end (include warmup_end day)
     cur2 = curve.loc[curve["Date"] >= warmup_end].copy()
@@ -203,13 +221,12 @@ def enrich_one_summary(
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
         })
         return out
 
-    inc2 = inc.loc[cur2.index] if inc.index.equals(curve.index) else pd.to_numeric(cur2.get("InCycle", 0), errors="coerce").fillna(0).astype(int)
-
-    start_date = cur2["Date"].iloc[0]
-    end_date = cur2["Date"].iloc[-1]
+    start_date = pd.Timestamp(cur2["Date"].iloc[0])
+    end_date = pd.Timestamp(cur2["Date"].iloc[-1])
     days = float((end_date - start_date).days)
 
     start_eq = float(cur2["Equity"].iloc[0])
@@ -217,12 +234,14 @@ def enrich_one_summary(
 
     cagr = _calc_cagr(start_eq, end_eq, days)
 
+    # ✅ Active/Idle days are "Date-based" (already unique after _clean_curve)
     total_days = int(cur2["Date"].nunique())
-    active_days = int((inc2 > 0).sum())
+    active_days = int((cur2["InCycle"] > 0).sum())
     idle_days = int(max(0, total_days - active_days))
     idle_pct = float(idle_days / total_days) if total_days > 0 else float("nan")
 
     qqq_mult, qqq_cagr, _ = _qqq_stats(prices, start_date, end_date)
+    excess_cagr = cagr - qqq_cagr if np.isfinite(cagr) and np.isfinite(qqq_cagr) else float("nan")
 
     out.update({
         "WarmupEndDate": str(warmup_end.date()),
@@ -233,6 +252,7 @@ def enrich_one_summary(
         "CAGR_AfterWarmup": cagr,
         "QQQ_SeedMultiple_SamePeriod": qqq_mult,
         "QQQ_CAGR_SamePeriod": qqq_cagr,
+        "ExcessCAGR_AfterWarmup": excess_cagr,
     })
     return out
 
@@ -265,10 +285,9 @@ def main() -> None:
         df = _read_csv(sp)
         if df.empty:
             continue
+
         row = df.iloc[0].copy()
 
-        # normalize expected fields from summarize_sim_trades.py
-        # TAG and GateSuffix must exist
         if "TAG" not in row.index:
             row["TAG"] = "run"
         if "GateSuffix" not in row.index:
@@ -288,21 +307,20 @@ def main() -> None:
         "MaxHoldingDaysObserved", "MaxExtendDaysObserved",
         "CycleCount", "SuccessRate",
         "MaxLeveragePct",
-        "CAGR_AfterWarmup", "QQQ_CAGR_SamePeriod",
+        "CAGR_AfterWarmup", "QQQ_CAGR_SamePeriod", "ExcessCAGR_AfterWarmup",
         "IdlePctAfterWarmup",
+        "QQQ_SeedMultiple_SamePeriod",
     ]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    # ---- add a simple "lever-adjusted" score (optional)
-    # This keeps your existing idea: higher seed multiple, lower leverage peak
+    # ---- leverage-adjusted score (optional)
     if "SeedMultiple" in out.columns and "MaxLeveragePct" in out.columns:
         lev = out["MaxLeveragePct"].fillna(0.0)
-        sm = out["SeedMultiple"].fillna(np.nan)
-        # penalize leverage: divide by (1 + lev)
+        sm = out["SeedMultiple"].astype(float)
         out["SeedMultiple_LevAdj"] = sm / (1.0 + lev)
 
-    # ---- sort aggregate: prefer SeedMultiple first, then LevAdj, then CAGR
+    # ---- sort aggregate: prefer SeedMultiple first, then LevAdj, then CAGR, then ExcessCAGR
     sort_cols = []
     if "SeedMultiple" in out.columns:
         sort_cols.append("SeedMultiple")
@@ -310,6 +328,8 @@ def main() -> None:
         sort_cols.append("SeedMultiple_LevAdj")
     if "CAGR_AfterWarmup" in out.columns:
         sort_cols.append("CAGR_AfterWarmup")
+    if "ExcessCAGR_AfterWarmup" in out.columns:
+        sort_cols.append("ExcessCAGR_AfterWarmup")
 
     if sort_cols:
         out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols))
@@ -319,7 +339,7 @@ def main() -> None:
     out.to_csv(out_path, index=False)
     print(f"[DONE] wrote aggregate: {out_path} rows={len(out)}")
 
-    # ---- Top-by-recent10y (너가 계속 보던 지표 유지)
+    # ---- Top-by-recent10y (기존 지표 유지)
     top = out.copy()
     if "Recent10Y_SeedMultiple" in top.columns:
         top = top.sort_values(["Recent10Y_SeedMultiple"], ascending=[False])
@@ -332,10 +352,10 @@ def main() -> None:
     if len(out):
         best = out.iloc[0].to_dict()
         print("=" * 60)
-        print("[BEST] (by SeedMultiple / LevAdj / CAGR)")
+        print("[BEST] (by SeedMultiple / LevAdj / CAGR / ExcessCAGR)")
         print(f"TAG={best.get('TAG')} suffix={best.get('GateSuffix')}")
         print(f"SeedMultiple={best.get('SeedMultiple')}  Recent10Y={best.get('Recent10Y_SeedMultiple')}")
-        print(f"CAGR_AfterWarmup={best.get('CAGR_AfterWarmup')}  QQQ_CAGR={best.get('QQQ_CAGR_SamePeriod')}")
+        print(f"CAGR_AfterWarmup={best.get('CAGR_AfterWarmup')}  QQQ_CAGR={best.get('QQQ_CAGR_SamePeriod')}  Excess={best.get('ExcessCAGR_AfterWarmup')}")
         print(f"IdlePctAfterWarmup={best.get('IdlePctAfterWarmup')}  MaxLevPct={best.get('MaxLeveragePct')}")
         print("=" * 60)
 
