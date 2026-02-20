@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # scripts/fetch_prices.py
 from __future__ import annotations
 
@@ -26,6 +27,22 @@ def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _utc_today_normalized() -> pd.Timestamp:
+    # pandas/버전별 tz 처리 차이 방어
+    return pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+
+
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [str(c[0]).strip() for c in df.columns]
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
 def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensure df has columns:
@@ -34,13 +51,7 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df is None:
         return pd.DataFrame()
 
-    df = df.copy()
-
-    # MultiIndex columns -> flatten (defensive)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-
-    df.columns = [str(c).strip() for c in df.columns]
+    df = _flatten_columns(df)
 
     # Date normalize
     if "Date" not in df.columns:
@@ -71,7 +82,27 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+
+    # numeric normalize (build_features 쪽에서 다시 coerce하긴 하는데 여기서도 정리)
+    for c in ["Open", "High", "Low", "Close", "AdjClose", "Volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     return df
+
+
+def _normalize_enabled_col(s: pd.Series) -> pd.Series:
+    """
+    Enabled가 bool/0/1/"true"/"TRUE"/"yes" 등 섞여 있어도 안전하게 bool로 정규화.
+    """
+    x = s.copy()
+    if x.dtype == bool:
+        return x
+    # 문자열/숫자 혼합 대응
+    x = x.astype(str).str.strip().str.lower()
+    truthy = {"true", "1", "yes", "y", "t"}
+    falsy = {"false", "0", "no", "n", "f", "", "nan", "none"}
+    return x.apply(lambda v: True if v in truthy else (False if v in falsy else False))
 
 
 def read_universe(path: Path) -> list[str]:
@@ -83,10 +114,14 @@ def read_universe(path: Path) -> list[str]:
         raise ValueError("universe.csv must contain 'Ticker' column")
 
     if "Enabled" in uni.columns:
-        # strict boolean filter
-        uni = uni[uni["Enabled"] == True]  # noqa: E712
+        uni = uni.copy()
+        uni["Enabled"] = _normalize_enabled_col(uni["Enabled"])
+        uni = uni.loc[uni["Enabled"] == True].copy()  # noqa: E712
 
     tickers = uni["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+    tickers = [t for t in tickers if t]
+    if not tickers:
+        raise RuntimeError("Universe tickers became empty after Enabled filter. Check universe.csv Enabled values.")
     return tickers
 
 
@@ -117,16 +152,16 @@ def safe_download_one(
             df.index = pd.to_datetime(df.index).tz_localize(None)
             df.index.name = "Date"
 
+            df = _flatten_columns(df)
+
             expected = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
             missing = [c for c in expected if c not in df.columns]
             if missing:
-                df.columns = [str(c).strip() for c in df.columns]
-                missing = [c for c in expected if c not in df.columns]
-                if missing:
-                    raise ValueError(f"{ticker} missing columns: {missing} (cols={list(df.columns)})")
+                raise ValueError(f"{ticker} missing columns: {missing} (cols={list(df.columns)})")
 
             df = df[expected].rename(columns={"Adj Close": "AdjClose"}).reset_index()
             df.insert(1, "Ticker", ticker)
+
             return normalize_schema(df)
 
         except Exception as e:
@@ -167,22 +202,21 @@ def clamp_start_by_max_years(start: str | None, max_years: int) -> str | None:
     Clamp start to be no earlier than (today - max_years).
     If start is None or invalid, returns the clamp date string.
     """
-    today = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    today = _utc_today_normalized()
     min_start = (today - pd.Timedelta(days=int(max_years) * 365)).date()
     min_start_str = str(min_start)
 
     if start is None:
         return min_start_str
 
-    try:
-        sdt = pd.to_datetime(start, errors="coerce")
-        if pd.isna(sdt):
-            return min_start_str
-        if sdt.date() < min_start:
-            return min_start_str
-        return start
-    except Exception:
+    sdt = pd.to_datetime(start, errors="coerce")
+    if pd.isna(sdt):
         return min_start_str
+    if sdt.tzinfo is not None:
+        sdt = sdt.tz_localize(None)
+    if sdt.date() < min_start:
+        return min_start_str
+    return str(sdt.date())
 
 
 def main() -> None:
@@ -204,11 +238,9 @@ def main() -> None:
     else:
         tickers = sorted(set(tickers))
 
-    # clamp info
-    today = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    today = _utc_today_normalized()
     min_start = (today - pd.Timedelta(days=int(args.max_years) * 365)).date()
     print(f"[INFO] max-years={args.max_years} -> clamp start >= {min_start}")
-
     print(f"[INFO] tickers={len(tickers)} -> {tickers}")
 
     if args.reset:
@@ -233,11 +265,13 @@ def main() -> None:
             if args.force_full or existing.empty or t not in last_dates:
                 start = args.start
             else:
-                ld = pd.to_datetime(last_dates[t])
-                start_dt = (ld - pd.Timedelta(days=int(args.lookback_days))).date()
-                start = args.start or str(start_dt)
+                ld = pd.to_datetime(last_dates[t], errors="coerce")
+                if pd.isna(ld):
+                    start = args.start
+                else:
+                    start_dt = (ld - pd.Timedelta(days=int(args.lookback_days))).date()
+                    start = args.start or str(start_dt)
 
-            # clamp start by max-years (always)
             start = clamp_start_by_max_years(start, int(args.max_years))
 
             df_new = safe_download_one(
@@ -259,7 +293,7 @@ def main() -> None:
 
     new_all = normalize_schema(pd.concat(downloads, ignore_index=True))
 
-    # also clamp the combined data itself (defensive)
+    # defensive clamp
     min_start_ts = pd.Timestamp(min_start)
     new_all = new_all[new_all["Date"] >= min_start_ts].reset_index(drop=True)
 
