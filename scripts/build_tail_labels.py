@@ -10,40 +10,24 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-
 # ------------------------------------------------------------
 # sys.path guard (avoid "No module named 'scripts'")
 # ------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(ROOT / "scripts") not in sys.path:
-    sys.path.insert(0, str(ROOT / "scripts"))
 
 try:
     # prefer SSOT feature spec if available
     from scripts.feature_spec import read_feature_cols_meta, get_feature_cols  # type: ignore
 except Exception:
     try:
-        # fallback when scripts isn't a package
         from feature_spec import read_feature_cols_meta, get_feature_cols  # type: ignore
     except Exception:
-        # last resort: minimal fallback (sector off)
-        def read_feature_cols_meta():
-            return ([], False)
-
-        def get_feature_cols(sector_enabled: bool = False):
-            base = [
-                "Drawdown_252", "Drawdown_60", "ATR_ratio", "Z_score",
-                "MACD_hist", "MA20_slope", "Market_Drawdown", "Market_ATR_ratio",
-                "ret_score",
-                "ret_5", "ret_10", "ret_20",
-                "breakout_20", "vol_surge", "trend_align", "beta_60",
-            ]
-            if sector_enabled:
-                base += ["Sector_Ret_20", "RelStrength"]
-            return base
-
+        raise ImportError(
+            "Cannot import feature_spec (scripts.feature_spec or feature_spec). "
+            "This pipeline requires feature_spec to enforce SSOT 18 features."
+        )
 
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
@@ -79,39 +63,65 @@ def save_table(df: pd.DataFrame, parq: Path, csv: Path) -> str:
     parq.parent.mkdir(parents=True, exist_ok=True)
     try:
         df.to_parquet(parq, index=False)
-        return str(parq)
+        return f"parquet:{parq}"
     except Exception:
         df.to_csv(csv, index=False)
-        return str(csv)
+        return f"csv:{csv}"
 
 
 def _norm_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
-def resolve_feature_cols(args_feature_cols: str) -> tuple[list[str], str]:
-    """
-    Priority:
-      1) --feature-cols explicit
-      2) data/meta/feature_cols.json (SSOT)
-      3) fallback SSOT default (sector disabled)
-    """
-    override = [x.strip() for x in str(args_feature_cols or "").split(",") if x.strip()]
-    if override:
-        return override, "--feature-cols"
-
-    cols_meta, _sector_enabled = read_feature_cols_meta()
-    if cols_meta:
-        return cols_meta, "data/meta/feature_cols.json"
-
-    return get_feature_cols(sector_enabled=False), "feature_spec.py (fallback)"
-
-
 def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source_hint: str = "") -> None:
     missing = [c for c in feat_cols if c not in df.columns]
     if missing:
         hint = f" (src={source_hint})" if source_hint else ""
-        raise ValueError(f"Missing feature columns{hint}: {missing}")
+        raise ValueError(
+            f"Missing feature columns{hint}: {missing}\n"
+            f"-> build_features.py must output all 18 SSOT features (including sector 2)."
+        )
+
+
+def resolve_feature_cols_forced(args_feature_cols: str) -> tuple[list[str], str]:
+    """
+    ✅ 18개(섹터 포함) SSOT 강제
+
+    규칙:
+      - --feature-cols 를 주면: 흔들리면 안 되므로 에러로 FAIL FAST
+      - SSOT(meta/feature_cols.json) 있으면 그걸 사용
+      - 없으면 get_feature_cols(sector_enabled=True) 사용
+      - 무엇을 쓰든 반드시:
+          (1) len == 18
+          (2) Sector_Ret_20, RelStrength 포함
+    """
+    if str(args_feature_cols or "").strip():
+        raise ValueError(
+            "--feature-cols override is not allowed when SSOT 18 features are enforced.\n"
+            "Remove --feature-cols and rely on SSOT/meta + feature_spec."
+        )
+
+    cols_meta, sector_enabled_meta = read_feature_cols_meta()
+    if cols_meta:
+        cols = [str(c).strip() for c in cols_meta if str(c).strip()]
+        src = "data/meta/feature_cols.json"
+        # meta에 sector_enabled가 false라도, 우리는 섹터 강제라서 검증으로 잡는다.
+        _validate_18_cols(cols, src)
+        return cols, src
+
+    cols = [str(c).strip() for c in get_feature_cols(sector_enabled=True) if str(c).strip()]
+    src = "feature_spec.get_feature_cols(sector_enabled=True)"
+    _validate_18_cols(cols, src)
+    return cols, src
+
+
+def _validate_18_cols(cols: list[str], src: str) -> None:
+    if len(cols) != 18:
+        raise RuntimeError(f"SSOT feature cols must be 18, got {len(cols)} from {src}: {cols}")
+    need = ["Sector_Ret_20", "RelStrength"]
+    miss = [c for c in need if c not in cols]
+    if miss:
+        raise RuntimeError(f"SSOT feature cols must include sector features {need}. Missing={miss}. src={src}")
 
 
 def clamp_invest_by_leverage(seed: float, entry_seed: float, desired: float, max_leverage_pct: float) -> float:
@@ -153,7 +163,7 @@ def simulate_tail_A_for_ticker(
           * DCA는 엔진 룰(<=avg full, <=avg*near_zone half, else 0)
       - 엔진과 정합: holding_days==H 되는 날 pending_reval로 DCA가 막히므로,
         DCA는 holding_days < H 에서만 허용 (즉 마지막 DCA는 H-1일)
-      - 같은 날 low와 high가 같이 조건 충족해도 "리스크 사건" 보수적으로 Tail=1 우선
+      - 같은 날 low와 high가 같이 조건 충족해도 Tail=1 우선(보수적)
     """
     n = len(close)
     out = np.zeros(n, dtype=np.int8)
@@ -173,7 +183,6 @@ def simulate_tail_A_for_ticker(
             out[i] = 0
             continue
 
-        # scale-in dynamics invariant to scale
         entry_seed = 1.0
         seed = 1.0
         unit = entry_seed / float(H)
@@ -182,7 +191,6 @@ def simulate_tail_A_for_ticker(
         invested = 0.0
         tp1_done = False
 
-        # entry buy at day i close
         invest0 = clamp_invest_by_leverage(seed, entry_seed, unit, max_leverage_pct)
         if invest0 > 0:
             seed -= invest0
@@ -196,7 +204,7 @@ def simulate_tail_A_for_ticker(
         avg = invested / shares
 
         end = min(n - 1, i + tail_h)
-        holding_days = 1  # entry day counted as 1
+        holding_days = 1
         tail_hit = False
 
         for j in range(i + 1, end + 1):
@@ -206,13 +214,13 @@ def simulate_tail_A_for_ticker(
             hi = float(high[j])
             cl = float(close[j])
 
-            # (A) Tail check first (conservative on same-day TP1)
+            # (A) Tail check first
             if (not tp1_done) and np.isfinite(lo) and np.isfinite(avg) and avg > 0:
                 if lo <= avg * tail_mult:
                     tail_hit = True
                     break
 
-            # (B) TP1 check (stop label scan if TP1 happens)
+            # (B) TP1 check
             if (not tp1_done) and np.isfinite(hi) and np.isfinite(avg) and avg > 0:
                 if hi >= avg * pt_mult:
                     tp_px = avg * pt_mult
@@ -226,18 +234,15 @@ def simulate_tail_A_for_ticker(
                             invested = 0.0
                         shares = shares_after
                         seed += proceeds
-
                     tp1_done = True
                     break
 
-            # (C) DCA rule only BEFORE reaching H (engine-equivalent: pending_reval blocks DCA at holding_days==H)
+            # (C) DCA only when holding_days < H
             if (not tp1_done) and (holding_days < H):
                 if not (np.isfinite(cl) and cl > 0):
                     continue
 
                 desired = unit
-
-                # engine same: <=avg full, <=avg*near_zone half, else 0
                 if np.isfinite(avg) and avg > 0:
                     if cl <= avg:
                         pass
@@ -274,7 +279,12 @@ def main() -> None:
     ap.add_argument("--near-zone-mult", type=float, default=1.05, help="engine near-zone for half-buy (avg*1.05)")
 
     ap.add_argument("--features-path", type=str, default=None, help="optional features file override")
-    ap.add_argument("--feature-cols", type=str, default="", help="comma-separated; empty => SSOT/meta")
+    ap.add_argument(
+        "--feature-cols",
+        type=str,
+        default="",
+        help="(DISABLED) override not allowed when SSOT 18 features are enforced",
+    )
 
     args = ap.parse_args()
 
@@ -297,6 +307,7 @@ def main() -> None:
     prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
     for c in ["High", "Low", "Close"]:
         prices[c] = pd.to_numeric(prices[c], errors="coerce")
+
     prices = (
         prices.dropna(subset=["Date", "Ticker", "High", "Low", "Close"])
         .sort_values(["Ticker", "Date"])
@@ -328,12 +339,11 @@ def main() -> None:
         .reset_index(drop=True)
     )
 
-    # feature cols resolution (STRICT)
-    feat_cols, feat_cols_src = resolve_feature_cols(args.feature_cols)
-    feat_cols = [c.strip() for c in feat_cols if c.strip()]
+    # ✅ 18개 SSOT 강제
+    feat_cols, feat_cols_src = resolve_feature_cols_forced(args.feature_cols)
     ensure_feature_columns_strict(feats, feat_cols, source_hint=f"{feat_cols_src}, feats_src={feats_src}")
 
-    # base key frame (we'll join prices for label simulation)
+    # join prices (for label simulation)
     base = feats[["Date", "Ticker"] + feat_cols].copy()
     base = base.merge(
         prices[["Date", "Ticker", "High", "Low", "Close"]],
@@ -347,8 +357,8 @@ def main() -> None:
         raise RuntimeError("No rows after merging features with prices. Check date ranges.")
 
     # compute TailTarget per ticker
-    tails = []
-    for tkr, g in base.groupby("Ticker", sort=False):
+    tails: list[pd.DataFrame] = []
+    for _tkr, g in base.groupby("Ticker", sort=False):
         g = g.sort_values("Date").reset_index(drop=True)
 
         close = g["Close"].to_numpy(dtype=float)
@@ -401,6 +411,9 @@ def main() -> None:
         "saved_to": saved_to,
         "tail_label_mode": "A(avg_price_before_TP1)",
         "dca_rule": "holding_days < H (engine-aligned; last DCA at H-1)",
+        "ssot_forced": True,
+        "ssot_feature_count": 18,
+        "ssot_sector_forced": True,
     }
     (LBL_DIR / f"labels_tail_{tag}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
