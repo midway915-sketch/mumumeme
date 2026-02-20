@@ -3,16 +3,12 @@ from __future__ import annotations
 
 # ✅ FIX(A): "python scripts/build_features.py" 실행에서도 scripts.* import 되도록 repo root를 sys.path에 추가
 import sys
-from pathlib import Path as _Path
+from pathlib import Path, Path as _Path
+
 _REPO_ROOT = _Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-
-# (선택) scripts 자체도 직접 넣어두면, feature_spec을 scripts 없이 import 하는 fallback도 가능
-# if str(_REPO_ROOT / "scripts") not in sys.path:
-#     sys.path.insert(0, str(_REPO_ROOT / "scripts"))
-
-# ---- 여기서부터 build_features.py 원래 코드 이어붙이기 ----
+    
 import argparse
 import pandas as pd
 import numpy as np
