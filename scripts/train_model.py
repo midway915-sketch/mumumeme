@@ -15,38 +15,14 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
+from scripts.feature_spec import read_feature_cols_meta, get_feature_cols
+
 
 DATA_DIR = Path("data")
 LABELS_PARQ = DATA_DIR / "labels" / "labels_model.parquet"
 LABELS_CSV = DATA_DIR / "labels" / "labels_model.csv"
 APP_DIR = Path("app")
 META_DIR = DATA_DIR / "meta"
-
-
-# ✅ build_features.py 기준(16) + (옵션) 섹터(2)
-DEFAULT_FEATURES = [
-    # base (9)
-    "Drawdown_252",
-    "Drawdown_60",
-    "ATR_ratio",
-    "Z_score",
-    "MACD_hist",
-    "MA20_slope",
-    "Market_Drawdown",
-    "Market_ATR_ratio",
-    "ret_score",
-    # new (7)
-    "ret_5",
-    "ret_10",
-    "ret_20",
-    "breakout_20",
-    "vol_surge",
-    "trend_align",
-    "beta_60",
-    # optional sector (2)
-    "Sector_Ret_20",
-    "RelStrength",
-]
 
 
 def read_table(parq: Path, csv: Path) -> pd.DataFrame:
@@ -64,12 +40,8 @@ def parse_csv_list(s: str) -> list[str]:
     return [x for x in items if x]
 
 
-def ensure_features_exist(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
+def coerce_features_numeric(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
     df = df.copy()
-    for c in feat_cols:
-        if c not in df.columns:
-            # 방어: 누락 컬럼은 0으로 생성 (pipeline 안 죽게)
-            df[c] = 0.0
     for c in feat_cols:
         df[c] = (
             pd.to_numeric(df[c], errors="coerce")
@@ -80,14 +52,38 @@ def ensure_features_exist(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFram
     return df
 
 
+def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source_hint: str = "") -> None:
+    missing = [c for c in feat_cols if c not in df.columns]
+    if missing:
+        hint = f" (src={source_hint})" if source_hint else ""
+        raise ValueError(f"Missing feature columns{hint}: {missing}")
+
+
 def write_train_report(tag: str, report: dict) -> None:
     META_DIR.mkdir(parents=True, exist_ok=True)
-    if tag:
-        p = META_DIR / f"train_model_report_{tag}.json"
-    else:
-        p = META_DIR / "train_model_report.json"
+    p = META_DIR / (f"train_model_report_{tag}.json" if tag else "train_model_report.json")
     p.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[DONE] wrote train report -> {p}")
+
+
+def resolve_feature_cols(args_features: str) -> tuple[list[str], str]:
+    """
+    Priority:
+      1) --features (explicit override)
+      2) data/meta/feature_cols.json (SSOT written by build_features.py)
+      3) fallback SSOT default (sector disabled)
+    Returns: (feature_cols, source_string)
+    """
+    override = parse_csv_list(args_features)
+    if override:
+        return [str(c).strip() for c in override if str(c).strip()], "--features"
+
+    cols_meta, sector_enabled = read_feature_cols_meta()
+    if cols_meta:
+        return cols_meta, "data/meta/feature_cols.json"
+
+    # fallback: sector OFF
+    return get_feature_cols(sector_enabled=False), "feature_spec.py (fallback)"
 
 
 def main() -> None:
@@ -98,7 +94,9 @@ def main() -> None:
     ap.add_argument("--date-col", default="Date", type=str)
     ap.add_argument("--ticker-col", default="Ticker", type=str)
 
-    ap.add_argument("--features", default=",".join(DEFAULT_FEATURES), type=str)
+    # ✅ 기본은 SSOT(meta) 사용. 필요할 때만 override.
+    ap.add_argument("--features", default="", type=str, help="comma-separated feature cols (override SSOT/meta)")
+
     ap.add_argument("--train-ratio", default=0.8, type=float)
     ap.add_argument("--n-splits", default=3, type=int)
     ap.add_argument("--max-iter", default=500, type=int)
@@ -114,9 +112,6 @@ def main() -> None:
     target_col = args.target_col
     ticker_col = args.ticker_col
 
-    feat_cols = parse_csv_list(args.features) or DEFAULT_FEATURES
-    feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
-
     for c in [date_col, target_col]:
         if c not in df.columns:
             raise ValueError(f"labels_model missing required column: {c}")
@@ -126,8 +121,14 @@ def main() -> None:
     df = df.dropna(subset=[date_col]).copy()
     df = df.sort_values(date_col).reset_index(drop=True)
 
-    # features
-    df = ensure_features_exist(df, feat_cols)
+    feat_cols, feat_src = resolve_feature_cols(args.features)
+    feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
+
+    # ✅ STRICT: 누락 피처는 바로 에러
+    ensure_feature_columns_strict(df, feat_cols, source_hint=feat_src)
+
+    # numeric coercion
+    df = coerce_features_numeric(df, feat_cols)
 
     y = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int).to_numpy()
     X = df[feat_cols].to_numpy(dtype=float)
@@ -169,6 +170,7 @@ def main() -> None:
     print("AUC:", (round(auc, 6) if np.isfinite(auc) else "nan"))
     print("base_rate:", (round(base_rate, 6) if np.isfinite(base_rate) else "nan"))
     print("pred_mean:", (round(pred_mean, 6) if np.isfinite(pred_mean) else "nan"))
+    print("feature_cols_source:", feat_src)
     print("feature_cols:", feat_cols)
     print("=" * 60)
 
@@ -184,12 +186,12 @@ def main() -> None:
     print(f"[DONE] saved model -> {out_model}")
     print(f"[DONE] saved scaler -> {out_scaler}")
 
-    # ✅ meta report (score_features가 이걸 읽어서 동일 피처로 scoring 하게 만들 것)
     report = {
         "tag": tag,
         "target_col": target_col,
         "date_col": date_col,
         "ticker_col": ticker_col if ticker_col in df.columns else "",
+        "feature_cols_source": feat_src,
         "feature_cols": feat_cols,
         "rows_total": int(len(y)),
         "rows_train": int(len(y_train)),
