@@ -360,8 +360,7 @@ def main() -> None:
     # write outputs
     # -------------------------
     out_parq = Path(args.out_parq)
-    out_csv = Path(args.out_c
-sv)
+    out_csv = Path(args.out_csv)
     out_parq.parent.mkdir(parents=True, exist_ok=True)
 
     try:
