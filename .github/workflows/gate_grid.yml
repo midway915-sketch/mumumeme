@@ -66,6 +66,19 @@ jobs:
     permissions:
       contents: read
 
+    env:
+      PROFIT_TARGET: ${{ github.event.inputs.profit_target || '0.10' }}
+      MAX_DAYS: ${{ github.event.inputs.max_days || '40' }}
+      STOP_LEVEL: ${{ github.event.inputs.stop_level || '-0.10' }}
+
+      P_TAIL_THRESHOLDS: ${{ github.event.inputs.p_tail_thresholds || '0.10,0.20,0.30' }}
+      UTILITY_QUANTILES: ${{ github.event.inputs.utility_quantiles || '0.60,0.75,0.90' }}
+      PS_MINS: ${{ github.event.inputs.ps_mins || '0.00,0.50,0.60,0.70' }}
+      RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility,ret_score' }}
+      LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.05' }}
+
+      REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'false' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,22 +105,20 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      - name: Set env keys (LABEL_KEY + PRICE_START + MAX_EXTEND_DAYS auto)
+         - name: Set env keys (LABEL_KEY + PRICE_START + MAX_EXTEND_DAYS auto)
         shell: bash
-        env:
-          PROFIT_TARGET: ${{ env.PROFIT_TARGET }}
-          MAX_DAYS: ${{ env.MAX_DAYS }}
-          STOP_LEVEL: ${{ env.STOP_LEVEL }}
         run: |
           set -euo pipefail
 
-          # LABEL_KEY: ex(extend)는 캐시/태그에 넣지 않음
+          # LABEL_KEY: pt10_h40_sl10 형태
           echo "LABEL_KEY=pt$(python - <<'PY'
-          pt=float("${PROFIT_TARGET}")
+          import os
+          pt=float(os.environ["PROFIT_TARGET"])
           print(int(round(pt*100)))
           PY
           )_h${MAX_DAYS}_sl$(python - <<'PY'
-          sl=float("${STOP_LEVEL}")
+          import os
+          sl=float(os.environ["STOP_LEVEL"])
           print(int(round(abs(sl)*100)))
           PY
           )" >> $GITHUB_ENV
@@ -115,9 +126,10 @@ jobs:
           # 10년만 돌릴 거니까 가격 시작일 고정
           echo "PRICE_START=2015-02-21" >> $GITHUB_ENV
 
-          # ✅ MAX_EXTEND_DAYS = H/2 (정수)
+          # MAX_EXTEND_DAYS = H/2
           echo "MAX_EXTEND_DAYS=$(python - <<'PY'
-          H=int("${MAX_DAYS}")
+          import os
+          H=int(os.environ["MAX_DAYS"])
           print(max(1, H//2))
           PY
           )" >> $GITHUB_ENV
