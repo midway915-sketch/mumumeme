@@ -2,7 +2,7 @@
 set -euo pipefail
 
 tok() {
-  python - "$1" <<'PY'
+  python - <<'PY' "$1"
 import sys
 x=float(sys.argv[1])
 s=f"{x:.4f}".rstrip("0").rstrip(".")
@@ -12,7 +12,7 @@ PY
 }
 
 build_tag() {
-  python - "$1" "$2" "$3" "$4" <<'PY'
+  python - <<'PY' "$1" "$2" "$3" "$4"
 import sys
 pt=float(sys.argv[1]); h=int(float(sys.argv[2])); sl=float(sys.argv[3]); ex=int(float(sys.argv[4]))
 pt_i=int(round(pt*100)); sl_i=int(round(abs(sl)*100))
@@ -21,17 +21,13 @@ PY
 }
 
 run_one_gate() {
-  local pt="$1"; local h="$2"; local sl="$3"; local ex="$4"
-  local mode="$5"; local tail_max="$6"; local u_q="$7"; local rank_by="$8"
-  local lambda_tail="$9"; local tau_gamma="${10}"
+  # ✅ 안전장치: 인자 부족해도 -u에서 안 죽도록 기본값 부여
+  local pt="${1:?missing pt}"; local h="${2:?missing h}"; local sl="${3:?missing sl}"; local ex="${4:?missing ex}"
+  local mode="${5:?missing mode}"; local tail_max="${6:-0.0}"; local u_q="${7:-0.0}"; local rank_by="${8:-utility}"
+  local lambda_tail="${9:-0.05}"; local tau_gamma="${10:-0.0}"
 
   local tag; tag="$(build_tag "$pt" "$h" "$sl" "$ex")"
-
-  # suffix는 파일명에 쓰이니까 최소한의 sanitize (쉼표/공백 제거)
-  local rank_safe="${rank_by//,/+}"
-  rank_safe="${rank_safe// /}"
-
-  local suffix="${mode}_t$(tok "$tail_max")_q$(tok "$u_q")_r${rank_safe}"
+  local suffix="${mode}_t$(tok "$tail_max")_q$(tok "$u_q")_r${rank_by}"
 
   local picks="data/signals/picks_${tag}_gate_${suffix}.csv"
   local trades="data/signals/sim_engine_trades_${tag}_gate_${suffix}.parquet"
@@ -42,6 +38,7 @@ run_one_gate() {
   echo "=============================="
   echo "[RUN] tag=${tag} suffix=${suffix}"
   echo "[RUN] mode=${mode} tail_max=${tail_max} u_q=${u_q} rank_by=${rank_by}"
+  echo "[RUN] lambda_tail=${lambda_tail} tau_gamma=${tau_gamma}"
   echo "[RUN] picks=${picks}"
   echo "=============================="
 
@@ -66,7 +63,7 @@ run_one_gate() {
     exit 1
   fi
 
-  # 2) 각 picks마다 시뮬(조합별 파일명 분리 강제)
+  # 2) 시뮬
   python scripts/simulate_single_position_engine.py \
     --profit-target "$pt" \
     --max-days "$h" \
@@ -83,7 +80,7 @@ run_one_gate() {
     exit 1
   fi
 
-  # 3) trades→curve 요약 생성
+  # 3) 요약
   python scripts/summarize_sim_trades.py \
     --trades-path "$trades" \
     --tag "$tag" \
