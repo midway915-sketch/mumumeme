@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
+from scripts.feature_spec import read_feature_cols_meta, get_feature_cols
+
 
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
@@ -21,32 +23,10 @@ PRICES_CSV = RAW_DIR / "prices.csv"
 FEATURES_PARQUET = FEAT_DIR / "features_model.parquet"
 FEATURES_CSV = FEAT_DIR / "features_model.csv"
 
-# ✅ 루트(data/)로 떨어지지 않게 labels 폴더로
+# ✅ FIX: 루트 data/ 가 아니라 data/labels/ 로
 OUT_STRATEGY_RAW = LABEL_DIR / "strategy_raw_data.csv"
 
 MARKET_TICKER = "SPY"
-
-# ✅ build_features.py (enable-sector-strength ON) 기준으로 model에서 쓰는 feature set에 맞춤
-DEFAULT_FEATURE_COLS = [
-    "Drawdown_252",
-    "Drawdown_60",
-    "ATR_ratio",
-    "Z_score",
-    "MACD_hist",
-    "MA20_slope",
-    "Market_Drawdown",
-    "Market_ATR_ratio",
-    "ret_score",
-    "ret_5",
-    "ret_10",
-    "ret_20",
-    "breakout_20",
-    "vol_surge",
-    "trend_align",
-    "beta_60",
-    "Sector_Ret_20",
-    "RelStrength",
-]
 
 
 def now_utc_iso() -> str:
@@ -78,11 +58,6 @@ def save_table(df: pd.DataFrame, parq: Path, csv: Path) -> str:
 
 
 def auto_load_features(features_path: str | None) -> tuple[pd.DataFrame, str]:
-    """
-    1) --features-path 있으면 사용
-    2) 기본 features_model.* 있으면 사용
-    3) 없으면 data/features 내 Date/Ticker 있는 파일 자동탐색
-    """
     if features_path:
         fp = Path(features_path)
         if not fp.exists():
@@ -98,9 +73,7 @@ def auto_load_features(features_path: str | None) -> tuple[pd.DataFrame, str]:
     if not FEAT_DIR.exists():
         raise FileNotFoundError(f"features dir not found: {FEAT_DIR}")
 
-    candidates = []
-    candidates += list(FEAT_DIR.glob("*.parquet"))
-    candidates += list(FEAT_DIR.glob("*.csv"))
+    candidates = list(FEAT_DIR.glob("*.parquet")) + list(FEAT_DIR.glob("*.csv"))
     candidates = [p for p in candidates if p.is_file()]
 
     if not candidates:
@@ -120,81 +93,8 @@ def auto_load_features(features_path: str | None) -> tuple[pd.DataFrame, str]:
             last_err = e
 
     raise FileNotFoundError(
-        f"Could not find a usable features file in {FEAT_DIR}. "
-        f"Need columns Date/Ticker. Last error: {last_err}"
+        f"Could not find a usable features file in {FEAT_DIR}. Need columns Date/Ticker. Last error: {last_err}"
     )
-
-
-def compute_market_frame_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    Market_Drawdown: SPY 기준 252일 롤링 고점 대비 드로우다운
-    Market_ATR_ratio: SPY ATR(14) / Close
-    """
-    px = prices.copy()
-    px["Date"] = pd.to_datetime(px["Date"])
-    px["Ticker"] = px["Ticker"].astype(str).str.upper().str.strip()
-
-    m = px[px["Ticker"] == MARKET_TICKER].sort_values("Date").copy()
-    if m.empty:
-        raise RuntimeError(
-            f"Market ticker {MARKET_TICKER} not found in prices. "
-            f"Run fetch_prices.py --include-extra"
-        )
-
-    for c in ["Open", "High", "Low", "Close"]:
-        if c not in m.columns:
-            raise ValueError(f"prices missing {c} for market ticker {MARKET_TICKER}")
-
-    close = m["Close"].astype(float)
-    high = m["High"].astype(float)
-    low = m["Low"].astype(float)
-
-    roll_max = close.rolling(252, min_periods=252).max()
-    mdd = (close / roll_max) - 1.0
-
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            (high - low),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr14 = tr.rolling(14, min_periods=14).mean()
-    atr_ratio = atr14 / close
-
-    out = pd.DataFrame(
-        {
-            "Date": m["Date"].values,
-            "Market_Drawdown": mdd.values,
-            "Market_ATR_ratio": atr_ratio.values,
-        }
-    )
-    return out
-
-
-def ensure_market_features(feats: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    feats에 Market_Drawdown / Market_ATR_ratio가 없으면 SPY로 계산해서 붙인다.
-    (build_features.py가 이미 넣어줬으면 그대로 둠)
-    """
-    need_any = ("Market_Drawdown" not in feats.columns) or ("Market_ATR_ratio" not in feats.columns)
-    if not need_any:
-        return feats
-
-    market = compute_market_frame_from_prices(prices)
-    merged = feats.merge(market, on="Date", how="left", suffixes=("", "_m"))
-
-    for col in ["Market_Drawdown", "Market_ATR_ratio"]:
-        col_m = f"{col}_m"
-        if col in merged.columns and col_m in merged.columns:
-            merged[col] = merged[col].combine_first(merged[col_m])
-            merged.drop(columns=[col_m], inplace=True)
-        elif col not in merged.columns and col_m in merged.columns:
-            merged.rename(columns={col_m: col}, inplace=True)
-
-    return merged
 
 
 def forward_roll_max_excl_today(s: pd.Series, window: int) -> pd.Series:
@@ -220,8 +120,7 @@ def main() -> None:
     )
 
     ap.add_argument("--features-path", type=str, default=None)
-    ap.add_argument("--feature-cols", type=str, default="",
-                    help="콤마로 feature 컬럼 지정(비우면 기본 DEFAULT_FEATURE_COLS)")
+    ap.add_argument("--feature-cols", type=str, default="", help="콤마로 feature 컬럼 지정(비우면 meta/SSOT 사용)")
     args = ap.parse_args()
 
     pt = float(args.profit_target)
@@ -232,7 +131,6 @@ def main() -> None:
 
     tag = fmt_tag(pt, max_days, sl, ex)
 
-    # prices
     prices = read_table(PRICES_PARQUET, PRICES_CSV).copy()
     prices["Date"] = pd.to_datetime(prices["Date"])
     prices["Ticker"] = prices["Ticker"].astype(str).str.upper().str.strip()
@@ -247,7 +145,6 @@ def main() -> None:
     if miss_px:
         raise ValueError(f"prices missing columns: {miss_px}")
 
-    # features (auto)
     feats, feats_src = auto_load_features(args.features_path)
     feats = feats.copy()
     feats["Date"] = pd.to_datetime(feats["Date"])
@@ -258,19 +155,21 @@ def main() -> None:
         .reset_index(drop=True)
     )
 
-    # Market_* 없으면 SPY로 생성해서 붙임(보통은 build_features가 이미 넣음)
-    feats = ensure_market_features(feats, prices)
-
-    feature_cols = DEFAULT_FEATURE_COLS
+    # ✅ feature cols 결정 정책:
+    # 1) args.feature_cols 명시 > 2) data/meta/feature_cols.json > 3) SSOT 기본 (sector off)
+    feature_cols: list[str]
     if str(args.feature_cols).strip():
         feature_cols = [c.strip() for c in args.feature_cols.split(",") if c.strip()]
+    else:
+        cols_meta, sector_enabled = read_feature_cols_meta()
+        if cols_meta:
+            feature_cols = cols_meta
+        else:
+            feature_cols = get_feature_cols(sector_enabled=False)
 
     missing_feat = [c for c in feature_cols if c not in feats.columns]
     if missing_feat:
-        raise ValueError(
-            f"features missing feature columns: {missing_feat} (src={feats_src}). "
-            f"NOTE: Sector_Ret_20/RelStrength는 build_features.py를 --enable-sector-strength로 생성해야 함."
-        )
+        raise ValueError(f"features missing feature columns: {missing_feat} (src={feats_src})")
 
     base = feats[["Date", "Ticker"] + feature_cols].merge(
         prices[["Date", "Ticker", "High", "Low", "Close"]],
@@ -281,7 +180,6 @@ def main() -> None:
     base = base.dropna(subset=["Close"] + feature_cols).reset_index(drop=True)
     base = base.sort_values(["Ticker", "Date"]).reset_index(drop=True)
 
-    # horizons
     success_h = max_days
     tail_h = max_days + ex
 
@@ -313,10 +211,7 @@ def main() -> None:
         g["RetAtMaxDays"] = ret_at_max
         g["ExtendNeeded"] = extend_needed
 
-        g = g.dropna(
-            subset=["Success", "Tail", "FutureMinDD_TailH", "RetAtMaxDays", "ExtendNeeded"]
-        ).reset_index(drop=True)
-
+        g = g.dropna(subset=["Success", "Tail", "FutureMinDD_TailH", "RetAtMaxDays", "ExtendNeeded"]).reset_index(drop=True)
         out.append(g)
 
     labeled = pd.concat(out, ignore_index=True) if out else pd.DataFrame()
@@ -333,7 +228,7 @@ def main() -> None:
     out_csv = LABEL_DIR / f"strategy_raw_data_{tag}.csv"
     saved_to = save_table(labeled, out_parq, out_csv)
 
-    # ✅ latest snapshot도 labels 폴더에 저장
+    # ✅ FIX: 루트 data/가 아니라 data/labels/ 아래로
     labeled.to_csv(OUT_STRATEGY_RAW, index=False)
 
     meta = {
