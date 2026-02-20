@@ -105,7 +105,7 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-         - name: Set env keys (LABEL_KEY + PRICE_START + MAX_EXTEND_DAYS auto)
+      - name: Set env keys (LABEL_KEY + PRICE_START + MAX_EXTEND_DAYS auto)
         shell: bash
         run: |
           set -euo pipefail
