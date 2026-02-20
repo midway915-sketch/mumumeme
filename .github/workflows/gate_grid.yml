@@ -46,26 +46,43 @@ on:
     # 매일 한국시간 08:10 (UTC 23:10)
     - cron: "10 23 * * *"
 
+# ✅ 겹침 방지: 스케줄 돌고 있는데 수동 실행 들어오면 이전 실행 취소(원하면 false로 바꿔)
+concurrency:
+  group: gate-grid-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   grid:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     permissions:
       contents: read
 
-    # ✅ schedule에서도 값이 항상 존재하도록 기본값 강제
+    # ✅ schedule에서도 값이 항상 존재하도록 기본값 강제 + schedule는 자동 경량 프리셋 적용
     env:
+      # --- core params
       PROFIT_TARGET: ${{ github.event.inputs.profit_target || '0.10' }}
       MAX_DAYS: ${{ github.event.inputs.max_days || '40' }}
       STOP_LEVEL: ${{ github.event.inputs.stop_level || '-0.10' }}
 
-      P_TAIL_THRESHOLDS: ${{ github.event.inputs.p_tail_thresholds || '0.10,0.20,0.30' }}
-      UTILITY_QUANTILES: ${{ github.event.inputs.utility_quantiles || '0.60,0.75,0.90' }}
-      PS_MINS: ${{ github.event.inputs.ps_mins || '0.00,0.50,0.60,0.70' }}
-      RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility,ret_score' }}
+      # --- grid dims (schedule 프리셋)
+      P_TAIL_THRESHOLDS: ${{ (github.event_name == 'schedule') && '0.20,0.30' || (github.event.inputs.p_tail_thresholds || '0.10,0.20,0.30') }}
+      UTILITY_QUANTILES: ${{ (github.event_name == 'schedule') && '0.75,0.90' || (github.event.inputs.utility_quantiles || '0.60,0.75,0.90') }}
+      PS_MINS: ${{ (github.event_name == 'schedule') && '0.50,0.60' || (github.event.inputs.ps_mins || '0.00,0.50,0.60,0.70') }}
+      RANK_METRICS: ${{ (github.event_name == 'schedule') && 'utility' || (github.event.inputs.rank_metrics || 'utility,ret_score') }}
       LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.05' }}
 
+      # schedule은 모드도 축소(가장 “의미있는” 조합 위주)
+      GATE_MODES: ${{ (github.event_name == 'schedule') && 'tail_utility,utility' || 'none,tail,utility,tail_utility' }}
+
+      # trailing/topk도 축소
+      TRAIL_STOPS: ${{ (github.event_name == 'schedule') && '0.10' || '0.08,0.10,0.12' }}
+      TOPK_CONFIGS: ${{ (github.event_name == 'schedule') && '1|1.0;2|0.7,0.3' || '1|1.0;2|0.7,0.3;2|0.6,0.4' }}
+
+      # rebuild
       REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'false' }}
 
+      # misc
       PRICE_START: "2015-02-21"
       OUT_DIR: "data/signals"
 
@@ -117,6 +134,7 @@ jobs:
           )" >> $GITHUB_ENV
 
       - name: Restore cache (PRICES)
+        id: cache_prices
         uses: actions/cache@v4
         with:
           path: |
@@ -128,6 +146,7 @@ jobs:
             mumumeme-prices-v3-${{ runner.os }}-
 
       - name: Restore cache (FEATURES_MODEL)
+        id: cache_features
         uses: actions/cache@v4
         with:
           path: |
@@ -139,6 +158,7 @@ jobs:
             mumumeme-features-v3-${{ runner.os }}-
 
       - name: Restore cache (MODEL)
+        id: cache_model
         uses: actions/cache@v4
         with:
           path: |
@@ -153,6 +173,7 @@ jobs:
             mumumeme-model-v3-${{ runner.os }}-
 
       - name: Restore cache (TAIL)
+        id: cache_tail
         uses: actions/cache@v4
         with:
           path: |
@@ -169,6 +190,7 @@ jobs:
             mumumeme-tail-v3-${{ runner.os }}-
 
       - name: Restore cache (TAU)
+        id: cache_tau
         uses: actions/cache@v4
         with:
           path: |
@@ -208,7 +230,13 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "$PRICE_START"
           fi
 
-          # 2) features (섹터는 build_features.py에서 강제)
+          # 2) features
+          # ✅ SSOT(meta/feature_cols.json)가 없으면 features를 재생성해서 SSOT를 반드시 만든다.
+          if [ ! -f data/meta/feature_cols.json ]; then
+            echo "[WARN] SSOT feature_cols.json missing -> rebuild features_model to restore SSOT"
+            rm -f data/features/features_model.parquet data/features/features_model.csv || true
+          fi
+
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             python scripts/build_features.py
           else
@@ -294,7 +322,7 @@ jobs:
             echo "[WARN] tau training skipped (missing script or labels_tau)"
           fi
 
-          # 5) score features
+          # 5) score features (항상 실행)
           python scripts/score_features.py --tag "$LABEL_KEY"
 
       - name: Run gate grid (predict + simulate + summarize)
@@ -312,13 +340,13 @@ jobs:
           RANK_METRICS: ${{ env.RANK_METRICS }}
           LAMBDA_TAIL: ${{ env.LAMBDA_TAIL }}
 
-          GATE_MODES: "none,tail,utility,tail_utility"
+          GATE_MODES: ${{ env.GATE_MODES }}
 
           ENABLE_TRAILING: "true"
           TP1_FRAC: "0.50"
-          TRAIL_STOPS: "0.08,0.10,0.12"
+          TRAIL_STOPS: ${{ env.TRAIL_STOPS }}
 
-          TOPK_CONFIGS: "1|1.0;2|0.7,0.3;2|0.6,0.4"
+          TOPK_CONFIGS: ${{ env.TOPK_CONFIGS }}
           PS_MINS: ${{ env.PS_MINS }}
 
           MAX_LEVERAGE_PCT: "1.00"
@@ -341,6 +369,61 @@ jobs:
             --out-top "data/signals/gate_grid_top_by_recent10y.csv" \
             --pattern "gate_summary_*.csv" \
             --topn 50
+
+      - name: Write GitHub Step Summary (BEST + Top5)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+
+          agg = Path("data/signals/gate_grid_aggregate.csv")
+          top = Path("data/signals/gate_grid_top_by_recent10y.csv")
+
+          lines = []
+          lines.append("# gate-grid 결과 요약")
+          lines.append("")
+
+          if agg.exists():
+            df = pd.read_csv(agg)
+            if len(df):
+              b = df.iloc[0].to_dict()
+              lines.append("## BEST (SeedMultiple / LevAdj / CAGR 기준)")
+              lines.append(f"- TAG: `{b.get('TAG')}`")
+              lines.append(f"- Suffix: `{b.get('GateSuffix')}`")
+              lines.append(f"- SeedMultiple: `{b.get('SeedMultiple')}`")
+              if 'SeedMultiple_LevAdj' in b: lines.append(f"- SeedMultiple_LevAdj: `{b.get('SeedMultiple_LevAdj')}`")
+              lines.append(f"- Recent10Y_SeedMultiple: `{b.get('Recent10Y_SeedMultiple')}`")
+              lines.append(f"- CAGR_AfterWarmup: `{b.get('CAGR_AfterWarmup')}` (QQQ `{b.get('QQQ_CAGR_SamePeriod')}`)")
+              lines.append(f"- IdlePctAfterWarmup: `{b.get('IdlePctAfterWarmup')}` / MaxLevPct `{b.get('MaxLeveragePct')}`")
+              lines.append("")
+
+          if top.exists():
+            df = pd.read_csv(top)
+            if len(df):
+              show = df.head(5).copy()
+              cols = [c for c in [
+                "TAG","GateSuffix","Recent10Y_SeedMultiple","SeedMultiple","SeedMultiple_LevAdj",
+                "CAGR_AfterWarmup","QQQ_CAGR_SamePeriod","IdlePctAfterWarmup","MaxLeveragePct","CycleCount","SuccessRate"
+              ] if c in show.columns]
+              show = show[cols]
+              lines.append("## Top 5 (Recent10Y_SeedMultiple 기준)")
+              lines.append("")
+              lines.append(show.to_markdown(index=False))
+              lines.append("")
+
+          Path(".").joinpath("GITHUB_STEP_SUMMARY.txt")
+
+          out = "\n".join(lines).strip() + "\n"
+          # GitHub Actions provides the path via env var
+          import os
+          p = os.environ.get("GITHUB_STEP_SUMMARY")
+          if p:
+            Path(p).write_text(out, encoding="utf-8")
+          else:
+            print(out)
+          PY
 
       - name: Upload artifacts (signals)
         uses: actions/upload-artifact@v4
