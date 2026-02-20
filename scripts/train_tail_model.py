@@ -70,8 +70,7 @@ def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source
         hint = f" (src={source_hint})" if source_hint else ""
         raise ValueError(
             f"Missing feature columns{hint}: {missing}\n"
-            f"-> labels_tail 생성 단계(build_strategy_labels/build_tail_labels)가 "
-            f"SSOT feature_cols를 포함하도록 먼저 맞춰져 있어야 함."
+            f"-> build_tail_labels.py가 SSOT feature_cols를 포함하도록 먼저 맞춰져 있어야 함."
         )
 
 
@@ -117,29 +116,25 @@ def main() -> None:
     sl_tag = int(round(abs(args.stop_level) * 100))
     tag = f"pt{pt_tag}_h{args.max_days}_sl{sl_tag}_ex{args.max_extend_days}"
 
+    # ✅ A안 SSOT: labels_tail_{tag}만 허용 (fallback 제거)
     parq = LABELS_DIR / f"labels_tail_{tag}.parquet"
     csv = LABELS_DIR / f"labels_tail_{tag}.csv"
+    if not parq.exists() and not csv.exists():
+        raise FileNotFoundError(
+            f"Missing tail labels for tag={tag}.\n"
+            f"-> expected: {parq} (or {csv})\n"
+            f"-> run: python scripts/build_tail_labels.py --profit-target ... --max-days ... --stop-level ... --max-extend-days ..."
+        )
 
-    if parq.exists() or csv.exists():
-        df = read_table(parq, csv).copy()
-        src = str(parq if parq.exists() else csv)
-    else:
-        # fallback only if TailTarget already exists there
-        parq2 = LABELS_DIR / "labels_model.parquet"
-        csv2 = LABELS_DIR / "labels_model.csv"
-        df = read_table(parq2, csv2).copy()
-        src = str(parq2 if parq2.exists() else csv2)
-        if "TailTarget" not in df.columns:
-            raise FileNotFoundError(
-                f"Missing tail labels. Provide {parq}/{csv} or include TailTarget in labels_model."
-            )
+    df = read_table(parq, csv).copy()
+    src = str(parq if parq.exists() else csv)
 
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
         df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
 
     if "TailTarget" not in df.columns:
-        raise ValueError(f"TailTarget column missing (src={src})")
+        raise ValueError(f"TailTarget column missing (labels_src={src})")
 
     feat_cols, feat_src = resolve_feature_cols(args.features)
     feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
@@ -156,6 +151,9 @@ def main() -> None:
     if len(use) < 200:
         raise RuntimeError(f"Not enough training rows: {len(use)} (labels_src={src})")
 
+    if len(np.unique(y)) < 2:
+        raise RuntimeError(f"TailTarget has only one class in training data (labels_src={src}).")
+
     split_idx = int(len(use) * float(args.train_ratio))
     split_idx = max(50, min(split_idx, len(use) - 50))
 
@@ -166,7 +164,14 @@ def main() -> None:
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    model = _fit_model(X_train_s, y_train, n_splits=int(args.n_splits), max_iter=int(args.max_iter))
+    # ✅ TimeSeriesSplit safety (데이터 길이에 맞게 축소)
+    n_splits = min(int(args.n_splits), 5)
+    if split_idx < 200:
+        n_splits = min(n_splits, 2)
+    if n_splits < 2:
+        n_splits = 2
+
+    model = _fit_model(X_train_s, y_train, n_splits=n_splits, max_iter=int(args.max_iter))
 
     probs = model.predict_proba(X_test_s)[:, 1]
     auc = float("nan")
@@ -189,7 +194,10 @@ def main() -> None:
         "feature_cols_source": feat_src,
         "feature_cols": feat_cols,
         "auc": (round(auc, 6) if np.isfinite(auc) else None),
+        "base_rate_test": (round(float(np.mean(y_test)), 6) if len(y_test) else None),
+        "pred_mean_test": (round(float(np.mean(probs)), 6) if len(probs) else None),
         "labels_src": src,
+        "n_splits": int(n_splits),
         "paths": {"model": str(out_model), "scaler": str(out_scaler)},
     }
     (META_DIR / f"train_tail_report_{tag}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -197,9 +205,13 @@ def main() -> None:
     print("=" * 60)
     print("[DONE] train_tail_model.py")
     print("tag:", tag)
+    print("labels_src:", src)
     print("AUC:", report["auc"])
+    print("base_rate_test:", report["base_rate_test"])
+    print("pred_mean_test:", report["pred_mean_test"])
     print("feature_cols_source:", feat_src)
     print("features:", feat_cols)
+    print("n_splits:", report["n_splits"])
     print("=" * 60)
 
 
