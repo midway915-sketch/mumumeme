@@ -42,6 +42,12 @@ on:
         required: true
         default: "false"
 
+      # ✅ 추가: dedupe 끄고 싶으면 false
+      dedup_picks:
+        description: "true=dedupe picks (skip duplicate hashes), false=run all"
+        required: true
+        default: "true"
+
   schedule:
     - cron: "10 23 * * *"
 
@@ -77,6 +83,9 @@ jobs:
       OUT_DIR: "data/signals"
       EXCLUDE_TICKERS: "SPY,^VIX"
       REQUIRE_FILES: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl"
+
+      # ✅ run_grid_workflow.sh에서 읽는 플래그
+      DEDUP_PICKS: ${{ github.event.inputs.dedup_picks || 'true' }}
 
     steps:
       - name: Checkout
@@ -202,6 +211,7 @@ jobs:
           set -euo pipefail
           echo "[INFO] PROFIT_TARGET=$PROFIT_TARGET MAX_DAYS=$MAX_DAYS STOP_LEVEL=$STOP_LEVEL MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS"
           echo "[INFO] LABEL_KEY=$LABEL_KEY"
+          echo "[INFO] DEDUP_PICKS=$DEDUP_PICKS"
 
           if [ "${REBUILD_ALL}" = "true" ]; then
             rm -rf data/raw/* data/features/* data/labels/* app/* data/signals/* data/meta/* || true
@@ -279,7 +289,6 @@ jobs:
             echo "[WARN] scripts/build_tau_labels.py not found -> skip tau labels"
           fi
 
-          # ✅ train_tau_model.py는 --tag REQUIRED
           if [ -f scripts/train_tau_model.py ] && ([ -f data/labels/labels_tau.parquet ] || [ -f data/labels/labels_tau.csv ]); then
             if [ ! -f app/tau_model.pkl ] || [ ! -f app/tau_scaler.pkl ]; then
               TAU_TAG="${LABEL_KEY}_ex${MAX_EXTEND_DAYS}"
