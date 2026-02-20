@@ -281,6 +281,13 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict) -> pd
     # ✅ Benchmarks / non-sector instruments
     NON_SECTOR = {"SPY", "^VIX", "QQQ"}  # 필요하면 여기에 추가
 
+    # --- init columns safely (avoid missing column later) ---
+    if "Sector_Ret_20" not in out.columns:
+        out["Sector_Ret_20"] = np.nan
+    if "RelStrength" not in out.columns:
+        out["RelStrength"] = np.nan
+
+    # set NON_SECTOR to zeros
     mask_non_sector = out["Ticker"].isin(NON_SECTOR)
     if mask_non_sector.any():
         out.loc[mask_non_sector, "Sector_Ret_20"] = 0.0
@@ -289,13 +296,14 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict) -> pd
     # sector 대상만 따로 계산
     sec = out.loc[~mask_non_sector].copy()
     if sec.empty:
-        # 전부 NON_SECTOR면 여기서 끝
-        # 컬럼이 아예 없을 수도 있으니 ensure
-        if "Sector_Ret_20" not in out.columns:
-            out["Sector_Ret_20"] = 0.0
-        if "RelStrength" not in out.columns:
-            out["RelStrength"] = 0.0
+        out["Sector_Ret_20"] = pd.to_numeric(out["Sector_Ret_20"], errors="coerce").fillna(0.0).astype(float)
+        out["RelStrength"] = pd.to_numeric(out["RelStrength"], errors="coerce").fillna(0.0).astype(float)
         return out
+
+    # ✅ merge 충돌 방지: sec에 이미 있으면 제거하고 새로 계산
+    for col in ["Sector_Ret_20", "RelStrength"]:
+        if col in sec.columns:
+            sec = sec.drop(columns=[col])
 
     # --- STRICT mapping check (ONLY for sector 대상) ---
     tickers = sec["Ticker"].astype(str).str.upper().unique().tolist()
@@ -307,18 +315,13 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict) -> pd
         )
 
     # --- compute Sector_Ret_20 / RelStrength ---
-    # prerequisites: need ret_20 column
     if "ret_20" not in sec.columns:
         raise ValueError("ret_20 missing - sector strength requires ret_20.")
-
-    # ensure numeric
-    sec["ret_20"] = pd.to_numeric(sec["ret_20"], errors="coerce").fillna(0.0).astype(float)
-
-    sec["Group"] = sec["Ticker"].map(ticker_to_group)
-
-    # Group 평균 ret_20 (날짜별)
     if "Date" not in sec.columns:
         raise ValueError("Date missing - sector strength requires Date.")
+
+    sec["ret_20"] = pd.to_numeric(sec["ret_20"], errors="coerce").fillna(0.0).astype(float)
+    sec["Group"] = sec["Ticker"].map(ticker_to_group)
 
     sec["Date"] = pd.to_datetime(sec["Date"], errors="coerce").dt.tz_localize(None)
     sec = sec.dropna(subset=["Date", "Ticker", "Group"]).copy()
@@ -329,21 +332,40 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict) -> pd
         .rename(columns={"ret_20": "Sector_Ret_20"})
     )
 
+    # merge (should produce Sector_Ret_20)
     sec = sec.merge(grp_mean, on=["Date", "Group"], how="left")
+
+    # ✅ suffix 케이스 방어 (혹시라도 남아있으면 정리)
+    if "Sector_Ret_20" not in sec.columns:
+        if "Sector_Ret_20_y" in sec.columns:
+            sec["Sector_Ret_20"] = sec["Sector_Ret_20_y"]
+        elif "Sector_Ret_20_x" in sec.columns:
+            sec["Sector_Ret_20"] = sec["Sector_Ret_20_x"]
+        else:
+            sec["Sector_Ret_20"] = 0.0
+
     sec["Sector_Ret_20"] = pd.to_numeric(sec["Sector_Ret_20"], errors="coerce").fillna(0.0).astype(float)
 
     sec["RelStrength"] = sec["ret_20"] - sec["Sector_Ret_20"]
     sec["RelStrength"] = pd.to_numeric(sec["RelStrength"], errors="coerce").fillna(0.0).astype(float)
 
-    # 결과를 out에 되돌리기
-    for col in ["Sector_Ret_20", "RelStrength"]:
-        out.loc[sec.index, col] = sec[col].values
+    # 결과를 out에 되돌리기 (Date+Ticker 키로 안전하게 merge back)
+    key_cols = ["Date", "Ticker"]
+    sec_back = sec[key_cols + ["Sector_Ret_20", "RelStrength"]].copy()
 
-    # 안전장치: 컬럼이 없으면 생성
-    if "Sector_Ret_20" not in out.columns:
-        out["Sector_Ret_20"] = 0.0
-    if "RelStrength" not in out.columns:
-        out["RelStrength"] = 0.0
+    out = out.merge(sec_back, on=key_cols, how="left", suffixes=("", "_new"))
+
+    # fill from _new where available (only for sector tickers)
+    if "Sector_Ret_20_new" in out.columns:
+        out.loc[~mask_non_sector, "Sector_Ret_20"] = out.loc[~mask_non_sector, "Sector_Ret_20_new"]
+        out = out.drop(columns=["Sector_Ret_20_new"])
+    if "RelStrength_new" in out.columns:
+        out.loc[~mask_non_sector, "RelStrength"] = out.loc[~mask_non_sector, "RelStrength_new"]
+        out = out.drop(columns=["RelStrength_new"])
+
+    # final numeric cleanup
+    out["Sector_Ret_20"] = pd.to_numeric(out["Sector_Ret_20"], errors="coerce").fillna(0.0).astype(float)
+    out["RelStrength"] = pd.to_numeric(out["RelStrength"], errors="coerce").fillna(0.0).astype(float)
 
     return out
     
