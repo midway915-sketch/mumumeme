@@ -261,60 +261,91 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
     return out
 
 
-def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict[str, str]) -> pd.DataFrame:
+def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict) -> pd.DataFrame:
     """
-    ✅ sector features 필수
+    Adds sector-relative features:
+      - Sector_Ret_20: average 20d return of the ticker's Group
+      - RelStrength   : ret_20 - Sector_Ret_20
+
+    STRICT policy:
+      - all tickers in feats must have Group mapping
+      - EXCEPT "NON_SECTOR" tickers (benchmark / index / volatility etc.)
+        -> they get Sector_Ret_20=0, RelStrength=0
     """
-    
-    # --- PATCH: allow "benchmark / non-sector" tickers without Group ---
-    # SPY, ^VIX 같은 애들은 섹터/그룹 개념이 없으니 sector features 대상에서 제외
-    NON_SECTOR = {"SPY", "^VIX", "QQQ"}  # 필요하면 추가 가능
-    
-    feats = feats.copy()
-    feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
-    
-    mask_non_sector = feats["Ticker"].isin(NON_SECTOR)
+    if feats is None or feats.empty:
+        return feats
+
+    out = feats.copy()
+    out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
+
+    # ✅ Benchmarks / non-sector instruments
+    NON_SECTOR = {"SPY", "^VIX", "QQQ"}  # 필요하면 여기에 추가
+
+    mask_non_sector = out["Ticker"].isin(NON_SECTOR)
     if mask_non_sector.any():
-        # sector columns을 만들어두되 값은 0으로 채움 (모델/SSOT 컬럼 일관성 유지)
-        feats.loc[mask_non_sector, "Sector_Ret_20"] = 0.0
-        feats.loc[mask_non_sector, "RelStrength"] = 0.0
-    
-    # 아래부터는 "sector 대상"만 strict 체크/계산
-    feats_sector = feats.loc[~mask_non_sector].copy()
-    
-    if "ret_20" not in feats.columns:
-        raise RuntimeError("feats missing ret_20 -> cannot build Sector_Ret_20 / RelStrength")
+        out.loc[mask_non_sector, "Sector_Ret_20"] = 0.0
+        out.loc[mask_non_sector, "RelStrength"] = 0.0
 
-    x = feats.copy()
-    x["Group"] = x["Ticker"].map(ticker_to_group)
+    # sector 대상만 따로 계산
+    sec = out.loc[~mask_non_sector].copy()
+    if sec.empty:
+        # 전부 NON_SECTOR면 여기서 끝
+        # 컬럼이 아예 없을 수도 있으니 ensure
+        if "Sector_Ret_20" not in out.columns:
+            out["Sector_Ret_20"] = 0.0
+        if "RelStrength" not in out.columns:
+            out["RelStrength"] = 0.0
+        return out
 
-    if x["Group"].isna().any():
-        missing = sorted(x.loc[x["Group"].isna(), "Ticker"].unique().tolist())
+    # --- STRICT mapping check (ONLY for sector 대상) ---
+    tickers = sec["Ticker"].astype(str).str.upper().unique().tolist()
+    missing = [t for t in tickers if str(t) not in ticker_to_group]
+    if missing:
         raise ValueError(
             f"Missing Group mapping for tickers (sector features required): {missing}\n"
             f"-> Fix data/universe.csv Group values."
         )
 
-    sector_ret = (
-        x.groupby(["Date", "Group"], as_index=False)["ret_20"]
+    # --- compute Sector_Ret_20 / RelStrength ---
+    # prerequisites: need ret_20 column
+    if "ret_20" not in sec.columns:
+        raise ValueError("ret_20 missing - sector strength requires ret_20.")
+
+    # ensure numeric
+    sec["ret_20"] = pd.to_numeric(sec["ret_20"], errors="coerce").fillna(0.0).astype(float)
+
+    sec["Group"] = sec["Ticker"].map(ticker_to_group)
+
+    # Group 평균 ret_20 (날짜별)
+    if "Date" not in sec.columns:
+        raise ValueError("Date missing - sector strength requires Date.")
+
+    sec["Date"] = pd.to_datetime(sec["Date"], errors="coerce").dt.tz_localize(None)
+    sec = sec.dropna(subset=["Date", "Ticker", "Group"]).copy()
+
+    grp_mean = (
+        sec.groupby(["Date", "Group"], as_index=False)["ret_20"]
         .mean()
         .rename(columns={"ret_20": "Sector_Ret_20"})
     )
-    x = x.merge(sector_ret, on=["Date", "Group"], how="left", validate="many_to_one")
-    x["RelStrength"] = pd.to_numeric(x["ret_20"], errors="coerce") - pd.to_numeric(
-        x["Sector_Ret_20"], errors="coerce"
-    )
 
-    if "Sector_Ret_20" not in x.columns or "RelStrength" not in x.columns:
-        raise RuntimeError("Sector features not created as expected (Sector_Ret_20/RelStrength missing).")
+    sec = sec.merge(grp_mean, on=["Date", "Group"], how="left")
+    sec["Sector_Ret_20"] = pd.to_numeric(sec["Sector_Ret_20"], errors="coerce").fillna(0.0).astype(float)
 
-    # feats_sector에서 Sector_Ret_20 / RelStrength 계산 완료했다고 가정
-    # 결과를 원본 feats에 되돌리기
+    sec["RelStrength"] = sec["ret_20"] - sec["Sector_Ret_20"]
+    sec["RelStrength"] = pd.to_numeric(sec["RelStrength"], errors="coerce").fillna(0.0).astype(float)
+
+    # 결과를 out에 되돌리기
     for col in ["Sector_Ret_20", "RelStrength"]:
-        if col in feats_sector.columns:
-            feats.loc[feats_sector.index, col] = feats_sector[col].values
-    
-    return feats
+        out.loc[sec.index, col] = sec[col].values
+
+    # 안전장치: 컬럼이 없으면 생성
+    if "Sector_Ret_20" not in out.columns:
+        out["Sector_Ret_20"] = 0.0
+    if "RelStrength" not in out.columns:
+        out["RelStrength"] = 0.0
+
+    return out
     
 
 def apply_lookahead_shift_per_ticker(df: pd.DataFrame, cols: list[str], shift_days: int) -> pd.DataFrame:
