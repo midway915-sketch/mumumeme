@@ -112,8 +112,152 @@ def forward_roll_min_excl_today(s: pd.Series, window: int) -> pd.Series:
     return s[::-1].rolling(window, min_periods=window).min()[::-1].shift(-1)
 
 
+# ---------------------------
+# A안 Tail(엔진 평단 기반) 계산
+# ---------------------------
+def clamp_invest_by_leverage(seed: float, entry_seed: float, desired: float, max_leverage_pct: float) -> float:
+    if desired <= 0:
+        return 0.0
+    if not np.isfinite(entry_seed) or entry_seed <= 0:
+        return float(min(desired, max(seed, 0.0)))
+
+    borrow_limit = float(entry_seed) * float(max_leverage_pct)
+    floor_seed = -borrow_limit
+    room = float(seed) - float(floor_seed)  # seed + borrow_limit
+    if room <= 0:
+        return 0.0
+    return float(min(desired, room))
+
+
+def tail_A_series_for_ticker(
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    H: int,
+    ex: int,
+    profit_target: float,
+    tail_threshold: float,
+    tp1_frac: float = 0.50,
+    max_leverage_pct: float = 1.00,
+    near_zone_mult: float = 1.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      tail_hit[i] (0/1): TP1 전까지 low <= avg*(1+tail_thr) 한번이라도 발생하면 1
+      fut_dd_close[i]: 참고용 (기존과 호환) entry close 기준 (t+1..t+H+ex) 최저 Low DD
+                       = min(low/close_i - 1)
+    """
+    n = len(close)
+    tail_hit = np.zeros(n, dtype=np.int8)
+    fut_dd_close = np.full(n, np.nan, dtype=float)
+
+    pt_mult = 1.0 + float(profit_target)
+    tail_mult = 1.0 + float(tail_threshold)
+
+    H = int(max(1, H))
+    ex = int(max(0, ex))
+    tail_h = int(H + ex)
+
+    tp1_frac = float(min(1.0, max(0.0, tp1_frac)))
+
+    for i in range(n):
+        entry_px = float(close[i])
+        if not np.isfinite(entry_px) or entry_px <= 0:
+            continue
+
+        # (참고용) entry close 기준 미래 최저 DD
+        end0 = min(n - 1, i + tail_h)
+        if end0 >= i + 1:
+            lo_min = np.nanmin(low[i + 1 : end0 + 1])
+            if np.isfinite(lo_min) and lo_min > 0:
+                fut_dd_close[i] = (lo_min / entry_px) - 1.0
+
+        # 엔진형 DCA(스케일 불변) - seed=1로 정규화
+        entry_seed = 1.0
+        seed = 1.0
+        unit = entry_seed / float(H)
+
+        shares = 0.0
+        invested = 0.0
+        tp1_done = False
+
+        # entry buy at day i close
+        invest0 = clamp_invest_by_leverage(seed, entry_seed, unit, max_leverage_pct)
+        if invest0 > 0:
+            seed -= invest0
+            invested += invest0
+            shares += invest0 / entry_px
+
+        if shares <= 0 or invested <= 0:
+            continue
+
+        avg = invested / shares
+        holding_days = 1
+
+        end = min(n - 1, i + tail_h)
+        hit = False
+
+        for j in range(i + 1, end + 1):
+            holding_days += 1
+            lo = float(low[j])
+            hi = float(high[j])
+            cl = float(close[j])
+
+            # (1) Tail check first (same-day TP1 vs Tail => Tail 우선 보수)
+            if (not tp1_done) and np.isfinite(lo) and np.isfinite(avg) and avg > 0:
+                if lo <= avg * tail_mult:
+                    hit = True
+                    break
+
+            # (2) TP1 check => TP1 나오면 Tail 스캔 종료(=0)
+            if (not tp1_done) and np.isfinite(hi) and np.isfinite(avg) and avg > 0:
+                if hi >= avg * pt_mult:
+                    # partial sell at tp_px
+                    tp_px = avg * pt_mult
+                    sell_shares = float(min(shares, max(0.0, shares * tp1_frac)))
+                    if sell_shares > 0 and tp_px > 0:
+                        proceeds = sell_shares * tp_px
+                        shares_after = shares - sell_shares
+                        if shares_after > 0:
+                            invested *= (shares_after / shares)
+                        else:
+                            invested = 0.0
+                        shares = shares_after
+                        seed += proceeds
+                    tp1_done = True
+                    break
+
+            # (3) DCA only until H (H 이후 DCA stop)
+            if (not tp1_done) and (holding_days <= H):
+                if not (np.isfinite(cl) and cl > 0):
+                    continue
+
+                desired = unit
+
+                # 엔진 룰: <=avg full, <=avg*1.05 half, else 0
+                if np.isfinite(avg) and avg > 0:
+                    if cl <= avg:
+                        pass
+                    elif cl <= avg * float(near_zone_mult):
+                        desired = desired / 2.0
+                    else:
+                        desired = 0.0
+
+                invest = clamp_invest_by_leverage(seed, entry_seed, desired, max_leverage_pct)
+                if invest > 0:
+                    seed -= invest
+                    invested += invest
+                    shares += invest / cl
+                    if shares > 0:
+                        avg = invested / shares
+
+        tail_hit[i] = 1 if hit else 0
+
+    return tail_hit, fut_dd_close
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build strategy labels (Success + Tail + ExtendNeeded).")
+    ap = argparse.ArgumentParser(description="Build strategy labels (Success + Tail(A) + ExtendNeeded).")
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
@@ -123,8 +267,13 @@ def main() -> None:
         "--tail-threshold",
         type=float,
         default=-0.30,
-        help="Tail event threshold as return (e.g. -0.30 means -30% drawdown event).",
+        help="A안 tail threshold vs avg (e.g. -0.30 means low <= avg*(1-0.30) before TP1).",
     )
+
+    # 엔진 파라미터(기본값은 simulate 엔진과 맞춤)
+    ap.add_argument("--tp1-frac", type=float, default=0.50)
+    ap.add_argument("--max-leverage-pct", type=float, default=1.00)
+    ap.add_argument("--near-zone-mult", type=float, default=1.05)
 
     ap.add_argument("--features-path", type=str, default=None)
     ap.add_argument("--feature-cols", type=str, default="", help="콤마로 feature 컬럼 지정(비우면 meta/SSOT 사용)")
@@ -197,18 +346,32 @@ def main() -> None:
         high = g["High"].astype(float)
         low = g["Low"].astype(float)
 
+        # --- Success (기존 그대로: entry Close 기준 미래 max High)
         fut_max_high_success = forward_roll_max_excl_today(high, success_h)
-        fut_min_low_tail = forward_roll_min_excl_today(low, tail_h)
-
         success = (fut_max_high_success >= close * (1.0 + pt)).astype("float")
 
-        fut_dd_tail = (fut_min_low_tail / close) - 1.0
-        tail = (fut_dd_tail <= tail_thr).astype("float")
+        # --- Tail (A안: 엔진 평단 기반)
+        tail_A, fut_dd_close = tail_A_series_for_ticker(
+            close=close.to_numpy(dtype=float),
+            high=high.to_numpy(dtype=float),
+            low=low.to_numpy(dtype=float),
+            H=max_days,
+            ex=ex,
+            profit_target=pt,
+            tail_threshold=tail_thr,
+            tp1_frac=float(args.tp1_frac),
+            max_leverage_pct=float(args.max_leverage_pct),
+            near_zone_mult=float(args.near_zone_mult),
+        )
+        tail = tail_A.astype("float")
 
+        # --- 참고용 FutureMinDD_TailH (호환 위해 entry Close 기준 DD 유지)
+        fut_dd_tail = pd.Series(fut_dd_close, index=g.index).astype(float)
+
+        # --- ExtendNeeded (기존 그대로: H일 시점 ret < SL and success==0)
         offset = max_days - 1
         close_at_max = close.shift(-offset)
         ret_at_max = (close_at_max / close) - 1.0
-
         extend_needed = ((success == 0) & (ret_at_max < sl)).astype("float")
 
         g["Success"] = success
@@ -259,6 +422,12 @@ def main() -> None:
         "features_source": feats_src,
         "tail_horizon_days": int(tail_h),
         "market_ticker": MARKET_TICKER,
+        "tail_label_mode": "A(avg_price_before_TP1)",
+        "engine_params": {
+            "tp1_frac": float(args.tp1_frac),
+            "max_leverage_pct": float(args.max_leverage_pct),
+            "near_zone_mult": float(args.near_zone_mult),
+        },
     }
     (LABEL_DIR / f"strategy_raw_data_{tag}_meta.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
