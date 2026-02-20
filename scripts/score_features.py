@@ -53,11 +53,20 @@ def norm_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
-def ensure_features_exist(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
+def ensure_features_exist(df: pd.DataFrame, feat_cols: list[str], *, warn_prefix: str = "") -> pd.DataFrame:
+    """
+    scoring 단계는 운영 편의상:
+      - 컬럼 없으면 0.0으로 생성
+      - 단, report/SSOT 기반일 때는 경고 출력
+    """
     out = df.copy()
-    for c in feat_cols:
-        if c not in out.columns:
+    missing = [c for c in feat_cols if c not in out.columns]
+    if missing:
+        pfx = f"{warn_prefix} " if warn_prefix else ""
+        print(f"[WARN]{pfx}missing feature cols -> filled with 0.0: {missing}")
+        for c in missing:
             out[c] = 0.0
+
     for c in feat_cols:
         out[c] = (
             pd.to_numeric(out[c], errors="coerce")
@@ -75,14 +84,33 @@ def _load_feature_cols_from_report(report_path: Path) -> list[str] | None:
         j = json.loads(report_path.read_text(encoding="utf-8"))
         cols = j.get("feature_cols")
         if isinstance(cols, list) and cols:
-            return [str(c) for c in cols]
+            return [str(c) for c in cols if str(c).strip()]
+    except Exception:
+        return None
+    return None
+
+
+def _load_feature_cols_from_ssot() -> list[str] | None:
+    """
+    data/meta/feature_cols.json (SSOT) 우선 사용.
+    형식:
+      {"feature_cols":[...], "sector_enabled": true/false, ...}
+    """
+    p = META_DIR / "feature_cols.json"
+    if not p.exists():
+        return None
+    try:
+        j = json.loads(p.read_text(encoding="utf-8"))
+        cols = j.get("feature_cols")
+        if isinstance(cols, list) and cols:
+            return [str(c) for c in cols if str(c).strip()]
     except Exception:
         return None
     return None
 
 
 def load_ps_feature_cols(tag: str) -> list[str] | None:
-    # ✅ train_model.py writes: data/meta/train_model_report_{tag}.json
+    # train_model.py writes: data/meta/train_model_report_{tag}.json
     return _load_feature_cols_from_report(META_DIR / f"train_model_report_{tag}.json")
 
 
@@ -92,7 +120,7 @@ def load_tail_feature_cols(tag: str) -> list[str] | None:
 
 
 def load_tau_feature_cols(tag: str) -> list[str] | None:
-    # (권장) train_tau_model.py writes: data/meta/train_tau_report_{tag}.json
+    # train_tau_model.py writes: data/meta/train_tau_report_{tag}.json
     return _load_feature_cols_from_report(META_DIR / f"train_tau_report_{tag}.json")
 
 
@@ -124,8 +152,27 @@ def class_to_h(cls: int, hmap: list[int]) -> int:
 
 
 def parse_csv_cols(s: str) -> list[str]:
-    cols = [c.strip() for c in (s or "").split(",") if c.strip()]
-    return cols
+    return [c.strip() for c in (s or "").split(",") if c.strip()]
+
+
+def resolve_model_paths(base_model: str, base_scaler: str, tag: str) -> tuple[str, str]:
+    """
+    tag가 있으면:
+      app/model_{tag}.pkl / app/scaler_{tag}.pkl 우선
+    없으면:
+      주어진 base_model/base_scaler 그대로
+    단, tag 파일이 없으면 base로 폴백
+    """
+    bm = Path(base_model)
+    bs = Path(base_scaler)
+
+    if tag:
+        cand_m = bm.with_name(f"{bm.stem}_{tag}{bm.suffix}")
+        cand_s = bs.with_name(f"{bs.stem}_{tag}{bs.suffix}")
+        if cand_m.exists() and cand_s.exists():
+            return str(cand_m), str(cand_s)
+
+    return str(bm), str(bs)
 
 
 def main() -> None:
@@ -143,12 +190,11 @@ def main() -> None:
     # p_success
     ap.add_argument("--ps-model", default="app/model.pkl", type=str)
     ap.add_argument("--ps-scaler", default="app/scaler.pkl", type=str)
-    # ✅ 기본값을 빈 문자열로: report에서 자동으로 읽도록
     ap.add_argument(
         "--ps-features",
         default="",
         type=str,
-        help="comma-separated override. default=read train_model_report_{tag}.json or fallback to DEFAULT_FEATURES",
+        help="comma-separated override. default=report(train_model_report_{tag}) -> SSOT(meta/feature_cols.json) -> DEFAULT_FEATURES",
     )
 
     # p_tail
@@ -158,7 +204,7 @@ def main() -> None:
         "--tail-features",
         default="",
         type=str,
-        help="comma-separated override. default=read train_tail_report_{tag}.json or fallback to ps-features",
+        help="comma-separated override. default=report(train_tail_report_{tag}) -> SSOT -> ps-features",
     )
 
     # tau
@@ -168,7 +214,7 @@ def main() -> None:
         "--tau-features",
         default="",
         type=str,
-        help="comma-separated override. default=read train_tau_report_{tag}.json or fallback to ps-features",
+        help="comma-separated override. default=report(train_tau_report_{tag}) -> SSOT -> ps-features",
     )
     ap.add_argument(
         "--tau-h-map",
@@ -189,25 +235,45 @@ def main() -> None:
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
+    # 공통 SSOT cols (report 없을 때 우선)
+    ssot_cols = _load_feature_cols_from_ssot()
+
     # -------------------------
-    # p_success (✅ report 기반 강제 정렬)
+    # p_success (report -> SSOT -> DEFAULT)
     # -------------------------
-    ps_model = joblib.load(args.ps_model)
-    ps_scaler = joblib.load(args.ps_scaler)
+    ps_model_path, ps_scaler_path = resolve_model_paths(args.ps_model, args.ps_scaler, args.tag)
+    if not Path(ps_model_path).exists() or not Path(ps_scaler_path).exists():
+        raise FileNotFoundError(
+            f"Missing p_success model/scaler.\n"
+            f"-> tried: {ps_model_path} / {ps_scaler_path}\n"
+            f"-> (tag fallback) you may need to train_model.py first."
+        )
+
+    ps_model = joblib.load(ps_model_path)
+    ps_scaler = joblib.load(ps_scaler_path)
 
     if args.ps_features.strip():
         ps_cols = parse_csv_cols(args.ps_features)
+        ps_cols_src = "--ps-features"
     else:
-        ps_cols = load_ps_feature_cols(args.tag) or DEFAULT_FEATURES
+        ps_cols = load_ps_feature_cols(args.tag)
+        if ps_cols:
+            ps_cols_src = f"report(train_model_report_{args.tag}.json)"
+        elif ssot_cols:
+            ps_cols = ssot_cols
+            ps_cols_src = "SSOT(data/meta/feature_cols.json)"
+        else:
+            ps_cols = DEFAULT_FEATURES
+            ps_cols_src = "DEFAULT_FEATURES"
 
-    ps_cols = [c for c in ps_cols if c]  # sanitize
-    feats_ps = ensure_features_exist(feats, ps_cols)
-    X_ps = feats_ps[ps_cols].to_numpy(dtype=float)  # ✅ train과 같은 순서/컬럼
+    ps_cols = [c for c in ps_cols if c]
+    feats_ps = ensure_features_exist(feats, ps_cols, warn_prefix=f"[p_success:{ps_cols_src}]")
+    X_ps = feats_ps[ps_cols].to_numpy(dtype=float)
     X_ps_s = ps_scaler.transform(X_ps)
     feats["p_success"] = ps_model.predict_proba(X_ps_s)[:, 1].astype(float)
 
     # -------------------------
-    # p_tail (optional)
+    # p_tail (optional; report -> SSOT -> ps_cols)
     # -------------------------
     tail_model_path = Path(args.tail_model)
     tail_scaler_path = Path(args.tail_scaler)
@@ -217,10 +283,20 @@ def main() -> None:
 
         if args.tail_features.strip():
             tail_cols = parse_csv_cols(args.tail_features)
+            tail_cols_src = "--tail-features"
         else:
-            tail_cols = load_tail_feature_cols(args.tag) or ps_cols
+            tail_cols = load_tail_feature_cols(args.tag)
+            if tail_cols:
+                tail_cols_src = f"report(train_tail_report_{args.tag}.json)"
+            elif ssot_cols:
+                tail_cols = ssot_cols
+                tail_cols_src = "SSOT(data/meta/feature_cols.json)"
+            else:
+                tail_cols = ps_cols
+                tail_cols_src = "fallback(ps_cols)"
 
-        feats_tail = ensure_features_exist(feats, tail_cols)
+        tail_cols = [c for c in tail_cols if c]
+        feats_tail = ensure_features_exist(feats, tail_cols, warn_prefix=f"[p_tail:{tail_cols_src}]")
         X_t = feats_tail[tail_cols].to_numpy(dtype=float)
         X_t_s = tail_scaler.transform(X_t)
         feats["p_tail"] = tail_model.predict_proba(X_t_s)[:, 1].astype(float)
@@ -228,7 +304,7 @@ def main() -> None:
         feats["p_tail"] = 0.0
 
     # -------------------------
-    # tau_class / tau_H (optional)
+    # tau_class / tau_H (optional; report -> SSOT -> ps_cols)
     # -------------------------
     tau_model_path = Path(args.tau_model)
     tau_scaler_path = Path(args.tau_scaler)
@@ -240,10 +316,20 @@ def main() -> None:
 
         if args.tau_features.strip():
             tau_cols = parse_csv_cols(args.tau_features)
+            tau_cols_src = "--tau-features"
         else:
-            tau_cols = load_tau_feature_cols(args.tag) or ps_cols
+            tau_cols = load_tau_feature_cols(args.tag)
+            if tau_cols:
+                tau_cols_src = f"report(train_tau_report_{args.tag}.json)"
+            elif ssot_cols:
+                tau_cols = ssot_cols
+                tau_cols_src = "SSOT(data/meta/feature_cols.json)"
+            else:
+                tau_cols = ps_cols
+                tau_cols_src = "fallback(ps_cols)"
 
-        feats_tau = ensure_features_exist(feats, tau_cols)
+        tau_cols = [c for c in tau_cols if c]
+        feats_tau = ensure_features_exist(feats, tau_cols, warn_prefix=f"[tau:{tau_cols_src}]")
         X_tau = feats_tau[tau_cols].to_numpy(dtype=float)
         X_tau_s = tau_scaler.transform(X_tau)
 
@@ -274,7 +360,8 @@ def main() -> None:
     # write outputs
     # -------------------------
     out_parq = Path(args.out_parq)
-    out_csv = Path(args.out_csv)
+    out_csv = Path(args.out_c
+sv)
     out_parq.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -284,6 +371,15 @@ def main() -> None:
         print(f"[WARN] parquet save failed ({e}) -> writing csv")
         feats.to_csv(out_csv, index=False)
         print(f"[DONE] wrote: {out_csv} rows={len(feats)}")
+
+    print("=" * 60)
+    print("[INFO] scoring summary")
+    print("tag:", args.tag)
+    print("p_success model/scaler:", ps_model_path, "/", ps_scaler_path)
+    print("p_success cols source:", ps_cols_src, "cols:", ps_cols)
+    print("p_tail enabled:", bool(tail_model_path.exists() and tail_scaler_path.exists()))
+    print("tau enabled:", bool(tau_model_path.exists() and tau_scaler_path.exists()))
+    print("=" * 60)
 
 
 if __name__ == "__main__":
