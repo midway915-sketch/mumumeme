@@ -1,4 +1,4 @@
-# scripts/train_tail_model.py
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -15,35 +15,12 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
+from scripts.feature_spec import read_feature_cols_meta, get_feature_cols
+
 
 APP_DIR = Path("app")
 META_DIR = Path("data/meta")
 LABELS_DIR = Path("data/labels")
-
-# ✅ build_features.py 기준(16) + (옵션) 섹터(2)
-DEFAULT_FEATURES = [
-    # base (9)
-    "Drawdown_252",
-    "Drawdown_60",
-    "ATR_ratio",
-    "Z_score",
-    "MACD_hist",
-    "MA20_slope",
-    "Market_Drawdown",
-    "Market_ATR_ratio",
-    "ret_score",
-    # new (7)
-    "ret_5",
-    "ret_10",
-    "ret_20",
-    "breakout_20",
-    "vol_surge",
-    "trend_align",
-    "beta_60",
-    # optional sector (2) - 있으면 쓰고, 없으면 choose_features가 보강
-    "Sector_Ret_20",
-    "RelStrength",
-]
 
 
 def read_table(parq: Path, csv: Path) -> pd.DataFrame:
@@ -54,23 +31,53 @@ def read_table(parq: Path, csv: Path) -> pd.DataFrame:
     raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
 
 
-def choose_features(df: pd.DataFrame, requested: list[str]) -> list[str]:
-    cols = set(df.columns)
-    feats = [c for c in requested if c in cols]
+def parse_csv_list(s: str) -> list[str]:
+    if s is None:
+        return []
+    items = [x.strip() for x in str(s).split(",")]
+    return [x for x in items if x]
 
-    # 최소 4개 미만이면 숫자 컬럼에서 자동 보강
-    if len(feats) < 4:
-        banned = {"TailTarget", "Target", "Success", "Date", "Ticker"}
-        numeric = [c for c in df.columns if c not in banned and pd.api.types.is_numeric_dtype(df[c])]
-        feats = feats + [c for c in numeric if c not in feats][:12]
 
-    # unique 유지
-    out, seen = [], set()
-    for c in feats:
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
-    return out
+def resolve_feature_cols(args_features: str) -> tuple[list[str], str]:
+    """
+    Priority:
+      1) --features (explicit override)
+      2) data/meta/feature_cols.json (SSOT written by build_features.py)
+      3) fallback SSOT default (sector disabled)
+    Returns: (feature_cols, source_string)
+    """
+    override = parse_csv_list(args_features)
+    if override:
+        return [str(c).strip() for c in override if str(c).strip()], "--features"
+
+    cols_meta, sector_enabled = read_feature_cols_meta()
+    if cols_meta:
+        return cols_meta, "data/meta/feature_cols.json"
+
+    return get_feature_cols(sector_enabled=False), "feature_spec.py (fallback)"
+
+
+def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source_hint: str = "") -> None:
+    missing = [c for c in feat_cols if c not in df.columns]
+    if missing:
+        hint = f" (src={source_hint})" if source_hint else ""
+        raise ValueError(
+            f"Missing feature columns{hint}: {missing}\n"
+            f"-> labels_tail 파일 생성 단계(build_strategy_labels/build_tail_labels)가 "
+            f"SSOT feature_cols를 포함하도록 먼저 맞춰져 있어야 함."
+        )
+
+
+def coerce_features_numeric(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for c in feat_cols:
+        df[c] = (
+            pd.to_numeric(df[c], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .astype(float)
+        )
+    return df
 
 
 def _fit_model(X_train, y_train, n_splits: int, max_iter: int):
@@ -91,7 +98,9 @@ def main() -> None:
     ap.add_argument("--stop-level", required=True, type=float)
     ap.add_argument("--max-extend-days", required=True, type=int)
 
-    ap.add_argument("--features", default=",".join(DEFAULT_FEATURES), type=str)
+    # ✅ 기본은 SSOT(meta) 사용. 필요할 때만 override.
+    ap.add_argument("--features", default="", type=str, help="comma-separated feature cols (override SSOT/meta)")
+
     ap.add_argument("--train-ratio", default=0.8, type=float)
     ap.add_argument("--n-splits", default=3, type=int)
     ap.add_argument("--max-iter", default=500, type=int)
@@ -119,31 +128,36 @@ def main() -> None:
                 f"Missing tail labels. Provide {parq}/{csv} or include TailTarget in labels_model."
             )
 
+    # normalize date ordering
     if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.sort_values("Date")
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+        df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
 
+    # target
     if "TailTarget" not in df.columns:
         raise ValueError(f"TailTarget column missing (src={src})")
 
-    requested = [x.strip() for x in args.features.split(",") if x.strip()]
-    feature_cols = choose_features(df, requested)
+    feat_cols, feat_src = resolve_feature_cols(args.features)
+    feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
 
-    use = df.dropna(subset=feature_cols + ["TailTarget"]).copy()
-    for c in feature_cols:
-        use[c] = pd.to_numeric(use[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # ✅ STRICT: 누락 피처는 바로 에러
+    ensure_feature_columns_strict(df, feat_cols, source_hint=f"{feat_src}, labels_src={src}")
 
-    y = pd.to_numeric(use["TailTarget"], errors="coerce").fillna(0).astype(int)
-    X = use[feature_cols]
+    # numeric coercion
+    df = coerce_features_numeric(df, feat_cols)
+
+    use = df.dropna(subset=feat_cols + ["TailTarget"]).copy()
+    y = pd.to_numeric(use["TailTarget"], errors="coerce").fillna(0).astype(int).to_numpy()
+    X = use[feat_cols].to_numpy(dtype=float)
 
     if len(use) < 200:
-        raise RuntimeError(f"Not enough training rows: {len(use)} (src={src})")
+        raise RuntimeError(f"Not enough training rows: {len(use)} (labels_src={src})")
 
     split_idx = int(len(use) * float(args.train_ratio))
-    split_idx = max(1, min(split_idx, len(use) - 1))
+    split_idx = max(50, min(split_idx, len(use) - 50))
 
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
@@ -152,24 +166,29 @@ def main() -> None:
     model = _fit_model(X_train_s, y_train, n_splits=int(args.n_splits), max_iter=int(args.max_iter))
 
     probs = model.predict_proba(X_test_s)[:, 1]
-    auc = float(roc_auc_score(y_test, probs)) if len(np.unique(y_test)) > 1 else float("nan")
+    auc = float("nan")
+    if len(np.unique(y_test)) > 1:
+        auc = float(roc_auc_score(y_test, probs))
 
     APP_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
 
     # ✅ 파이프라인 호환: 고정 파일명 유지
-    joblib.dump(model, APP_DIR / "tail_model.pkl")
-    joblib.dump(scaler, APP_DIR / "tail_scaler.pkl")
+    out_model = APP_DIR / "tail_model.pkl"
+    out_scaler = APP_DIR / "tail_scaler.pkl"
+    joblib.dump(model, out_model)
+    joblib.dump(scaler, out_scaler)
 
     report = {
         "tag": tag,
         "rows_used": int(len(use)),
         "train_rows": int(len(X_train)),
         "test_rows": int(len(X_test)),
-        "feature_cols": feature_cols,
+        "feature_cols_source": feat_src,
+        "feature_cols": feat_cols,
         "auc": (round(auc, 6) if np.isfinite(auc) else None),
         "labels_src": src,
-        "paths": {"model": str(APP_DIR / "tail_model.pkl"), "scaler": str(APP_DIR / "tail_scaler.pkl")},
+        "paths": {"model": str(out_model), "scaler": str(out_scaler)},
     }
     (META_DIR / f"train_tail_report_{tag}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
@@ -177,7 +196,8 @@ def main() -> None:
     print("[DONE] train_tail_model.py")
     print("tag:", tag)
     print("AUC:", report["auc"])
-    print("features:", feature_cols)
+    print("feature_cols_source:", feat_src)
+    print("features:", feat_cols)
     print("=" * 60)
 
 
