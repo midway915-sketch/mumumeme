@@ -34,6 +34,9 @@ OUT_CSV = FEAT_DIR / "features_model.csv"
 
 MARKET_TICKER = "SPY"  # market proxy (must exist in raw prices)
 
+# ✅ 룩어헤드 방지: "당일 종가 진입(B)" 기준이면 무조건 1일 lag 피처만 사용
+LOOKAHEAD_SHIFT_DAYS = 1
+
 
 # -----------------------------
 # IO helpers
@@ -58,13 +61,22 @@ def read_prices() -> pd.DataFrame:
         if c not in df.columns:
             raise ValueError(f"prices missing required column: {c}")
 
-    df = df.dropna(subset=["Date", "Ticker", "Close"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    # numeric coerce
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = (
+        df.dropna(subset=["Date", "Ticker", "Close", "High", "Low"])
+        .sort_values(["Ticker", "Date"])
+        .drop_duplicates(["Date", "Ticker"], keep="last")
+        .reset_index(drop=True)
+    )
     return df
 
 
 def read_universe_groups_strict() -> dict[str, str]:
     """
-    ✅ sector features를 '무조건' 쓰려면 Group 매핑이 필수라서,
+    ✅ sector features를 '무조건' 쓰려면 Group 매핑이 필수.
     universe.csv 없거나 Group 컬럼 없으면 여기서 바로 에러.
     """
     if not UNIVERSE_CSV.exists():
@@ -141,9 +153,7 @@ def compute_market_features(prices: pd.DataFrame) -> pd.DataFrame:
 
 def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> pd.DataFrame:
     """
-    ✅ 핵심 FIX:
-      - r(티커 수익률)과 mret(시장 수익률)을 "같은 index(g.index)"로 맞춰서
-        rolling.cov/var에서 pandas align로 길이 꼬이는 문제를 막음.
+    ✅ beta_60 index 정렬로 길이 꼬임 방지
     """
     g = g.sort_values("Date").copy()
     dt = pd.to_datetime(g["Date"], errors="coerce").dt.tz_localize(None)
@@ -195,7 +205,7 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
     var = mret.rolling(60, min_periods=60).var()
     beta_60 = cov / var
 
-    # ✅ 방어: 길이 체크(여기서 깨지면 바로 원인 찾기 쉬움)
+    # ✅ 방어: 길이 체크
     n = len(g)
     cols_for_len = {
         "Date": len(dt),
@@ -242,7 +252,7 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
             "trend_align": trend_align.to_numpy(),
             "beta_60": beta_60.to_numpy(),
 
-            # optional debug columns (kept for future filters)
+            # debug columns (not in SSOT, but keep)
             "Volume": v.to_numpy(),
             "Close": c.to_numpy(),
         }
@@ -253,9 +263,7 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
 
 def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict[str, str]) -> pd.DataFrame:
     """
-    ✅ sector features 필수:
-      - Group 매핑이 없으면 이미 read_universe_groups_strict()에서 실패
-      - 계산 후 Sector_Ret_20 / RelStrength가 안 생기면 여기서도 실패
+    ✅ sector features 필수
     """
     if "ret_20" not in feats.columns:
         raise RuntimeError("feats missing ret_20 -> cannot build Sector_Ret_20 / RelStrength")
@@ -263,7 +271,6 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict[str, s
     x = feats.copy()
     x["Group"] = x["Ticker"].map(ticker_to_group)
 
-    # Group이 없는 티커가 있으면 지금은 바로 실패시키는 게 안전(섹터 강제니까)
     if x["Group"].isna().any():
         missing = sorted(x.loc[x["Group"].isna(), "Ticker"].unique().tolist())
         raise ValueError(
@@ -277,12 +284,27 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict[str, s
         .rename(columns={"ret_20": "Sector_Ret_20"})
     )
     x = x.merge(sector_ret, on=["Date", "Group"], how="left", validate="many_to_one")
-    x["RelStrength"] = pd.to_numeric(x["ret_20"], errors="coerce") - pd.to_numeric(x["Sector_Ret_20"], errors="coerce")
+    x["RelStrength"] = pd.to_numeric(x["ret_20"], errors="coerce") - pd.to_numeric(
+        x["Sector_Ret_20"], errors="coerce"
+    )
 
     if "Sector_Ret_20" not in x.columns or "RelStrength" not in x.columns:
         raise RuntimeError("Sector features not created as expected (Sector_Ret_20/RelStrength missing).")
 
     return x
+
+
+def apply_lookahead_shift_per_ticker(df: pd.DataFrame, cols: list[str], shift_days: int) -> pd.DataFrame:
+    """
+    ✅ 룩어헤드 0 보장:
+    Date=t 행의 cols 값은 't-1까지'로만 계산된 값이 되도록 shift(1).
+    """
+    if shift_days <= 0:
+        return df
+
+    out = df.sort_values(["Ticker", "Date"]).copy()
+    out[cols] = out.groupby("Ticker", sort=False)[cols].shift(shift_days)
+    return out
 
 
 def main() -> None:
@@ -307,8 +329,7 @@ def main() -> None:
         compute_start = start_date - pd.Timedelta(days=lookback_days)
         prices = prices.loc[prices["Date"] >= compute_start].copy()
 
-    market = compute_market_features(prices)
-    market = market.sort_values("Date").reset_index(drop=True)
+    market = compute_market_features(prices).sort_values("Date").reset_index(drop=True)
 
     market_ret_by_date = pd.Series(
         market["Market_ret_1d"].to_numpy(dtype=float),
@@ -323,9 +344,9 @@ def main() -> None:
     if feats.empty:
         raise RuntimeError("No features produced. Check prices input.")
 
-    feats = feats.copy()
     feats["Date"] = pd.to_datetime(feats["Date"], errors="coerce").dt.tz_localize(None)
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
+    feats = feats.dropna(subset=["Date", "Ticker"]).reset_index(drop=True)
 
     # merge market columns needed by SSOT
     market_merge_cols = ["Date", "Market_Drawdown", "Market_ATR_ratio"]
@@ -334,15 +355,13 @@ def main() -> None:
     if args.min_volume and args.min_volume > 0:
         feats = feats.loc[pd.to_numeric(feats["Volume"], errors="coerce") >= float(args.min_volume)].copy()
 
-    # ✅ sector features are REQUIRED (always)
+    # ✅ sector features REQUIRED
     ticker_to_group = read_universe_groups_strict()
     feats = add_sector_strength_strict(feats, ticker_to_group=ticker_to_group)
 
-    # ✅ sector always enabled => SSOT cols = 18 (9+7+2)
+    # ✅ SSOT 18개 강제(섹터 포함)
     sector_enabled = True
     FEATURE_COLS = get_feature_cols(sector_enabled=sector_enabled)
-
-    # ✅ 18개 강제(SSOT 안정성)
     if len(FEATURE_COLS) != 18:
         raise RuntimeError(f"SSOT feature cols must be 18, got {len(FEATURE_COLS)}: {FEATURE_COLS}")
 
@@ -350,9 +369,13 @@ def main() -> None:
     if missing_cols:
         raise RuntimeError(f"Computed features missing SSOT columns: {missing_cols}")
 
-    # dropna (strict)
+    # ✅ ✅ ✅ LOOK-AHEAD GUARD: ticker별 1일 shift
+    feats = apply_lookahead_shift_per_ticker(feats, FEATURE_COLS, LOOKAHEAD_SHIFT_DAYS)
+
+    # shift 후 NaN 생기는 구간 제거(초반부)
     feats = feats.dropna(subset=FEATURE_COLS + ["Date", "Ticker"]).copy()
 
+    # start-date cut (true output cut)
     if start_date is not None:
         feats = feats.loc[pd.to_datetime(feats["Date"], errors="coerce") >= start_date].copy()
 
@@ -367,7 +390,6 @@ def main() -> None:
         feats.to_parquet(OUT_PARQ, index=False)
     except Exception as e:
         print(f"[WARN] parquet save failed ({e}) -> writing csv only")
-
     feats.to_csv(OUT_CSV, index=False)
 
     # ✅ SSOT meta write (cols= 시그니처)
@@ -378,6 +400,7 @@ def main() -> None:
         dmin = pd.to_datetime(feats["Date"]).min().date()
         dmax = pd.to_datetime(feats["Date"]).max().date()
         print(f"[INFO] range: {dmin}..{dmax}")
+        print(f"[INFO] lookahead_shift_days: {LOOKAHEAD_SHIFT_DAYS} (B: enter at close)")
         print("[INFO] sector strength: ENABLED (required)")
         print(f"[INFO] feature_cols_meta: {meta_path}")
         print(f"[INFO] feature_cols({len(FEATURE_COLS)}): {FEATURE_COLS}")
