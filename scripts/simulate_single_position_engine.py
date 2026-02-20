@@ -418,8 +418,6 @@ def main() -> None:
                     st.grace_days_left = int(st.grace_days_total)
 
                     # hybrid threshold
-                    # STRONG -> max(ret_H+0.05, -0.05)
-                    # WEAK   -> min(ret_H+0.05, -0.05)
                     base = float(st.ret_H) + 0.05 if np.isfinite(st.ret_H) else -0.05
                     if strength == "STRONG":
                         st.recovery_threshold = float(max(base, -0.05))
@@ -433,36 +431,81 @@ def main() -> None:
                     for leg in st.legs:
                         if leg.ticker not in day_df.index:
                             continue
-                        high_px = day_prices_high[leg.ticker]
-                        low_px = day_prices_low[leg.ticker]
+                        high_px = float(day_prices_high[leg.ticker])
+                        low_px = float(day_prices_low[leg.ticker])
                         avg = leg.avg_price()
 
-                        # TP1
-                        if (not leg.tp1_done) and np.isfinite(avg) and high_px >= avg * (1.0 + float(args.profit_target)):
-                            tp_px = avg * (1.0 + float(args.profit_target))
-                            sell_shares = leg.shares * float(args.tp1_frac)
-                            sell_shares = float(min(leg.shares, max(0.0, sell_shares)))
-                            proceeds = sell_shares * tp_px
+                        # ------------------------------------------------------------
+                        # ✅ LOOKAHEAD GUARD (intraday order):
+                        # We only have OHLC, not the sequence of events.
+                        # To avoid optimistic "I know today's high came before low",
+                        # we enforce conservative execution:
+                        #
+                        # - For TP1-already-done legs: assume LOW happens first.
+                        #   => check trailing-stop with *previous* peak BEFORE updating peak with today's high.
+                        #
+                        # - For TP1 trigger day: we allow TP1 if High hits target,
+                        #   then conservatively allow trailing to also trigger same day (High -> then Low),
+                        #   which removes any hidden benefit from choosing a favorable intraday order.
+                        # ------------------------------------------------------------
 
-                            leg.shares -= sell_shares
-                            leg.invested *= (leg.shares / (leg.shares + sell_shares)) if (leg.shares + sell_shares) > 0 else 0.0
-
-                            st.seed += proceeds
-                            leg.tp1_done = True
-                            leg.peak = float(max(high_px, tp_px))
-
-                            st.update_lev(float(args.max_leverage_pct))
-
-                        # trailing after TP1
+                        # (A) If TP1 already done: trailing-stop check FIRST using prior peak (LOW-first)
                         if leg.tp1_done and leg.shares > 0:
-                            if high_px > leg.peak:
+                            peak_prev = float(leg.peak) if np.isfinite(leg.peak) else 0.0
+                            if peak_prev > 0:
+                                stop_px = peak_prev * (1.0 - float(args.trail_stop))
+                                if np.isfinite(low_px) and low_px <= stop_px:
+                                    proceeds = leg.shares * stop_px
+                                    st.seed += proceeds
+                                    leg.shares = 0.0
+                                    leg.invested = 0.0
+                                    st.update_lev(float(args.max_leverage_pct))
+                                    continue  # if stopped out, DO NOT update peak with today's high
+
+                            # if not stopped, now update peak with today's high
+                            if np.isfinite(high_px) and high_px > leg.peak:
                                 leg.peak = float(high_px)
-                            stop_px = leg.peak * (1.0 - float(args.trail_stop))
-                            if np.isfinite(low_px) and low_px <= stop_px:
-                                proceeds = leg.shares * stop_px
-                                st.seed += proceeds
-                                leg.shares = 0.0
-                                leg.invested = 0.0
+
+                        # (B) TP1 not yet done: check TP1 (High condition)
+                        if (not leg.tp1_done) and leg.shares > 0 and np.isfinite(avg) and avg > 0:
+                            tp_hit = np.isfinite(high_px) and high_px >= avg * (1.0 + float(args.profit_target))
+                            if tp_hit:
+                                tp_px = avg * (1.0 + float(args.profit_target))
+
+                                shares_before = float(leg.shares)
+                                invested_before = float(leg.invested)
+
+                                sell_shares = shares_before * float(args.tp1_frac)
+                                sell_shares = float(min(shares_before, max(0.0, sell_shares)))
+
+                                if sell_shares > 0 and np.isfinite(tp_px) and tp_px > 0:
+                                    proceeds = sell_shares * tp_px
+
+                                    shares_after = shares_before - sell_shares
+                                    if shares_before > 0:
+                                        leg.invested = invested_before * (shares_after / shares_before)
+                                    else:
+                                        leg.invested = 0.0
+                                    leg.shares = shares_after
+
+                                    st.seed += proceeds
+                                    st.update_lev(float(args.max_leverage_pct))
+
+                                leg.tp1_done = True
+
+                                # set peak at least tp_px, and consider today's high
+                                leg.peak = float(max(tp_px, high_px)) if np.isfinite(high_px) else float(tp_px)
+
+                                # (C) Conservative same-day trailing after TP1:
+                                # assume High happened (to enable TP1), then Low can hit stop.
+                                if leg.shares > 0 and np.isfinite(low_px) and leg.peak > 0:
+                                    stop_px = float(leg.peak) * (1.0 - float(args.trail_stop))
+                                    if low_px <= stop_px:
+                                        proceeds = leg.shares * stop_px
+                                        st.seed += proceeds
+                                        leg.shares = 0.0
+                                        leg.invested = 0.0
+                                        st.update_lev(float(args.max_leverage_pct))
 
                 # 2) if all legs emptied -> close
                 if st.in_cycle and all((leg.shares <= 0 for leg in st.legs)):
@@ -478,18 +521,15 @@ def main() -> None:
 
             # 4) Grace mode: DCA STOP, apply recovery-stop for non-TP1 legs only
             if st.in_cycle and st.extending:
-                # decrement grace only when we're in grace AND still no TP1 anywhere
                 any_tp1 = any((leg.tp1_done for leg in st.legs))
                 if not any_tp1:
                     st.grace_days_left = max(0, int(st.grace_days_left) - 1)
 
-                    # recovery-stop check (close-based)
                     thr = float(st.recovery_threshold) if np.isfinite(st.recovery_threshold) else -0.05
                     hit = False
                     for leg in st.legs:
                         if leg.shares <= 0:
                             continue
-                        # TP1 legs ignore recovery-stop
                         if leg.tp1_done:
                             continue
                         px = day_prices_close.get(leg.ticker, np.nan)
@@ -503,11 +543,9 @@ def main() -> None:
                     if hit:
                         close_cycle(date, day_prices_close, reason="GRACE_RECOVERY_EXIT")
                     else:
-                        # grace end => close (only if still no TP1)
                         if st.in_cycle and st.grace_days_left <= 0:
                             close_cycle(date, day_prices_close, reason="GRACE_END_EXIT")
 
-                # if TP1 exists, trailing regime continues without grace closing
                 if st.in_cycle:
                     st.update_dd(day_prices_close)
 
@@ -526,7 +564,6 @@ def main() -> None:
                         avg = leg.avg_price()
                         desired_leg = desired_total * float(leg.weight)
 
-                        # buy rule: only <=avg, soften in near zone
                         if np.isfinite(avg) and avg > 0:
                             if close_px <= avg:
                                 pass
