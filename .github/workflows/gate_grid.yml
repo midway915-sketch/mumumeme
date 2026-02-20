@@ -107,26 +107,25 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      # ✅ 여기서 "런타임 env" 뿐 아니라 "expression용 output" 도 같이 만든다
       - name: Set env keys (LABEL_KEY + MAX_EXTEND_DAYS auto)
         id: set_keys
         shell: bash
         run: |
           set -euo pipefail
 
-          LABEL_KEY="pt$(python - <<'PY'
-          pt=float("${PROFIT_TARGET}")
-          print(int(round(pt*100)))
-          PY
-          )_h${MAX_DAYS}_sl$(python - <<'PY'
-          sl=float("${STOP_LEVEL}")
-          print(int(round(abs(sl)*100)))
+          LABEL_KEY="$(python - <<'PY'
+          import os
+          pt=float(os.environ.get("PROFIT_TARGET","0.10"))
+          md=int(os.environ.get("MAX_DAYS","40"))
+          sl=float(os.environ.get("STOP_LEVEL","-0.10"))
+          print(f"pt{int(round(pt*100))}_h{md}_sl{int(round(abs(sl)*100))}")
           PY
           )"
 
           MAX_EXTEND_DAYS="$(python - <<'PY'
-          H=int("${MAX_DAYS}")
-          print(max(1, H//2))
+          import os
+          md=int(os.environ.get("MAX_DAYS","40"))
+          print(max(1, md//2))
           PY
           )"
 
