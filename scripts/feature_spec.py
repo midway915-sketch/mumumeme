@@ -70,12 +70,24 @@ def read_prices() -> pd.DataFrame:
     return df
 
 
+def _normalize_enabled_col(s: pd.Series) -> pd.Series:
+    """
+    Enabled가 bool/0/1/"true"/"FALSE"/"yes" 등 섞여 있어도 안전하게 bool로 정규화.
+    """
+    if s.dtype == bool:
+        return s
+    x = s.astype(str).str.strip().str.lower()
+    truthy = {"true", "1", "yes", "y", "t"}
+    falsy = {"false", "0", "no", "n", "f", "", "nan", "none"}
+    return x.apply(lambda v: True if v in truthy else (False if v in falsy else False))
+
+
 def read_universe_groups_strict() -> tuple[dict[str, str], list[str]]:
     """
     ✅ sector features 강제:
-      - universe.csv가 반드시 있어야 함
-      - Group 매핑이 반드시 있어야 함
-      - "유니버스 티커 목록"도 같이 반환 (features는 유니버스만 생성)
+      - universe.csv 반드시 필요
+      - Group 매핑 반드시 필요
+      - 유니버스 티커 목록도 같이 반환 (features는 유니버스만 생성)
     """
     if not UNIVERSE_CSV.exists():
         raise FileNotFoundError(f"Missing {UNIVERSE_CSV}. Sector features require universe.csv with Group column.")
@@ -88,10 +100,9 @@ def read_universe_groups_strict() -> tuple[dict[str, str], list[str]]:
     uni["Ticker"] = uni["Ticker"].astype(str).str.upper().str.strip()
     uni["Group"] = uni["Group"].astype(str).str.strip()
 
-    # Enabled 컬럼 있으면 Enabled==True만 사용 (없으면 전체)
     if "Enabled" in uni.columns:
-        uni["Enabled"] = uni["Enabled"].astype(bool)
-        uni = uni.loc[uni["Enabled"] == True].copy()
+        uni["Enabled"] = _normalize_enabled_col(uni["Enabled"])
+        uni = uni.loc[uni["Enabled"] == True].copy()  # noqa: E712
 
     uni = uni.dropna(subset=["Ticker", "Group"]).reset_index(drop=True)
 
@@ -133,7 +144,10 @@ def compute_atr_ratio(g: pd.DataFrame, n: int = 14) -> pd.Series:
 def compute_market_features(prices: pd.DataFrame) -> pd.DataFrame:
     m = prices.loc[prices["Ticker"] == MARKET_TICKER].sort_values("Date").copy()
     if m.empty:
-        raise ValueError(f"Market ticker {MARKET_TICKER} not found. Use fetch_prices.py --include-extra")
+        raise ValueError(
+            f"Market ticker {MARKET_TICKER} not found in prices. "
+            f"-> run fetch_prices.py --include-extra (must include SPY)."
+        )
 
     m["Date"] = pd.to_datetime(m["Date"], errors="coerce").dt.tz_localize(None)
     m = m.dropna(subset=["Date"]).reset_index(drop=True)
@@ -144,7 +158,6 @@ def compute_market_features(prices: pd.DataFrame) -> pd.DataFrame:
     mdd = (c / roll_max_252) - 1.0
 
     atr_ratio = compute_atr_ratio(m, n=14)
-
     mret = c.pct_change()
 
     out = pd.DataFrame(
@@ -211,7 +224,7 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
     beta_60 = cov / var
 
     n = len(g)
-    bad = {  # 길이 방어
+    bad = {
         "Drawdown_252": len(dd_252),
         "Drawdown_60": len(dd_60),
         "ATR_ratio": len(atr_ratio),
@@ -275,9 +288,7 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict[str, s
         .rename(columns={"ret_20": "Sector_Ret_20"})
     )
     x = x.merge(sector_ret, on=["Date", "Group"], how="left", validate="many_to_one")
-    x["RelStrength"] = pd.to_numeric(x["ret_20"], errors="coerce") - pd.to_numeric(
-        x["Sector_Ret_20"], errors="coerce"
-    )
+    x["RelStrength"] = pd.to_numeric(x["ret_20"], errors="coerce") - pd.to_numeric(x["Sector_Ret_20"], errors="coerce")
 
     if "Sector_Ret_20" not in x.columns or "RelStrength" not in x.columns:
         raise RuntimeError("Sector features not created as expected (Sector_Ret_20/RelStrength missing).")
@@ -309,6 +320,16 @@ def main() -> None:
     ticker_to_group, universe_tickers = read_universe_groups_strict()
     keep_tickers = set(universe_tickers) | {MARKET_TICKER}
     prices = prices.loc[prices["Ticker"].isin(keep_tickers)].copy()
+
+    # ✅ FAIL FAST: 유니버스 티커가 prices에 실제로 존재하는지 확인
+    have = set(prices["Ticker"].unique().tolist())
+    missing_px = sorted([t for t in universe_tickers if t not in have])
+    if missing_px:
+        raise RuntimeError(
+            f"Universe tickers missing in prices: {missing_px}\n"
+            f"-> fetch_prices.py에서 다운로드 실패했거나 Enabled/Universe 설정 불일치.\n"
+            f"-> 해결: fetch_prices.py --include-extra (SPY 포함) 후 재실행."
+        )
 
     start_date = None
     if args.start_date:
@@ -348,7 +369,7 @@ def main() -> None:
     if args.min_volume and args.min_volume > 0:
         feats = feats.loc[pd.to_numeric(feats["Volume"], errors="coerce") >= float(args.min_volume)].copy()
 
-    # ✅ sector features REQUIRED (유니버스 티커만 있으니 여기서 SPY로 터질 일이 없음)
+    # ✅ sector features REQUIRED
     feats = add_sector_strength_strict(feats, ticker_to_group=ticker_to_group)
 
     # ✅ SSOT 18개 강제(섹터 포함)
@@ -374,7 +395,6 @@ def main() -> None:
         .reset_index(drop=True)
     )
 
-    # save
     try:
         feats.to_parquet(OUT_PARQ, index=False)
     except Exception as e:
