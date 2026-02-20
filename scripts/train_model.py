@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+# ✅ FIX: "python scripts/xxx.py"로 실행될 때도 scripts.* import가 되도록 repo root를 sys.path에 추가
+import sys
+from pathlib import Path
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import json
-from pathlib import Path
 
 import joblib
 import numpy as np
@@ -40,6 +46,31 @@ def parse_csv_list(s: str) -> list[str]:
     return [x for x in items if x]
 
 
+def resolve_feature_cols(args_features: str) -> tuple[list[str], str]:
+    """
+    Priority:
+      1) --features (explicit override)
+      2) data/meta/feature_cols.json (SSOT written by build_features.py)
+      3) fallback SSOT default (sector disabled)
+    """
+    override = parse_csv_list(args_features)
+    if override:
+        return [str(c).strip() for c in override if str(c).strip()], "--features"
+
+    cols_meta, _sector_enabled = read_feature_cols_meta()
+    if cols_meta:
+        return cols_meta, "data/meta/feature_cols.json"
+
+    return get_feature_cols(sector_enabled=False), "feature_spec.py (fallback)"
+
+
+def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source_hint: str = "") -> None:
+    missing = [c for c in feat_cols if c not in df.columns]
+    if missing:
+        hint = f" (src={source_hint})" if source_hint else ""
+        raise ValueError(f"Missing feature columns{hint}: {missing}")
+
+
 def coerce_features_numeric(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
     df = df.copy()
     for c in feat_cols:
@@ -52,38 +83,11 @@ def coerce_features_numeric(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFr
     return df
 
 
-def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source_hint: str = "") -> None:
-    missing = [c for c in feat_cols if c not in df.columns]
-    if missing:
-        hint = f" (src={source_hint})" if source_hint else ""
-        raise ValueError(f"Missing feature columns{hint}: {missing}")
-
-
 def write_train_report(tag: str, report: dict) -> None:
     META_DIR.mkdir(parents=True, exist_ok=True)
     p = META_DIR / (f"train_model_report_{tag}.json" if tag else "train_model_report.json")
     p.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[DONE] wrote train report -> {p}")
-
-
-def resolve_feature_cols(args_features: str) -> tuple[list[str], str]:
-    """
-    Priority:
-      1) --features (explicit override)
-      2) data/meta/feature_cols.json (SSOT written by build_features.py)
-      3) fallback SSOT default (sector disabled)
-    Returns: (feature_cols, source_string)
-    """
-    override = parse_csv_list(args_features)
-    if override:
-        return [str(c).strip() for c in override if str(c).strip()], "--features"
-
-    cols_meta, sector_enabled = read_feature_cols_meta()
-    if cols_meta:
-        return cols_meta, "data/meta/feature_cols.json"
-
-    # fallback: sector OFF
-    return get_feature_cols(sector_enabled=False), "feature_spec.py (fallback)"
 
 
 def main() -> None:
@@ -118,16 +122,14 @@ def main() -> None:
 
     # normalize date
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.tz_localize(None)
-    df = df.dropna(subset=[date_col]).copy()
-    df = df.sort_values(date_col).reset_index(drop=True)
+    df = df.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
 
     feat_cols, feat_src = resolve_feature_cols(args.features)
     feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
 
-    # ✅ STRICT: 누락 피처는 바로 에러
-    ensure_feature_columns_strict(df, feat_cols, source_hint=feat_src)
+    # ✅ STRICT
+    ensure_feature_columns_strict(df, feat_cols, source_hint=f"{feat_src}, labels_src={LABELS_PARQ if LABELS_PARQ.exists() else LABELS_CSV}")
 
-    # numeric coercion
     df = coerce_features_numeric(df, feat_cols)
 
     y = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int).to_numpy()
@@ -148,7 +150,6 @@ def main() -> None:
     base = LogisticRegression(max_iter=int(args.max_iter))
     tscv = TimeSeriesSplit(n_splits=int(args.n_splits))
 
-    # sklearn 버전 차이 방어 (estimator vs base_estimator)
     try:
         model = CalibratedClassifierCV(estimator=base, method="isotonic", cv=tscv)
     except TypeError:
