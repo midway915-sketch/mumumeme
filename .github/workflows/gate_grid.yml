@@ -66,8 +66,8 @@ jobs:
 
       REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'false' }}
 
+      # 고정
       PRICE_START: "2015-02-21"
-
       GATE_MODES: "none,tail,utility,tail_utility"
 
       ENABLE_TRAILING: "true"
@@ -108,33 +108,25 @@ jobs:
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
       - name: Set env keys (LABEL_KEY + MAX_EXTEND_DAYS auto)
-        id: set_keys
         shell: bash
         run: |
           set -euo pipefail
 
-          LABEL_KEY="$(python - <<'PY'
-          import os
-          pt=float(os.environ.get("PROFIT_TARGET","0.10"))
-          md=int(os.environ.get("MAX_DAYS","40"))
-          sl=float(os.environ.get("STOP_LEVEL","-0.10"))
-          print(f"pt{int(round(pt*100))}_h{md}_sl{int(round(abs(sl)*100))}")
+          echo "LABEL_KEY=pt$(python - <<PY
+          pt=float(\"${PROFIT_TARGET}\")
+          print(int(round(pt*100)))
           PY
-          )"
-
-          MAX_EXTEND_DAYS="$(python - <<'PY'
-          import os
-          md=int(os.environ.get("MAX_DAYS","40"))
-          print(max(1, md//2))
+          )_h${MAX_DAYS}_sl$(python - <<PY
+          sl=float(\"${STOP_LEVEL}\")
+          print(int(round(abs(sl)*100)))
           PY
-          )"
+          )" >> $GITHUB_ENV
 
-          echo "LABEL_KEY=${LABEL_KEY}" >> $GITHUB_ENV
-          echo "MAX_EXTEND_DAYS=${MAX_EXTEND_DAYS}" >> $GITHUB_ENV
-
-          # outputs for cache key / expressions
-          echo "label_key=${LABEL_KEY}" >> $GITHUB_OUTPUT
-          echo "max_extend_days=${MAX_EXTEND_DAYS}" >> $GITHUB_OUTPUT
+          echo "MAX_EXTEND_DAYS=$(python - <<PY
+          H=int(\"${MAX_DAYS}\")
+          print(max(1, H//2))
+          PY
+          )" >> $GITHUB_ENV
 
       - name: Restore cache (PRICES)
         uses: actions/cache@v4
@@ -167,9 +159,9 @@ jobs:
             app/model.pkl
             app/scaler.pkl
             data/meta/train_model_report*.json
-          key: mumumeme-model-v3-${{ runner.os }}-${{ steps.set_keys.outputs.label_key }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py') }}
+          key: mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py') }}
           restore-keys: |
-            mumumeme-model-v3-${{ runner.os }}-${{ steps.set_keys.outputs.label_key }}-
+            mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
             mumumeme-model-v3-${{ runner.os }}-
 
       - name: Restore cache (TAIL)
@@ -182,10 +174,10 @@ jobs:
             app/tail_model.pkl
             app/tail_scaler.pkl
             data/meta/train_tail_report_*.json
-          key: mumumeme-tail-v3-${{ runner.os }}-${{ steps.set_keys.outputs.label_key }}-ex${{ steps.set_keys.outputs.max_extend_days }}-${{ hashFiles('scripts/build_tail_labels.py','scripts/train_tail_model.py') }}
+          key: mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-ex${{ env.MAX_EXTEND_DAYS }}-${{ hashFiles('scripts/build_tail_labels.py','scripts/train_tail_model.py') }}
           restore-keys: |
-            mumumeme-tail-v3-${{ runner.os }}-${{ steps.set_keys.outputs.label_key }}-ex${{ steps.set_keys.outputs.max_extend_days }}-
-            mumumeme-tail-v3-${{ runner.os }}-${{ steps.set_keys.outputs.label_key }}-
+            mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-ex${{ env.MAX_EXTEND_DAYS }}-
+            mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
             mumumeme-tail-v3-${{ runner.os }}-
 
       - name: Restore cache (TAU)
@@ -203,17 +195,17 @@ jobs:
 
       - name: Prepare required files (10y only + partial rebuild)
         shell: bash
+        env:
+          LABEL_KEY: ${{ env.LABEL_KEY }}
+          MAX_EXTEND_DAYS: ${{ env.MAX_EXTEND_DAYS }}
         run: |
           set -euo pipefail
-
-          echo "[INFO] LABEL_KEY=${LABEL_KEY}"
-          echo "[INFO] MAX_EXTEND_DAYS=${MAX_EXTEND_DAYS}"
 
           if [ "${REBUILD_ALL}" = "true" ]; then
             rm -rf data/raw/* data/features/* data/labels/* app/* data/signals/* data/meta/* || true
           fi
 
-          # 1) universe + prices (10y only)
+          # 1) universe + prices (10y만)
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full --start "${PRICE_START}"
@@ -228,7 +220,7 @@ jobs:
             echo "[INFO] features_model exists -> reuse"
           fi
 
-          # 3) labels (p_success)
+          # 3) labels (p_success 학습 데이터)
           if [ ! -f data/labels/labels_model.parquet ] && [ ! -f data/labels/labels_model.csv ]; then
             python scripts/build_labels.py \
               --profit-target "${PROFIT_TARGET}" \
@@ -238,7 +230,7 @@ jobs:
             echo "[INFO] labels_model exists -> reuse"
           fi
 
-          # 4) p_success model
+          # 4) p_success model.pkl / scaler.pkl
           if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
             python scripts/train_model.py
           else
@@ -247,11 +239,11 @@ jobs:
 
           # 4b) labels_tail_{EX_TAG}
           EX_TAG="pt$(python - <<PY
-          pt=float("${PROFIT_TARGET}")
+          pt=float(\"${PROFIT_TARGET}\")
           print(int(round(pt*100)))
           PY
           )_h${MAX_DAYS}_sl$(python - <<PY
-          sl=float("${STOP_LEVEL}")
+          sl=float(\"${STOP_LEVEL}\")
           print(int(round(abs(sl)*100)))
           PY
           )_ex${MAX_EXTEND_DAYS}"
@@ -266,7 +258,7 @@ jobs:
             echo "[INFO] labels_tail exists -> reuse"
           fi
 
-          # 4c) tail_model
+          # 4c) tail_model.pkl / tail_scaler.pkl
           if [ ! -f app/tail_model.pkl ] || [ ! -f app/tail_scaler.pkl ]; then
             python scripts/train_tail_model.py \
               --profit-target "${PROFIT_TARGET}" \
@@ -277,7 +269,7 @@ jobs:
             echo "[INFO] tail model exists -> reuse"
           fi
 
-          # 4d) TAU labels + model (optional)
+          # 4d) TAU labels + model (있으면 사용)
           if [ -f scripts/build_tau_labels.py ]; then
             if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
               python scripts/build_tau_labels.py \
@@ -307,10 +299,14 @@ jobs:
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
+        env:
+          LABEL_KEY: ${{ env.LABEL_KEY }}
+          MAX_EXTEND_DAYS: ${{ env.MAX_EXTEND_DAYS }}
         run: |
           set -euo pipefail
           chmod +x scripts/run_grid_workflow.sh
-          bash scripts/run_grid_workflow.sh
+          # ❌ bash로 실행하면 안됨 (파이썬 스크립트임)
+          ./scripts/run_grid_workflow.sh
 
       - name: Aggregate summaries
         shell: bash
