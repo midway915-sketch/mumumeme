@@ -265,6 +265,23 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict[str, s
     """
     ✅ sector features 필수
     """
+    
+    # --- PATCH: allow "benchmark / non-sector" tickers without Group ---
+    # SPY, ^VIX 같은 애들은 섹터/그룹 개념이 없으니 sector features 대상에서 제외
+    NON_SECTOR = {"SPY", "^VIX", "QQQ"}  # 필요하면 추가 가능
+    
+    feats = feats.copy()
+    feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
+    
+    mask_non_sector = feats["Ticker"].isin(NON_SECTOR)
+    if mask_non_sector.any():
+        # sector columns을 만들어두되 값은 0으로 채움 (모델/SSOT 컬럼 일관성 유지)
+        feats.loc[mask_non_sector, "Sector_Ret_20"] = 0.0
+        feats.loc[mask_non_sector, "RelStrength"] = 0.0
+    
+    # 아래부터는 "sector 대상"만 strict 체크/계산
+    feats_sector = feats.loc[~mask_non_sector].copy()
+    
     if "ret_20" not in feats.columns:
         raise RuntimeError("feats missing ret_20 -> cannot build Sector_Ret_20 / RelStrength")
 
@@ -291,8 +308,14 @@ def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict[str, s
     if "Sector_Ret_20" not in x.columns or "RelStrength" not in x.columns:
         raise RuntimeError("Sector features not created as expected (Sector_Ret_20/RelStrength missing).")
 
-    return x
-
+    # feats_sector에서 Sector_Ret_20 / RelStrength 계산 완료했다고 가정
+    # 결과를 원본 feats에 되돌리기
+    for col in ["Sector_Ret_20", "RelStrength"]:
+        if col in feats_sector.columns:
+            feats.loc[feats_sector.index, col] = feats_sector[col].values
+    
+    return feats
+    
 
 def apply_lookahead_shift_per_ticker(df: pd.DataFrame, cols: list[str], shift_days: int) -> pd.DataFrame:
     """
