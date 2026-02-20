@@ -197,12 +197,12 @@ jobs:
       - name: Prepare required files (10y only + partial rebuild)
         shell: bash
         env:
-          REBUILD_ALL: ${{ env.REBUILD_ALL }}
+          REBUILD_ALL: ${{ inputs.rebuild_all }}
           PRICE_START: ${{ env.PRICE_START }}
 
-          PROFIT_TARGET: ${{ env.PROFIT_TARGET }}
-          MAX_DAYS: ${{ env.MAX_DAYS }}
-          STOP_LEVEL: ${{ env.STOP_LEVEL }}
+          PROFIT_TARGET: ${{ inputs.profit_target }}
+          MAX_DAYS: ${{ inputs.max_days }}
+          STOP_LEVEL: ${{ inputs.stop_level }}
           MAX_EXTEND_DAYS: ${{ env.MAX_EXTEND_DAYS }}
 
           LABEL_KEY: ${{ env.LABEL_KEY }}
@@ -213,6 +213,33 @@ jobs:
             rm -rf data/raw/* data/features/* data/labels/* app/* data/signals/* data/meta/* || true
           fi
 
+          # helper: check if a parquet/csv has required columns
+          check_cols() {
+            local parq="$1"
+            local csv="$2"
+            shift 2
+            python - <<PY
+          import sys, pandas as pd
+          parq="$parq"; csv="$csv"
+          req=${@:-}
+          cols=[]
+          if parq and __import__("pathlib").Path(parq).exists():
+              df=pd.read_parquet(parq)
+              cols=list(df.columns)
+          elif csv and __import__("pathlib").Path(csv).exists():
+              df=pd.read_csv(csv, nrows=5)
+              cols=list(df.columns)
+          else:
+              print("MISSING_FILE")
+              sys.exit(2)
+          missing=[c for c in sys.argv[1:] if c not in cols]
+          if missing:
+              print("MISSING_COLS:" + ",".join(missing))
+              sys.exit(1)
+          print("OK")
+          PY "$@"
+          }
+
           # 1) universe + prices (10y만)
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
@@ -221,35 +248,55 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "$PRICE_START"
           fi
 
-          # 2) features
-          if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
-            python scripts/build_features.py --enable-sector-strength
+          # 2) features (섹터 필수: 없으면 무조건 재빌드)
+          NEED_REBUILD_FEATURES="false"
+          if [ -f data/features/features_model.parquet ] || [ -f data/features/features_model.csv ]; then
+            if ! check_cols "data/features/features_model.parquet" "data/features/features_model.csv" "Sector_Ret_20" "RelStrength" >/dev/null 2>&1; then
+              echo "[WARN] features_model exists but missing sector cols -> rebuild"
+              NEED_REBUILD_FEATURES="true"
+            fi
           else
-            echo "[INFO] features_model exists -> reuse"
+            NEED_REBUILD_FEATURES="true"
           fi
 
-          # 3) labels (p_success 학습 데이터)
-          if [ ! -f data/labels/labels_model.parquet ] && [ ! -f data/labels/labels_model.csv ]; then
+          if [ "$NEED_REBUILD_FEATURES" = "true" ]; then
+            rm -f data/features/features_model.parquet data/features/features_model.csv data/meta/feature_cols.json || true
+            python scripts/build_features.py --enable-sector-strength
+          else
+            echo "[INFO] features_model exists (sector OK) -> reuse"
+          fi
+
+          # 3) labels (p_success 학습 데이터) : 섹터 피처 포함이므로, labels도 섹터 없으면 재빌드
+          NEED_REBUILD_LABELS="false"
+          if [ -f data/labels/labels_model.parquet ] || [ -f data/labels/labels_model.csv ]; then
+            if ! check_cols "data/labels/labels_model.parquet" "data/labels/labels_model.csv" "Sector_Ret_20" "RelStrength" >/dev/null 2>&1; then
+              echo "[WARN] labels_model exists but missing sector cols -> rebuild"
+              NEED_REBUILD_LABELS="true"
+            fi
+          else
+            NEED_REBUILD_LABELS="true"
+          fi
+
+          if [ "$NEED_REBUILD_LABELS" = "true" ]; then
+            rm -f data/labels/labels_model.parquet data/labels/labels_model.csv || true
             python scripts/build_labels.py \
               --profit-target "$PROFIT_TARGET" \
               --max-days "$MAX_DAYS" \
               --stop-level "$STOP_LEVEL"
+            # labels 재빌드했으면 모델도 같이 갈아엎는 게 안전
+            rm -f app/model*.pkl app/scaler*.pkl data/meta/train_model_report*.json || true
           else
-            echo "[INFO] labels_model exists -> reuse"
+            echo "[INFO] labels_model exists (sector OK) -> reuse"
           fi
 
-          # 4) p_success model (태그 학습 + 기존 호환용 model.pkl 유지)
-          if [ ! -f "app/model_${LABEL_KEY}.pkl" ] || [ ! -f "app/scaler_${LABEL_KEY}.pkl" ]; then
+          # 4) p_success model.pkl / scaler.pkl (가능하면 tag 맞춰 저장)
+          if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
             python scripts/train_model.py --tag "$LABEL_KEY"
           else
-            echo "[INFO] p_success tagged model exists -> reuse"
+            echo "[INFO] p_success model exists -> reuse"
           fi
 
-          # canonical names 유지 (run_grid가 app/model.pkl을 요구하니까)
-          cp -f "app/model_${LABEL_KEY}.pkl" "app/model.pkl"
-          cp -f "app/scaler_${LABEL_KEY}.pkl" "app/scaler.pkl"
-
-          # 4b) labels_tail_{EX_TAG}  ✅ A안 TailTarget 생성
+          # 4b) labels_tail_{EX_TAG}
           EX_TAG="pt$(python - <<PY
           pt=float("$PROFIT_TARGET")
           print(int(round(pt*100)))
@@ -311,7 +358,7 @@ jobs:
             echo "[WARN] tau training skipped (missing script or labels_tau)"
           fi
 
-          # 5) score features
+          # 5) score features -> features_scored
           python scripts/score_features.py --tag "$LABEL_KEY"
 
       - name: Run gate grid (predict + simulate + summarize)
