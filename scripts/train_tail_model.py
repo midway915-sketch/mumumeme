@@ -50,7 +50,7 @@ def resolve_feature_cols(args_features: str) -> tuple[list[str], str]:
     if override:
         return [str(c).strip() for c in override if str(c).strip()], "--features"
 
-    cols_meta, sector_enabled = read_feature_cols_meta()
+    cols_meta, _sector_enabled = read_feature_cols_meta()
     if cols_meta:
         return cols_meta, "data/meta/feature_cols.json"
 
@@ -63,7 +63,7 @@ def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source
         hint = f" (src={source_hint})" if source_hint else ""
         raise ValueError(
             f"Missing feature columns{hint}: {missing}\n"
-            f"-> labels_tail 파일 생성 단계(build_strategy_labels/build_tail_labels)가 "
+            f"-> labels_tail 생성 단계(build_strategy_labels/build_tail_labels)가 "
             f"SSOT feature_cols를 포함하도록 먼저 맞춰져 있어야 함."
         )
 
@@ -98,7 +98,7 @@ def main() -> None:
     ap.add_argument("--stop-level", required=True, type=float)
     ap.add_argument("--max-extend-days", required=True, type=int)
 
-    # ✅ 기본은 SSOT(meta) 사용. 필요할 때만 override.
+    # default: SSOT/meta. override only if you really want.
     ap.add_argument("--features", default="", type=str, help="comma-separated feature cols (override SSOT/meta)")
 
     ap.add_argument("--train-ratio", default=0.8, type=float)
@@ -110,7 +110,6 @@ def main() -> None:
     sl_tag = int(round(abs(args.stop_level) * 100))
     tag = f"pt{pt_tag}_h{args.max_days}_sl{sl_tag}_ex{args.max_extend_days}"
 
-    # preferred: labels_tail_tag
     parq = LABELS_DIR / f"labels_tail_{tag}.parquet"
     csv = LABELS_DIR / f"labels_tail_{tag}.csv"
 
@@ -118,7 +117,7 @@ def main() -> None:
         df = read_table(parq, csv).copy()
         src = str(parq if parq.exists() else csv)
     else:
-        # fallback: labels_model, if it contains TailTarget
+        # fallback only if TailTarget already exists there
         parq2 = LABELS_DIR / "labels_model.parquet"
         csv2 = LABELS_DIR / "labels_model.csv"
         df = read_table(parq2, csv2).copy()
@@ -128,22 +127,19 @@ def main() -> None:
                 f"Missing tail labels. Provide {parq}/{csv} or include TailTarget in labels_model."
             )
 
-    # normalize date ordering
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
         df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
 
-    # target
     if "TailTarget" not in df.columns:
         raise ValueError(f"TailTarget column missing (src={src})")
 
     feat_cols, feat_src = resolve_feature_cols(args.features)
     feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
 
-    # ✅ STRICT: 누락 피처는 바로 에러
+    # STRICT: missing features -> fail fast
     ensure_feature_columns_strict(df, feat_cols, source_hint=f"{feat_src}, labels_src={src}")
 
-    # numeric coercion
     df = coerce_features_numeric(df, feat_cols)
 
     use = df.dropna(subset=feat_cols + ["TailTarget"]).copy()
@@ -173,7 +169,6 @@ def main() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ✅ 파이프라인 호환: 고정 파일명 유지
     out_model = APP_DIR / "tail_model.pkl"
     out_scaler = APP_DIR / "tail_scaler.pkl"
     joblib.dump(model, out_model)
