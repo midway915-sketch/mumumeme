@@ -107,6 +107,13 @@ def resolve_feature_cols(args_feature_cols: str) -> tuple[list[str], str]:
     return get_feature_cols(sector_enabled=False), "feature_spec.py (fallback)"
 
 
+def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source_hint: str = "") -> None:
+    missing = [c for c in feat_cols if c not in df.columns]
+    if missing:
+        hint = f" (src={source_hint})" if source_hint else ""
+        raise ValueError(f"Missing feature columns{hint}: {missing}")
+
+
 def clamp_invest_by_leverage(seed: float, entry_seed: float, desired: float, max_leverage_pct: float) -> float:
     """
     Enforce: seed_after >= - entry_seed * max_leverage_pct
@@ -126,7 +133,6 @@ def clamp_invest_by_leverage(seed: float, entry_seed: float, desired: float, max
 
 
 def simulate_tail_A_for_ticker(
-    dates: np.ndarray,
     close: np.ndarray,
     high: np.ndarray,
     low: np.ndarray,
@@ -145,7 +151,8 @@ def simulate_tail_A_for_ticker(
           * (TP1 전) low <= avg*(1+tail_thr) 발생하면 TailTarget=1
           * high >= avg*(1+PT) 발생하면 TP1(부분매도) 발생으로 간주하고 TailTarget=0로 종료
           * DCA는 엔진 룰(<=avg full, <=avg*near_zone half, else 0)
-      - H 도달 이후(ex 구간 포함)엔 DCA STOP(엔진의 pending_reval/extend 느낌 반영)
+      - 엔진과 정합: holding_days==H 되는 날 pending_reval로 DCA가 막히므로,
+        DCA는 holding_days < H 에서만 허용 (즉 마지막 DCA는 H-1일)
       - 같은 날 low와 high가 같이 조건 충족해도 "리스크 사건" 보수적으로 Tail=1 우선
     """
     n = len(close)
@@ -154,24 +161,21 @@ def simulate_tail_A_for_ticker(
     pt_mult = 1.0 + float(profit_target)
     tail_mult = 1.0 + float(tail_threshold)
 
-    tp1_frac = float(tp1_frac)
-    tp1_frac = float(min(1.0, max(0.0, tp1_frac)))
+    tp1_frac = float(min(1.0, max(0.0, float(tp1_frac))))
 
     H = int(max(1, H))
     ex = int(max(0, ex))
     tail_h = int(H + ex)
 
-    # simulate per start index i
     for i in range(n):
-        entry_px = close[i]
+        entry_px = float(close[i])
         if not np.isfinite(entry_px) or entry_px <= 0:
             out[i] = 0
             continue
 
-        # "capital" scale is arbitrary; avg dynamics invariant to scale
+        # scale-in dynamics invariant to scale
         entry_seed = 1.0
         seed = 1.0
-
         unit = entry_seed / float(H)
 
         shares = 0.0
@@ -191,18 +195,16 @@ def simulate_tail_A_for_ticker(
 
         avg = invested / shares
 
-        # forward days: i+1 .. i+tail_h (inclusive bound by data)
         end = min(n - 1, i + tail_h)
-
-        holding_days = 1  # entry day counted as 1 in engine
+        holding_days = 1  # entry day counted as 1
         tail_hit = False
 
         for j in range(i + 1, end + 1):
             holding_days += 1
 
-            lo = low[j]
-            hi = high[j]
-            cl = close[j]
+            lo = float(low[j])
+            hi = float(high[j])
+            cl = float(close[j])
 
             # (A) Tail check first (conservative on same-day TP1)
             if (not tp1_done) and np.isfinite(lo) and np.isfinite(avg) and avg > 0:
@@ -213,37 +215,29 @@ def simulate_tail_A_for_ticker(
             # (B) TP1 check (stop label scan if TP1 happens)
             if (not tp1_done) and np.isfinite(hi) and np.isfinite(avg) and avg > 0:
                 if hi >= avg * pt_mult:
-                    # execute partial sell at tp_px (avg*(1+PT))
                     tp_px = avg * pt_mult
-                    sell_shares = shares * tp1_frac
-                    sell_shares = float(min(shares, max(0.0, sell_shares)))
+                    sell_shares = float(min(shares, max(0.0, shares * tp1_frac)))
                     if sell_shares > 0 and tp_px > 0:
                         proceeds = sell_shares * tp_px
                         shares_after = shares - sell_shares
-
-                        # invested scales down proportional to remaining shares (same as engine)
                         if shares_after > 0:
                             invested *= (shares_after / shares)
                         else:
                             invested = 0.0
-
                         shares = shares_after
                         seed += proceeds
 
                     tp1_done = True
-                    # TP1 occurred before any tail => label 0
                     break
 
-            # (C) DCA rule only BEFORE we reach H
-            # 엔진: (not extending) & (not pending_reval)에서만 매수
-            # 여기서는 "holding_days <= H"에서만 DCA 허용 (H 이후 DCA stop)
-            if (not tp1_done) and (holding_days <= H):
+            # (C) DCA rule only BEFORE reaching H (engine-equivalent: pending_reval blocks DCA at holding_days==H)
+            if (not tp1_done) and (holding_days < H):
                 if not (np.isfinite(cl) and cl > 0):
                     continue
 
                 desired = unit
 
-                # conditional buy rule (engine same)
+                # engine same: <=avg full, <=avg*near_zone half, else 0
                 if np.isfinite(avg) and avg > 0:
                     if cl <= avg:
                         pass
@@ -310,7 +304,7 @@ def main() -> None:
         .reset_index(drop=True)
     )
 
-    # load features (base frame) - keep SSOT feature cols + Date/Ticker
+    # load features
     if args.features_path:
         fp = Path(args.features_path)
         if not fp.exists():
@@ -334,14 +328,13 @@ def main() -> None:
         .reset_index(drop=True)
     )
 
-    # feature cols resolution
+    # feature cols resolution (STRICT)
     feat_cols, feat_cols_src = resolve_feature_cols(args.feature_cols)
-    feat_cols = [c for c in feat_cols if c in feats.columns]  # only those present in feats
+    feat_cols = [c.strip() for c in feat_cols if c.strip()]
+    ensure_feature_columns_strict(feats, feat_cols, source_hint=f"{feat_cols_src}, feats_src={feats_src}")
 
-    # base key frame (we'll join TailTarget onto this)
+    # base key frame (we'll join prices for label simulation)
     base = feats[["Date", "Ticker"] + feat_cols].copy()
-
-    # join prices (for label simulation)
     base = base.merge(
         prices[["Date", "Ticker", "High", "Low", "Close"]],
         on=["Date", "Ticker"],
@@ -358,13 +351,11 @@ def main() -> None:
     for tkr, g in base.groupby("Ticker", sort=False):
         g = g.sort_values("Date").reset_index(drop=True)
 
-        dates = g["Date"].to_numpy()
         close = g["Close"].to_numpy(dtype=float)
         high = g["High"].to_numpy(dtype=float)
         low = g["Low"].to_numpy(dtype=float)
 
         tail_arr = simulate_tail_A_for_ticker(
-            dates=dates,
             close=close,
             high=high,
             low=low,
@@ -408,6 +399,8 @@ def main() -> None:
         "feature_cols_source": feat_cols_src,
         "feature_cols": feat_cols,
         "saved_to": saved_to,
+        "tail_label_mode": "A(avg_price_before_TP1)",
+        "dca_rule": "holding_days < H (engine-aligned; last DCA at H-1)",
     }
     (LBL_DIR / f"labels_tail_{tag}_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
