@@ -52,6 +52,23 @@ jobs:
     permissions:
       contents: read
 
+    # ✅ schedule에서도 값이 항상 존재하도록 기본값 강제
+    env:
+      PROFIT_TARGET: ${{ github.event.inputs.profit_target || '0.10' }}
+      MAX_DAYS: ${{ github.event.inputs.max_days || '40' }}
+      STOP_LEVEL: ${{ github.event.inputs.stop_level || '-0.10' }}
+
+      P_TAIL_THRESHOLDS: ${{ github.event.inputs.p_tail_thresholds || '0.10,0.20,0.30' }}
+      UTILITY_QUANTILES: ${{ github.event.inputs.utility_quantiles || '0.60,0.75,0.90' }}
+      PS_MINS: ${{ github.event.inputs.ps_mins || '0.00,0.50,0.60,0.70' }}
+      RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility,ret_score' }}
+      LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.05' }}
+
+      REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'false' }}
+
+      PRICE_START: "2015-02-21"
+      OUT_DIR: "data/signals"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -78,25 +95,23 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      - name: Set env keys (LABEL_KEY + PRICE_START + MAX_EXTEND_DAYS auto)
+      - name: Set env keys (LABEL_KEY + MAX_EXTEND_DAYS auto)
         shell: bash
         run: |
           set -euo pipefail
 
           echo "LABEL_KEY=pt$(python - <<'PY'
-          pt=float("${{ inputs.profit_target }}")
+          pt=float("${PROFIT_TARGET}")
           print(int(round(pt*100)))
           PY
-          )_h${{ inputs.max_days }}_sl$(python - <<'PY'
-          sl=float("${{ inputs.stop_level }}")
+          )_h${MAX_DAYS}_sl$(python - <<'PY'
+          sl=float("${STOP_LEVEL}")
           print(int(round(abs(sl)*100)))
           PY
           )" >> $GITHUB_ENV
 
-          echo "PRICE_START=2015-02-21" >> $GITHUB_ENV
-
           echo "MAX_EXTEND_DAYS=$(python - <<'PY'
-          H=int("${{ inputs.max_days }}")
+          H=int("${MAX_DAYS}")
           print(max(1, H//2))
           PY
           )" >> $GITHUB_ENV
@@ -169,12 +184,12 @@ jobs:
       - name: Prepare required files (10y only + partial rebuild)
         shell: bash
         env:
-          REBUILD_ALL: ${{ inputs.rebuild_all }}
+          REBUILD_ALL: ${{ env.REBUILD_ALL }}
           PRICE_START: ${{ env.PRICE_START }}
 
-          PROFIT_TARGET: ${{ inputs.profit_target }}
-          MAX_DAYS: ${{ inputs.max_days }}
-          STOP_LEVEL: ${{ inputs.stop_level }}
+          PROFIT_TARGET: ${{ env.PROFIT_TARGET }}
+          MAX_DAYS: ${{ env.MAX_DAYS }}
+          STOP_LEVEL: ${{ env.STOP_LEVEL }}
           MAX_EXTEND_DAYS: ${{ env.MAX_EXTEND_DAYS }}
 
           LABEL_KEY: ${{ env.LABEL_KEY }}
@@ -193,7 +208,7 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "$PRICE_START"
           fi
 
-          # 2) features  ✅ 섹터는 build_features.py에서 무조건 켜짐 -> 옵션 제거
+          # 2) features (섹터는 build_features.py에서 강제)
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             python scripts/build_features.py
           else
@@ -286,17 +301,16 @@ jobs:
         shell: bash
         env:
           LABEL_KEY: ${{ env.LABEL_KEY }}
-          PRICE_START: ${{ env.PRICE_START }}
 
-          PROFIT_TARGET: ${{ inputs.profit_target }}
-          MAX_DAYS: ${{ inputs.max_days }}
-          STOP_LEVEL: ${{ inputs.stop_level }}
+          PROFIT_TARGET: ${{ env.PROFIT_TARGET }}
+          MAX_DAYS: ${{ env.MAX_DAYS }}
+          STOP_LEVEL: ${{ env.STOP_LEVEL }}
           MAX_EXTEND_DAYS: ${{ env.MAX_EXTEND_DAYS }}
 
-          P_TAIL_THRESHOLDS: ${{ inputs.p_tail_thresholds }}
-          UTILITY_QUANTILES: ${{ inputs.utility_quantiles }}
-          RANK_METRICS: ${{ inputs.rank_metrics }}
-          LAMBDA_TAIL: ${{ inputs.lambda_tail }}
+          P_TAIL_THRESHOLDS: ${{ env.P_TAIL_THRESHOLDS }}
+          UTILITY_QUANTILES: ${{ env.UTILITY_QUANTILES }}
+          RANK_METRICS: ${{ env.RANK_METRICS }}
+          LAMBDA_TAIL: ${{ env.LAMBDA_TAIL }}
 
           GATE_MODES: "none,tail,utility,tail_utility"
 
@@ -305,7 +319,7 @@ jobs:
           TRAIL_STOPS: "0.08,0.10,0.12"
 
           TOPK_CONFIGS: "1|1.0;2|0.7,0.3;2|0.6,0.4"
-          PS_MINS: ${{ inputs.ps_mins }}
+          PS_MINS: ${{ env.PS_MINS }}
 
           MAX_LEVERAGE_PCT: "1.00"
 
