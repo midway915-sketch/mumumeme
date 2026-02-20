@@ -21,10 +21,12 @@ PRICES_CSV = RAW_DIR / "prices.csv"
 FEATURES_PARQUET = FEAT_DIR / "features_model.parquet"
 FEATURES_CSV = FEAT_DIR / "features_model.csv"
 
-OUT_STRATEGY_RAW = DATA_DIR / "strategy_raw_data.csv"
+# ✅ 루트(data/)로 떨어지지 않게 labels 폴더로
+OUT_STRATEGY_RAW = LABEL_DIR / "strategy_raw_data.csv"
 
 MARKET_TICKER = "SPY"
 
+# ✅ build_features.py (enable-sector-strength ON) 기준으로 model에서 쓰는 feature set에 맞춤
 DEFAULT_FEATURE_COLS = [
     "Drawdown_252",
     "Drawdown_60",
@@ -34,6 +36,16 @@ DEFAULT_FEATURE_COLS = [
     "MA20_slope",
     "Market_Drawdown",
     "Market_ATR_ratio",
+    "ret_score",
+    "ret_5",
+    "ret_10",
+    "ret_20",
+    "breakout_20",
+    "vol_surge",
+    "trend_align",
+    "beta_60",
+    "Sector_Ret_20",
+    "RelStrength",
 ]
 
 
@@ -137,11 +149,9 @@ def compute_market_frame_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
     high = m["High"].astype(float)
     low = m["Low"].astype(float)
 
-    # Drawdown_252
     roll_max = close.rolling(252, min_periods=252).max()
     mdd = (close / roll_max) - 1.0
 
-    # ATR(14) ratio
     prev_close = close.shift(1)
     tr = pd.concat(
         [
@@ -167,32 +177,24 @@ def compute_market_frame_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
 def ensure_market_features(feats: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
     """
     feats에 Market_Drawdown / Market_ATR_ratio가 없으면 SPY로 계산해서 붙인다.
-    feats에 이미 있더라도(부분만 있거나 NaN이 많을 수 있음), market 계산값으로 NaN만 채운다.
-    merge 시 컬럼 겹침으로 suffix가 붙는 문제를 방지하기 위해 suffixes=('', '_m') 사용.
+    (build_features.py가 이미 넣어줬으면 그대로 둠)
     """
     need_any = ("Market_Drawdown" not in feats.columns) or ("Market_ATR_ratio" not in feats.columns)
     if not need_any:
         return feats
 
     market = compute_market_frame_from_prices(prices)
-
-    # ✅ 겹치는 컬럼은 market 쪽에 _m suffix를 강제로 붙인다
     merged = feats.merge(market, on="Date", how="left", suffixes=("", "_m"))
 
     for col in ["Market_Drawdown", "Market_ATR_ratio"]:
         col_m = f"{col}_m"
-
         if col in merged.columns and col_m in merged.columns:
-            # feats에 기존 col이 있었던 케이스: 기존값 우선, NaN만 market으로 채움
             merged[col] = merged[col].combine_first(merged[col_m])
             merged.drop(columns=[col_m], inplace=True)
-
         elif col not in merged.columns and col_m in merged.columns:
-            # feats에 없어서 market 값이 _m로 들어온 케이스(드물지만 안전하게 처리)
             merged.rename(columns={col_m: col}, inplace=True)
 
     return merged
-
 
 
 def forward_roll_max_excl_today(s: pd.Series, window: int) -> pd.Series:
@@ -219,7 +221,7 @@ def main() -> None:
 
     ap.add_argument("--features-path", type=str, default=None)
     ap.add_argument("--feature-cols", type=str, default="",
-                    help="콤마로 feature 컬럼 지정(비우면 기본 8개)")
+                    help="콤마로 feature 컬럼 지정(비우면 기본 DEFAULT_FEATURE_COLS)")
     args = ap.parse_args()
 
     pt = float(args.profit_target)
@@ -256,7 +258,7 @@ def main() -> None:
         .reset_index(drop=True)
     )
 
-    # ✅ Market_* 없으면 SPY로 생성해서 붙임
+    # Market_* 없으면 SPY로 생성해서 붙임(보통은 build_features가 이미 넣음)
     feats = ensure_market_features(feats, prices)
 
     feature_cols = DEFAULT_FEATURE_COLS
@@ -265,7 +267,10 @@ def main() -> None:
 
     missing_feat = [c for c in feature_cols if c not in feats.columns]
     if missing_feat:
-        raise ValueError(f"features missing feature columns: {missing_feat} (src={feats_src})")
+        raise ValueError(
+            f"features missing feature columns: {missing_feat} (src={feats_src}). "
+            f"NOTE: Sector_Ret_20/RelStrength는 build_features.py를 --enable-sector-strength로 생성해야 함."
+        )
 
     base = feats[["Date", "Ticker"] + feature_cols].merge(
         prices[["Date", "Ticker", "High", "Low", "Close"]],
@@ -278,7 +283,7 @@ def main() -> None:
 
     # horizons
     success_h = max_days
-    tail_h = max_days + ex  # max_days + extend 구간까지 대충 포함
+    tail_h = max_days + ex
 
     out = []
     for tkr, g in base.groupby("Ticker", sort=False):
@@ -296,12 +301,10 @@ def main() -> None:
         fut_dd_tail = (fut_min_low_tail / close) - 1.0
         tail = (fut_dd_tail <= tail_thr).astype("float")
 
-        # max_days 시점 close 수익률 (extend 필요 여부 근사용)
         offset = max_days - 1
         close_at_max = close.shift(-offset)
         ret_at_max = (close_at_max / close) - 1.0
 
-        # success 못했고 max_days 시점 수익률이 stop_level보다 더 나쁘면 extend 필요한 케이스로 표시
         extend_needed = ((success == 0) & (ret_at_max < sl)).astype("float")
 
         g["Success"] = success
@@ -330,6 +333,7 @@ def main() -> None:
     out_csv = LABEL_DIR / f"strategy_raw_data_{tag}.csv"
     saved_to = save_table(labeled, out_parq, out_csv)
 
+    # ✅ latest snapshot도 labels 폴더에 저장
     labeled.to_csv(OUT_STRATEGY_RAW, index=False)
 
     meta = {
