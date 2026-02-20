@@ -43,7 +43,6 @@ on:
         default: "false"
 
   schedule:
-    # 매일 한국시간 08:10 (UTC 23:10)
     - cron: "10 23 * * *"
 
 jobs:
@@ -52,7 +51,6 @@ jobs:
     permissions:
       contents: read
 
-    # ✅ schedule에서도 값이 존재하도록 기본값 확정
     env:
       PROFIT_TARGET: ${{ github.event.inputs.profit_target || '0.10' }}
       MAX_DAYS: ${{ github.event.inputs.max_days || '40' }}
@@ -66,7 +64,6 @@ jobs:
 
       REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'false' }}
 
-      # 고정
       PRICE_START: "2015-02-21"
       GATE_MODES: "none,tail,utility,tail_utility"
 
@@ -113,17 +110,17 @@ jobs:
           set -euo pipefail
 
           echo "LABEL_KEY=pt$(python - <<PY
-          pt=float(\"${PROFIT_TARGET}\")
+          pt=float("${PROFIT_TARGET}")
           print(int(round(pt*100)))
           PY
           )_h${MAX_DAYS}_sl$(python - <<PY
-          sl=float(\"${STOP_LEVEL}\")
+          sl=float("${STOP_LEVEL}")
           print(int(round(abs(sl)*100)))
           PY
           )" >> $GITHUB_ENV
 
           echo "MAX_EXTEND_DAYS=$(python - <<PY
-          H=int(\"${MAX_DAYS}\")
+          H=int("${MAX_DAYS}")
           print(max(1, H//2))
           PY
           )" >> $GITHUB_ENV
@@ -205,7 +202,6 @@ jobs:
             rm -rf data/raw/* data/features/* data/labels/* app/* data/signals/* data/meta/* || true
           fi
 
-          # 1) universe + prices (10y만)
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
             python scripts/fetch_prices.py --include-extra --reset --force-full --start "${PRICE_START}"
@@ -213,14 +209,12 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "${PRICE_START}"
           fi
 
-          # 2) features
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             python scripts/build_features.py
           else
             echo "[INFO] features_model exists -> reuse"
           fi
 
-          # 3) labels (p_success 학습 데이터)
           if [ ! -f data/labels/labels_model.parquet ] && [ ! -f data/labels/labels_model.csv ]; then
             python scripts/build_labels.py \
               --profit-target "${PROFIT_TARGET}" \
@@ -230,20 +224,18 @@ jobs:
             echo "[INFO] labels_model exists -> reuse"
           fi
 
-          # 4) p_success model.pkl / scaler.pkl
           if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
             python scripts/train_model.py
           else
             echo "[INFO] p_success model exists -> reuse"
           fi
 
-          # 4b) labels_tail_{EX_TAG}
           EX_TAG="pt$(python - <<PY
-          pt=float(\"${PROFIT_TARGET}\")
+          pt=float("${PROFIT_TARGET}")
           print(int(round(pt*100)))
           PY
           )_h${MAX_DAYS}_sl$(python - <<PY
-          sl=float(\"${STOP_LEVEL}\")
+          sl=float("${STOP_LEVEL}")
           print(int(round(abs(sl)*100)))
           PY
           )_ex${MAX_EXTEND_DAYS}"
@@ -258,7 +250,6 @@ jobs:
             echo "[INFO] labels_tail exists -> reuse"
           fi
 
-          # 4c) tail_model.pkl / tail_scaler.pkl
           if [ ! -f app/tail_model.pkl ] || [ ! -f app/tail_scaler.pkl ]; then
             python scripts/train_tail_model.py \
               --profit-target "${PROFIT_TARGET}" \
@@ -269,7 +260,6 @@ jobs:
             echo "[INFO] tail model exists -> reuse"
           fi
 
-          # 4d) TAU labels + model (있으면 사용)
           if [ -f scripts/build_tau_labels.py ]; then
             if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
               python scripts/build_tau_labels.py \
@@ -294,7 +284,6 @@ jobs:
             echo "[WARN] tau training skipped (missing script or labels_tau)"
           fi
 
-          # 5) score features
           python scripts/score_features.py --tag "${LABEL_KEY}"
 
       - name: Run gate grid (predict + simulate + summarize)
@@ -305,7 +294,6 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/run_grid_workflow.sh
-          # ❌ bash로 실행하면 안됨 (파이썬 스크립트임)
           ./scripts/run_grid_workflow.sh
 
       - name: Aggregate summaries
