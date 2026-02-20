@@ -80,26 +80,27 @@ jobs:
 
       - name: Set env keys (LABEL_KEY + PRICE_START + MAX_EXTEND_DAYS auto)
         shell: bash
-        env:
-          PROFIT_TARGET: ${{ inputs.profit_target }}
-          MAX_DAYS: ${{ inputs.max_days }}
-          STOP_LEVEL: ${{ inputs.stop_level }}
         run: |
           set -euo pipefail
 
-          PT_TAG="$(python -c "import os; print(int(round(float(os.environ['PROFIT_TARGET'])*100)))")"
-          SL_TAG="$(python -c "import os; print(int(round(abs(float(os.environ['STOP_LEVEL']))*100)))")"
+          echo "LABEL_KEY=pt$(python - <<'PY'
+          pt=float("${{ inputs.profit_target }}")
+          print(int(round(pt*100)))
+          PY
+          )_h${{ inputs.max_days }}_sl$(python - <<'PY'
+          sl=float("${{ inputs.stop_level }}")
+          print(int(round(abs(sl)*100)))
+          PY
+          )" >> $GITHUB_ENV
 
-          # LABEL_KEY: ex(extend)는 캐시/태그에 넣지 않음 (H/2 자동계산)
-          echo "LABEL_KEY=pt${PT_TAG}_h${MAX_DAYS}_sl${SL_TAG}" >> "$GITHUB_ENV"
+          echo "PRICE_START=2015-02-21" >> $GITHUB_ENV
 
-          # 10년만 돌릴 거니까 가격 시작일 고정
-          echo "PRICE_START=2015-02-21" >> "$GITHUB_ENV"
+          echo "MAX_EXTEND_DAYS=$(python - <<'PY'
+          H=int("${{ inputs.max_days }}")
+          print(max(1, H//2))
+          PY
+          )" >> $GITHUB_ENV
 
-          # ✅ MAX_EXTEND_DAYS = H/2 (정수)
-          echo "MAX_EXTEND_DAYS=$(python -c "import os; H=int(os.environ['MAX_DAYS']); print(max(1, H//2))")" >> "$GITHUB_ENV"
-
-      # ---- PRICES cache
       - name: Restore cache (PRICES)
         uses: actions/cache@v4
         with:
@@ -111,7 +112,6 @@ jobs:
           restore-keys: |
             mumumeme-prices-v3-${{ runner.os }}-
 
-      # ---- FEATURES cache
       - name: Restore cache (FEATURES_MODEL)
         uses: actions/cache@v4
         with:
@@ -123,7 +123,6 @@ jobs:
           restore-keys: |
             mumumeme-features-v3-${{ runner.os }}-
 
-      # ---- MODEL cache (p_success labels+model)
       - name: Restore cache (MODEL)
         uses: actions/cache@v4
         with:
@@ -138,7 +137,6 @@ jobs:
             mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
             mumumeme-model-v3-${{ runner.os }}-
 
-      # ---- TAIL cache (labels_tail_{tag} + tail model)
       - name: Restore cache (TAIL)
         uses: actions/cache@v4
         with:
@@ -155,7 +153,6 @@ jobs:
             mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
             mumumeme-tail-v3-${{ runner.os }}-
 
-      # ---- TAU cache (tau labels + tau model)
       - name: Restore cache (TAU)
         uses: actions/cache@v4
         with:
@@ -196,9 +193,9 @@ jobs:
             python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "$PRICE_START"
           fi
 
-          # 2) features (✅ 섹터 무조건)
+          # 2) features  ✅ 섹터는 build_features.py에서 무조건 켜짐 -> 옵션 제거
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
-            python scripts/build_features.py --enable-sector-strength
+            python scripts/build_features.py
           else
             echo "[INFO] features_model exists -> reuse"
           fi
@@ -221,7 +218,15 @@ jobs:
           fi
 
           # 4b) labels_tail_{EX_TAG}
-          EX_TAG="pt$(python -c "import math; print(int(round(float('$PROFIT_TARGET')*100)))")_h${MAX_DAYS}_sl$(python -c "import math; print(int(round(abs(float('$STOP_LEVEL'))*100)))")_ex${MAX_EXTEND_DAYS}"
+          EX_TAG="pt$(python - <<PY
+          pt=float("$PROFIT_TARGET")
+          print(int(round(pt*100)))
+          PY
+          )_h${MAX_DAYS}_sl$(python - <<PY
+          sl=float("$STOP_LEVEL")
+          print(int(round(abs(sl)*100)))
+          PY
+          )_ex${MAX_EXTEND_DAYS}"
 
           if [ ! -f "data/labels/labels_tail_${EX_TAG}.parquet" ] && [ ! -f "data/labels/labels_tail_${EX_TAG}.csv" ]; then
             python scripts/build_tail_labels.py \
@@ -274,7 +279,7 @@ jobs:
             echo "[WARN] tau training skipped (missing script or labels_tau)"
           fi
 
-          # 5) score features -> features_scored
+          # 5) score features
           python scripts/score_features.py --tag "$LABEL_KEY"
 
       - name: Run gate grid (predict + simulate + summarize)
