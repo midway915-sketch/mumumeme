@@ -2,7 +2,7 @@
 set -euo pipefail
 
 tok() {
-  python - <<'PY' "$1"
+  python - "$1" <<'PY'
 import sys
 x=float(sys.argv[1])
 s=f"{x:.4f}".rstrip("0").rstrip(".")
@@ -12,7 +12,7 @@ PY
 }
 
 build_tag() {
-  python - <<'PY' "$1" "$2" "$3" "$4"
+  python - "$1" "$2" "$3" "$4" <<'PY'
 import sys
 pt=float(sys.argv[1]); h=int(float(sys.argv[2])); sl=float(sys.argv[3]); ex=int(float(sys.argv[4]))
 pt_i=int(round(pt*100)); sl_i=int(round(abs(sl)*100))
@@ -26,7 +26,12 @@ run_one_gate() {
   local lambda_tail="$9"; local tau_gamma="${10}"
 
   local tag; tag="$(build_tag "$pt" "$h" "$sl" "$ex")"
-  local suffix="${mode}_t$(tok "$tail_max")_q$(tok "$u_q")_r${rank_by}"
+
+  # suffix는 파일명에 쓰이니까 최소한의 sanitize (쉼표/공백 제거)
+  local rank_safe="${rank_by//,/+}"
+  rank_safe="${rank_safe// /}"
+
+  local suffix="${mode}_t$(tok "$tail_max")_q$(tok "$u_q")_r${rank_safe}"
 
   local picks="data/signals/picks_${tag}_gate_${suffix}.csv"
   local trades="data/signals/sim_engine_trades_${tag}_gate_${suffix}.parquet"
@@ -61,7 +66,7 @@ run_one_gate() {
     exit 1
   fi
 
-  # 2) ✅ 각 picks마다 시뮬(조합별 파일명 분리 강제)
+  # 2) 각 picks마다 시뮬(조합별 파일명 분리 강제)
   python scripts/simulate_single_position_engine.py \
     --profit-target "$pt" \
     --max-days "$h" \
@@ -78,7 +83,7 @@ run_one_gate() {
     exit 1
   fi
 
-  # 3) ✅ trades→curve 자동추론해서 요약 생성
+  # 3) trades→curve 요약 생성
   python scripts/summarize_sim_trades.py \
     --trades-path "$trades" \
     --tag "$tag" \
