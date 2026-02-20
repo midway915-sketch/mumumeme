@@ -116,16 +116,69 @@ def write_train_report(tag: str, report: dict) -> None:
     print(f"[DONE] wrote train report -> {p}")
 
 
+def _date_based_train_test_split(df: pd.DataFrame, date_col: str, train_ratio: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    ✅ 룩어헤드/누수 방지용: row가 아니라 'Date' 단위로 split.
+    """
+    dates = pd.to_datetime(df[date_col], errors="coerce").dt.tz_localize(None)
+    uniq = pd.Series(dates.dropna().unique()).sort_values().to_list()
+    if len(uniq) < 10:
+        raise RuntimeError(f"Not enough unique dates for split: {len(uniq)}")
+
+    cut_i = int(len(uniq) * float(train_ratio)) - 1
+    cut_i = max(0, min(cut_i, len(uniq) - 2))  # ensure test has at least 1 date
+    cut_date = pd.Timestamp(uniq[cut_i])
+
+    train_df = df.loc[pd.to_datetime(df[date_col]) <= cut_date].copy()
+    test_df = df.loc[pd.to_datetime(df[date_col]) > cut_date].copy()
+    if len(train_df) < 50 or len(test_df) < 50:
+        raise RuntimeError(f"Split too small. train={len(train_df)} test={len(test_df)} cut_date={cut_date.date()}")
+
+    return train_df, test_df
+
+
+def _make_date_cv_splits(df_train: pd.DataFrame, date_col: str, n_splits: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    ✅ CV도 날짜 단위로만 진행 (같은 날짜가 train/val에 동시에 존재하지 않게).
+    CalibratedClassifierCV(cv=...)에 넣을 수 있게 sample indices로 반환.
+    """
+    d = pd.to_datetime(df_train[date_col], errors="coerce").dt.tz_localize(None)
+    uniq_dates = pd.Series(d.dropna().unique()).sort_values().to_list()
+    if len(uniq_dates) < (n_splits + 2):
+        raise RuntimeError(f"Not enough unique dates for TimeSeriesSplit: {len(uniq_dates)} (n_splits={n_splits})")
+
+    # date -> ordinal id (0..U-1)
+    date_to_id = {pd.Timestamp(x): i for i, x in enumerate(uniq_dates)}
+    date_ids = d.map(lambda x: date_to_id.get(pd.Timestamp(x), -1)).to_numpy(dtype=int)
+
+    tscv = TimeSeriesSplit(n_splits=int(n_splits))
+    splits: list[tuple[np.ndarray, np.ndarray]] = []
+
+    # split on unique-date index space
+    U = len(uniq_dates)
+    dummy = np.arange(U)
+    for tr_u, te_u in tscv.split(dummy):
+        tr_mask = np.isin(date_ids, tr_u)
+        te_mask = np.isin(date_ids, te_u)
+        tr_idx = np.where(tr_mask)[0]
+        te_idx = np.where(te_mask)[0]
+        if len(tr_idx) == 0 or len(te_idx) == 0:
+            continue
+        splits.append((tr_idx, te_idx))
+
+    if not splits:
+        raise RuntimeError("Failed to build date-based CV splits.")
+    return splits
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", default="", type=str, help="optional tag suffix for saving model files + meta report")
 
-    # labels_model에는 Success/Target 둘 다 있을 수 있음. 기본은 Success.
     ap.add_argument("--target-col", default="Success", type=str)
     ap.add_argument("--date-col", default="Date", type=str)
     ap.add_argument("--ticker-col", default="Ticker", type=str)
 
-    # ✅ 기본은 SSOT(meta) 사용. 필요할 때만 override.
     ap.add_argument("--features", default="", type=str, help="comma-separated feature cols (override SSOT/meta)")
 
     ap.add_argument("--train-ratio", default=0.8, type=float)
@@ -147,9 +200,13 @@ def main() -> None:
         if c not in df.columns:
             raise ValueError(f"labels_model missing required column: {c}")
 
-    # normalize date
+    # normalize date + sort by Date then Ticker (deterministic)
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.tz_localize(None)
-    df = df.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
+    if ticker_col in df.columns:
+        df[ticker_col] = df[ticker_col].astype(str).str.upper().str.strip()
+        df = df.dropna(subset=[date_col]).sort_values([date_col, ticker_col]).reset_index(drop=True)
+    else:
+        df = df.dropna(subset=[date_col]).sort_values([date_col]).reset_index(drop=True)
 
     feat_cols, feat_src = resolve_feature_cols(args.features)
     feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
@@ -162,29 +219,32 @@ def main() -> None:
 
     df = coerce_features_numeric(df, feat_cols)
 
-    y = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int).to_numpy()
-    X = df[feat_cols].to_numpy(dtype=float)
+    # ✅ date-based split (no same-date mixing across train/test)
+    train_df, test_df = _date_based_train_test_split(df, date_col=date_col, train_ratio=float(args.train_ratio))
 
-    if len(y) < 200:
-        raise RuntimeError(f"Not enough training rows: {len(y)}")
+    y_train = pd.to_numeric(train_df[target_col], errors="coerce").fillna(0).astype(int).to_numpy()
+    X_train = train_df[feat_cols].to_numpy(dtype=float)
 
-    split_idx = int(len(y) * float(args.train_ratio))
-    split_idx = max(50, min(split_idx, len(y) - 50))
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
+    y_test = pd.to_numeric(test_df[target_col], errors="coerce").fillna(0).astype(int).to_numpy()
+    X_test = test_df[feat_cols].to_numpy(dtype=float)
+
+    if len(y_train) < 200:
+        raise RuntimeError(f"Not enough training rows: {len(y_train)}")
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
     base = LogisticRegression(max_iter=int(args.max_iter))
-    tscv = TimeSeriesSplit(n_splits=int(args.n_splits))
+
+    # ✅ date-based CV splits
+    cv_splits = _make_date_cv_splits(train_df, date_col=date_col, n_splits=int(args.n_splits))
 
     # sklearn 버전 호환
     try:
-        model = CalibratedClassifierCV(estimator=base, method="isotonic", cv=tscv)
+        model = CalibratedClassifierCV(estimator=base, method="isotonic", cv=cv_splits)
     except TypeError:
-        model = CalibratedClassifierCV(base_estimator=base, method="isotonic", cv=tscv)
+        model = CalibratedClassifierCV(base_estimator=base, method="isotonic", cv=cv_splits)
 
     model.fit(X_train_s, y_train)
 
@@ -197,8 +257,8 @@ def main() -> None:
     pred_mean = float(np.mean(probs)) if len(probs) else float("nan")
 
     print("=" * 60)
-    print("[TRAIN] p_success model")
-    print("rows:", len(y), "train:", len(y_train), "test:", len(y_test))
+    print("[TRAIN] p_success model (date-split, date-CV)")
+    print("rows_total:", len(df), "train:", len(train_df), "test:", len(test_df))
     print("AUC:", (round(auc, 6) if np.isfinite(auc) else "nan"))
     print("base_rate:", (round(base_rate, 6) if np.isfinite(base_rate) else "nan"))
     print("pred_mean:", (round(pred_mean, 6) if np.isfinite(pred_mean) else "nan"))
@@ -218,6 +278,12 @@ def main() -> None:
     print(f"[DONE] saved model -> {out_model}")
     print(f"[DONE] saved scaler -> {out_scaler}")
 
+    # train/test date range for traceability
+    dtr0 = pd.to_datetime(train_df[date_col]).min()
+    dtr1 = pd.to_datetime(train_df[date_col]).max()
+    dte0 = pd.to_datetime(test_df[date_col]).min()
+    dte1 = pd.to_datetime(test_df[date_col]).max()
+
     report = {
         "tag": tag,
         "target_col": target_col,
@@ -225,9 +291,11 @@ def main() -> None:
         "ticker_col": ticker_col if ticker_col in df.columns else "",
         "feature_cols_source": feat_src,
         "feature_cols": feat_cols,
-        "rows_total": int(len(y)),
-        "rows_train": int(len(y_train)),
-        "rows_test": int(len(y_test)),
+        "rows_total": int(len(df)),
+        "rows_train": int(len(train_df)),
+        "rows_test": int(len(test_df)),
+        "train_date_range": [str(dtr0.date()) if pd.notna(dtr0) else "", str(dtr1.date()) if pd.notna(dtr1) else ""],
+        "test_date_range": [str(dte0.date()) if pd.notna(dte0) else "", str(dte1.date()) if pd.notna(dte1) else ""],
         "auc": float(auc) if np.isfinite(auc) else None,
         "base_rate_test": float(base_rate) if np.isfinite(base_rate) else None,
         "pred_mean_test": float(pred_mean) if np.isfinite(pred_mean) else None,
