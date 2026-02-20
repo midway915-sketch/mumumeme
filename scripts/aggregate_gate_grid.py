@@ -34,7 +34,6 @@ def _read_prices(prices_parq: Path, prices_csv: Path) -> pd.DataFrame:
 
 
 def _find_suffix_from_summary_path(p: Path) -> str:
-    # gate_summary_<TAG>_gate_<SUFFIX>.csv
     name = p.name
     m = re.match(r"gate_summary_(.+)_gate_(.+)\.csv$", name)
     if m:
@@ -66,11 +65,6 @@ def _calc_cagr(start_equity: float, end_equity: float, days: float) -> float:
 
 
 def _qqq_stats(prices: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> tuple[float, float, float]:
-    """
-    Return (qqq_seed_multiple, qqq_cagr, days)
-    - Uses first available close with Date >= start
-    - Uses last available close with Date <= end
-    """
     q = prices.loc[prices["Ticker"] == "QQQ"].copy()
     if q.empty:
         return (float("nan"), float("nan"), float("nan"))
@@ -97,13 +91,6 @@ def _qqq_stats(prices: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> 
 
 
 def _clean_curve(curve: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize curve columns:
-      - Date (datetime)
-      - Equity (float)
-      - InCycle (int 0/1) from InCycle or InPosition if present else 0
-    Also sorts by Date and drops duplicate Date keeping last.
-    """
     c = curve.copy()
 
     if "Date" not in c.columns or "Equity" not in c.columns:
@@ -122,23 +109,11 @@ def _clean_curve(curve: pd.DataFrame) -> pd.DataFrame:
     c["InCycle"] = (inc > 0).astype(int)
 
     c = c.dropna(subset=["Date", "Equity"]).sort_values("Date").reset_index(drop=True)
-
-    # Date 중복이 있으면 "마지막 상태"를 남김
     c = c.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
     return c
 
 
 def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) -> dict:
-    """
-    Add:
-      - WarmupEndDate (first EntryDate)
-      - BacktestDaysAfterWarmup
-      - IdleDaysAfterWarmup / IdlePctAfterWarmup
-      - CAGR_AfterWarmup
-      - QQQ_SeedMultiple_SamePeriod / QQQ_CAGR_SamePeriod
-      - ExcessCAGR_AfterWarmup
-      - ActiveDaysAfterWarmup
-    """
     tag = str(row.get("TAG", "run"))
     suffix = str(row.get("GateSuffix", ""))
 
@@ -209,7 +184,6 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
         })
         return out
 
-    # only after warmup_end (include warmup_end day)
     cur2 = curve.loc[curve["Date"] >= warmup_end].copy()
     if cur2.empty:
         out.update({
@@ -234,7 +208,6 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
 
     cagr = _calc_cagr(start_eq, end_eq, days)
 
-    # ✅ Active/Idle days are "Date-based" (already unique after _clean_curve)
     total_days = int(cur2["Date"].nunique())
     active_days = int((cur2["InCycle"] > 0).sum())
     idle_days = int(max(0, total_days - active_days))
@@ -301,8 +274,8 @@ def main() -> None:
 
     out = pd.DataFrame(rows)
 
-    # ---- robust numeric conversions for scoring columns
-    for c in [
+    # ---- robust numeric conversions for scoring columns (✅ NEW cols included)
+    num_cols = [
         "Recent10Y_SeedMultiple", "SeedMultiple",
         "MaxHoldingDaysObserved", "MaxExtendDaysObserved",
         "CycleCount", "SuccessRate",
@@ -310,18 +283,38 @@ def main() -> None:
         "CAGR_AfterWarmup", "QQQ_CAGR_SamePeriod", "ExcessCAGR_AfterWarmup",
         "IdlePctAfterWarmup",
         "QQQ_SeedMultiple_SamePeriod",
-    ]:
+        # ✅ summarize_sim_trades.py NEW
+        "TrailEntryCountTotal", "TrailEntryCountPerCycleAvg", "MaxCyclePeakReturn",
+    ]
+    for c in num_cols:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    # ---- leverage-adjusted score (optional)
+    # ---- leverage-adjusted score
     if "SeedMultiple" in out.columns and "MaxLeveragePct" in out.columns:
         lev = out["MaxLeveragePct"].fillna(0.0)
         sm = out["SeedMultiple"].astype(float)
         out["SeedMultiple_LevAdj"] = sm / (1.0 + lev)
 
-    # ---- sort aggregate: prefer SeedMultiple first, then LevAdj, then CAGR, then ExcessCAGR
+    # ---- ✅ NEW: risk-ish score (optional)
+    # 목적: SeedMultiple은 그대로 보되, "너무 레버/너무 idle/트레일링 과다/피크 과열"은 살짝 눌러줌
+    if "SeedMultiple" in out.columns:
+        sm = out["SeedMultiple"].astype(float)
+
+        lev = out["MaxLeveragePct"].fillna(0.0) if "MaxLeveragePct" in out.columns else 0.0
+        idle = out["IdlePctAfterWarmup"].fillna(0.0) if "IdlePctAfterWarmup" in out.columns else 0.0
+
+        trail = out["TrailEntryCountPerCycleAvg"].fillna(0.0) if "TrailEntryCountPerCycleAvg" in out.columns else 0.0
+        peak = out["MaxCyclePeakReturn"].fillna(0.0) if "MaxCyclePeakReturn" in out.columns else 0.0
+
+        # penalty terms (약하게)
+        pen = (0.25 * lev) + (0.15 * idle) + (0.05 * trail) + (0.03 * np.maximum(0.0, peak - 0.50))
+        out["RiskAdjScore"] = sm / (1.0 + pen)
+
+    # ---- sort aggregate
     sort_cols = []
+    if "RiskAdjScore" in out.columns:
+        sort_cols.append("RiskAdjScore")
     if "SeedMultiple" in out.columns:
         sort_cols.append("SeedMultiple")
     if "SeedMultiple_LevAdj" in out.columns:
@@ -339,7 +332,7 @@ def main() -> None:
     out.to_csv(out_path, index=False)
     print(f"[DONE] wrote aggregate: {out_path} rows={len(out)}")
 
-    # ---- Top-by-recent10y (기존 지표 유지)
+    # ---- Top-by-recent10y
     top = out.copy()
     if "Recent10Y_SeedMultiple" in top.columns:
         top = top.sort_values(["Recent10Y_SeedMultiple"], ascending=[False])
@@ -352,11 +345,13 @@ def main() -> None:
     if len(out):
         best = out.iloc[0].to_dict()
         print("=" * 60)
-        print("[BEST] (by SeedMultiple / LevAdj / CAGR / ExcessCAGR)")
+        print("[BEST] (by RiskAdjScore / SeedMultiple / LevAdj / CAGR / ExcessCAGR)")
         print(f"TAG={best.get('TAG')} suffix={best.get('GateSuffix')}")
+        print(f"RiskAdjScore={best.get('RiskAdjScore')}")
         print(f"SeedMultiple={best.get('SeedMultiple')}  Recent10Y={best.get('Recent10Y_SeedMultiple')}")
         print(f"CAGR_AfterWarmup={best.get('CAGR_AfterWarmup')}  QQQ_CAGR={best.get('QQQ_CAGR_SamePeriod')}  Excess={best.get('ExcessCAGR_AfterWarmup')}")
         print(f"IdlePctAfterWarmup={best.get('IdlePctAfterWarmup')}  MaxLevPct={best.get('MaxLeveragePct')}")
+        print(f"TrailAvg={best.get('TrailEntryCountPerCycleAvg')}  PeakCycleRet={best.get('MaxCyclePeakReturn')}")
         print("=" * 60)
 
 
