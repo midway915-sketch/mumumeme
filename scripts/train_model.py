@@ -1,12 +1,42 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-# ✅ FIX: "python scripts/xxx.py"로 실행될 때도 scripts.* import가 되도록 repo root를 sys.path에 추가
+# ------------------------------------------------------------
+# sys.path guard (avoid "No module named 'scripts'")
+# ------------------------------------------------------------
 import sys
 from pathlib import Path
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+
+# ------------------------------------------------------------
+# feature spec import (robust)
+# ------------------------------------------------------------
+try:
+    from scripts.feature_spec import read_feature_cols_meta, get_feature_cols  # type: ignore
+except Exception:
+    try:
+        from feature_spec import read_feature_cols_meta, get_feature_cols  # type: ignore
+    except Exception:
+        # last resort: minimal fallback (sector off)
+        def read_feature_cols_meta():
+            return ([], False)
+
+        def get_feature_cols(sector_enabled: bool = False):
+            base = [
+                "Drawdown_252", "Drawdown_60", "ATR_ratio", "Z_score",
+                "MACD_hist", "MA20_slope", "Market_Drawdown", "Market_ATR_ratio",
+                "ret_score",
+                "ret_5", "ret_10", "ret_20",
+                "breakout_20", "vol_surge", "trend_align", "beta_60",
+            ]
+            if sector_enabled:
+                base += ["Sector_Ret_20", "RelStrength"]
+            return base
 
 import argparse
 import json
@@ -20,8 +50,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
-
-from scripts.feature_spec import read_feature_cols_meta, get_feature_cols
 
 
 DATA_DIR = Path("data")
@@ -40,9 +68,7 @@ def read_table(parq: Path, csv: Path) -> pd.DataFrame:
 
 
 def parse_csv_list(s: str) -> list[str]:
-    if s is None:
-        return []
-    items = [x.strip() for x in str(s).split(",")]
+    items = [x.strip() for x in str(s or "").split(",")]
     return [x for x in items if x]
 
 
@@ -72,15 +98,15 @@ def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source
 
 
 def coerce_features_numeric(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
-    df = df.copy()
+    out = df.copy()
     for c in feat_cols:
-        df[c] = (
-            pd.to_numeric(df[c], errors="coerce")
+        out[c] = (
+            pd.to_numeric(out[c], errors="coerce")
             .replace([np.inf, -np.inf], np.nan)
             .fillna(0.0)
             .astype(float)
         )
-    return df
+    return out
 
 
 def write_train_report(tag: str, report: dict) -> None:
@@ -94,6 +120,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", default="", type=str, help="optional tag suffix for saving model files + meta report")
 
+    # labels_model에는 Success/Target 둘 다 있을 수 있음. 기본은 Success.
     ap.add_argument("--target-col", default="Success", type=str)
     ap.add_argument("--date-col", default="Date", type=str)
     ap.add_argument("--ticker-col", default="Ticker", type=str)
@@ -127,8 +154,11 @@ def main() -> None:
     feat_cols, feat_src = resolve_feature_cols(args.features)
     feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
 
-    # ✅ STRICT
-    ensure_feature_columns_strict(df, feat_cols, source_hint=f"{feat_src}, labels_src={LABELS_PARQ if LABELS_PARQ.exists() else LABELS_CSV}")
+    ensure_feature_columns_strict(
+        df,
+        feat_cols,
+        source_hint=f"{feat_src}, labels_src={LABELS_PARQ if LABELS_PARQ.exists() else LABELS_CSV}",
+    )
 
     df = coerce_features_numeric(df, feat_cols)
 
@@ -150,6 +180,7 @@ def main() -> None:
     base = LogisticRegression(max_iter=int(args.max_iter))
     tscv = TimeSeriesSplit(n_splits=int(args.n_splits))
 
+    # sklearn 버전 호환
     try:
         model = CalibratedClassifierCV(estimator=base, method="isotonic", cv=tscv)
     except TypeError:
