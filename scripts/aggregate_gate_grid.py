@@ -113,6 +113,18 @@ def _clean_curve(curve: pd.DataFrame) -> pd.DataFrame:
     return c
 
 
+def _parse_cap_from_suffix(suffix: str) -> tuple[str, str]:
+    """
+    GateSuffix가 ..._capnone / ..._caph2 / ..._captotal 로 끝나면 분리.
+    returns: (base_suffix, cap_mode)
+    """
+    s = str(suffix or "")
+    m = re.search(r"(.*)_cap(none|h2|total)$", s)
+    if not m:
+        return (s, "")
+    return (m.group(1), m.group(2))
+
+
 def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) -> dict:
     tag = str(row.get("TAG", "run"))
     suffix = str(row.get("GateSuffix", ""))
@@ -235,6 +247,10 @@ def main() -> None:
     ap.add_argument("--signals-dir", default="data/signals", type=str)
     ap.add_argument("--out-aggregate", default="data/signals/gate_grid_aggregate.csv", type=str)
     ap.add_argument("--out-top", default="data/signals/gate_grid_top_by_recent10y.csv", type=str)
+
+    # ✅ NEW: base config별 best cap 1개만 모은 파일
+    ap.add_argument("--out-top-bestcap", default="data/signals/gate_grid_top_by_recent10y_bestcap.csv", type=str)
+
     ap.add_argument("--pattern", default="gate_summary_*.csv", type=str)
     ap.add_argument("--topn", default=50, type=int)
 
@@ -266,6 +282,11 @@ def main() -> None:
         if "GateSuffix" not in row.index:
             row["GateSuffix"] = _find_suffix_from_summary_path(sp)
 
+        # ✅ parse cap from suffix
+        base_suffix, cap_mode = _parse_cap_from_suffix(str(row["GateSuffix"]))
+        row["BaseSuffix"] = base_suffix
+        row["CapMode"] = cap_mode
+
         enriched = enrich_one_summary(row, signals_dir=signals_dir, prices=prices)
         for k, v in enriched.items():
             row[k] = v
@@ -283,10 +304,16 @@ def main() -> None:
         "CAGR_AfterWarmup", "QQQ_CAGR_SamePeriod", "ExcessCAGR_AfterWarmup",
         "IdlePctAfterWarmup",
         "QQQ_SeedMultiple_SamePeriod",
+
         # summarize_sim_trades.py (existing)
         "TrailEntryCountTotal", "TrailEntryCountPerCycleAvg", "MaxCyclePeakReturn",
-        # ✅ summarize_sim_trades.py NEW (realized return stats)
         "MaxCycleReturn", "P95CycleReturn", "MedianCycleReturn", "MeanCycleReturn",
+
+        # ✅ summarize_sim_trades.py NEW (cap / tp1 / exits)
+        "TP1HoldCapDays", "TotalHoldCapDays",
+        "TP1CycleRate", "TP1CycleCount", "TP1FirstDay_Mean", "TP1FirstDay_Median",
+        "Exit_TrailAll", "Exit_GraceEnd", "Exit_GraceRecovery", "Exit_RevalFail",
+        "Exit_FinalClose", "Exit_TP1H2Cap", "Exit_TP1TotalCap", "Exit_Other",
     ]
     for c in num_cols:
         if c in out.columns:
@@ -298,7 +325,7 @@ def main() -> None:
         sm = out["SeedMultiple"].astype(float)
         out["SeedMultiple_LevAdj"] = sm / (1.0 + lev)
 
-    # ---- risk-ish score (optional) (※ 그대로 둠)
+    # ---- risk-ish score (optional)
     if "SeedMultiple" in out.columns:
         sm = out["SeedMultiple"].astype(float)
 
@@ -311,7 +338,7 @@ def main() -> None:
         pen = (0.25 * lev) + (0.15 * idle) + (0.05 * trail) + (0.03 * np.maximum(0.0, peak - 0.50))
         out["RiskAdjScore"] = sm / (1.0 + pen)
 
-    # ---- sort aggregate (※ 그대로 둠)
+    # ---- sort aggregate
     sort_cols = []
     if "RiskAdjScore" in out.columns:
         sort_cols.append("RiskAdjScore")
@@ -332,7 +359,7 @@ def main() -> None:
     out.to_csv(out_path, index=False)
     print(f"[DONE] wrote aggregate: {out_path} rows={len(out)}")
 
-    # ---- Top-by-recent10y
+    # ---- Top-by-recent10y (cap 포함해서 그냥 TopN)
     top = out.copy()
     if "Recent10Y_SeedMultiple" in top.columns:
         top = top.sort_values(["Recent10Y_SeedMultiple"], ascending=[False])
@@ -341,24 +368,36 @@ def main() -> None:
     top.to_csv(top_path, index=False)
     print(f"[DONE] wrote top: {top_path} rows={len(top)}")
 
-    # ---- quick headline (표시만 추가)
+    # ---- ✅ BaseSuffix별 “best cap 1개”만 뽑기
+    bestcap = out.copy()
+    if "Recent10Y_SeedMultiple" in bestcap.columns:
+        bestcap = bestcap.sort_values(["BaseSuffix", "Recent10Y_SeedMultiple"], ascending=[True, False])
+        bestcap = bestcap.drop_duplicates(subset=["BaseSuffix"], keep="first")
+        bestcap = bestcap.sort_values(["Recent10Y_SeedMultiple"], ascending=[False]).head(int(args.topn))
+
+    bestcap_path = Path(args.out_top_bestcap)
+    bestcap.to_csv(bestcap_path, index=False)
+    print(f"[DONE] wrote top-bestcap: {bestcap_path} rows={len(bestcap)}")
+
+    # ---- quick headline
     if len(out):
         best = out.iloc[0].to_dict()
         print("=" * 60)
         print("[BEST] (by RiskAdjScore / SeedMultiple / LevAdj / CAGR / ExcessCAGR)")
-        print(f"TAG={best.get('TAG')} suffix={best.get('GateSuffix')}")
+        print(f"TAG={best.get('TAG')} suffix={best.get('GateSuffix')} base={best.get('BaseSuffix')} cap={best.get('CapMode')}")
         print(f"RiskAdjScore={best.get('RiskAdjScore')}")
         print(f"SeedMultiple={best.get('SeedMultiple')}  Recent10Y={best.get('Recent10Y_SeedMultiple')}")
         print(f"CAGR_AfterWarmup={best.get('CAGR_AfterWarmup')}  QQQ_CAGR={best.get('QQQ_CAGR_SamePeriod')}  Excess={best.get('ExcessCAGR_AfterWarmup')}")
         print(f"IdlePctAfterWarmup={best.get('IdlePctAfterWarmup')}  MaxLevPct={best.get('MaxLeveragePct')}")
         print(f"TrailAvg={best.get('TrailEntryCountPerCycleAvg')}  PeakCycleRet={best.get('MaxCyclePeakReturn')}")
-        # ✅ realized returns display
         print(
             f"MaxCycleReturn={best.get('MaxCycleReturn')}  "
             f"P95={best.get('P95CycleReturn')}  "
             f"Median={best.get('MedianCycleReturn')}  "
             f"Mean={best.get('MeanCycleReturn')}"
         )
+        print(f"TP1Rate={best.get('TP1CycleRate')} TP1FirstDay(med)={best.get('TP1FirstDay_Median')}")
+        print(f"Exit_TP1H2Cap={best.get('Exit_TP1H2Cap')} Exit_TP1TotalCap={best.get('Exit_TP1TotalCap')}")
         print("=" * 60)
 
 
