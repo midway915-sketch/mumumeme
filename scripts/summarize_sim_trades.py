@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
-import os  # ✅ NEW
 import pandas as pd
 import numpy as np
 
@@ -138,11 +138,6 @@ def _reason_counts(trades: pd.DataFrame) -> dict[str, int]:
 
 
 def _tp1_stats(trades: pd.DataFrame) -> dict:
-    """
-    TP1 발생 관련 통계:
-      - TP1FirstHoldingDay > 0 이면 TP1이 발생한 사이클로 간주
-      - 평균/중앙 TP1 발생일(holding_days 기준)
-    """
     if trades is None or trades.empty:
         return {
             "TP1CycleRate": 0.0,
@@ -178,9 +173,6 @@ def _tp1_stats(trades: pd.DataFrame) -> dict:
 
 
 def _cap_meta(trades: pd.DataFrame) -> dict:
-    """
-    엔진에서 내려준 cap 모드/값을 summary로 끌고 오기 (없으면 NaN/빈값).
-    """
     if trades is None or trades.empty:
         return {
             "TP1HoldCapMode": "",
@@ -215,26 +207,15 @@ def _cap_meta(trades: pd.DataFrame) -> dict:
 
 
 def _cycle_stats(trades: pd.DataFrame) -> dict:
-    """
-    trades(사이클 단위 테이블)에서 요약 통계 산출.
-
-    호환:
-      - trailing entry: TrailingEntries(신규) 또는 TrailEntryCount(구버전)
-      - peak cycle return: CycleMaxReturn(신규) 또는 PeakCycleReturn(구버전)
-      - realized cycle return: CycleReturn (기본)
-    """
     if trades is None or trades.empty:
         return {
             "CycleCount": 0,
             "SuccessRate": 0.0,
             "MaxHoldingDaysObserved": np.nan,
             "MaxLeveragePct": np.nan,
-
             "TrailEntryCountTotal": 0,
             "TrailEntryCountPerCycleAvg": 0.0,
             "MaxCyclePeakReturn": np.nan,
-
-            # ✅ realized return stats
             "MaxCycleReturn": np.nan,
             "P95CycleReturn": np.nan,
             "MedianCycleReturn": np.nan,
@@ -243,13 +224,11 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
 
     cycle_cnt = int(len(trades))
 
-    # --- realized returns (실현)
     if "CycleReturn" in trades.columns:
         cr = _safe_num(trades["CycleReturn"]).replace([np.inf, -np.inf], np.nan)
     else:
         cr = pd.Series([np.nan] * cycle_cnt, index=trades.index, dtype=float)
 
-    # success
     if "Win" in trades.columns:
         wins = (_safe_num(trades["Win"], 0.0) > 0).astype(int)
     elif "CycleReturn" in trades.columns:
@@ -259,20 +238,17 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
 
     success_rate = float(wins.sum() / cycle_cnt) if cycle_cnt > 0 else 0.0
 
-    # max holding observed
     max_hold_obs = np.nan
     if "HoldingDays" in trades.columns:
         mh = _safe_num(trades["HoldingDays"]).max()
         max_hold_obs = float(mh) if np.isfinite(mh) else np.nan
 
-    # max leverage pct
     max_lev = np.nan
     lev_col = _pick_first_existing_col(trades, ["MaxLeveragePct", "max_leverage_pct", "LeveragePct", "leverage_pct"])
     if lev_col:
         mv = _safe_num(trades[lev_col]).max()
         max_lev = float(mv) if np.isfinite(mv) else np.nan
 
-    # trailing entry stats (신규/구버전 둘 다)
     trail_col = _pick_first_existing_col(trades, ["TrailingEntries", "TrailEntryCount"])
     trail_total = 0
     trail_avg = 0.0
@@ -281,14 +257,12 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
         trail_total = int(te.sum())
         trail_avg = float(te.mean()) if cycle_cnt > 0 else 0.0
 
-    # peak cycle return (신규/구버전 둘 다)
     peak_col = _pick_first_existing_col(trades, ["CycleMaxReturn", "PeakCycleReturn"])
     max_peak_ret = np.nan
     if peak_col:
         mpr = _safe_num(trades[peak_col]).max()
         max_peak_ret = float(mpr) if np.isfinite(mpr) else np.nan
 
-    # realized return stats
     max_cycle_ret = float(_safe_num(cr).max()) if _safe_num(cr).notna().any() else np.nan
     p95_cycle_ret = _quantile_safe(cr, 0.95)
     med_cycle_ret = _quantile_safe(cr, 0.50)
@@ -299,16 +273,31 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
         "SuccessRate": float(success_rate),
         "MaxHoldingDaysObserved": max_hold_obs,
         "MaxLeveragePct": max_lev,
-
         "TrailEntryCountTotal": int(trail_total),
         "TrailEntryCountPerCycleAvg": float(trail_avg),
         "MaxCyclePeakReturn": max_peak_ret,
-
         "MaxCycleReturn": max_cycle_ret,
         "P95CycleReturn": p95_cycle_ret,
         "MedianCycleReturn": med_cycle_ret,
         "MeanCycleReturn": mean_cycle_ret,
     }
+
+
+def _infer_tau_split(tag: str) -> str:
+    """
+    1) env TAU_SPLIT 있으면 그걸 우선 사용
+    2) 없으면 TAG에서 패턴으로 추정
+    """
+    env_v = (os.environ.get("TAU_SPLIT", "") or "").strip()
+    if env_v:
+        return env_v
+
+    t = (tag or "").lower()
+    if "_taucur" in t or "_tau_cur" in t:
+        return "cur"
+    if "q255025" in t or "_tauq" in t:
+        return "q255025"
+    return ""
 
 
 def main() -> None:
@@ -348,22 +337,17 @@ def main() -> None:
     if np.isfinite(st["MaxHoldingDaysObserved"]):
         max_extend_obs = float(max(0.0, float(st["MaxHoldingDaysObserved"]) - float(args.max_days)))
 
-    # ✅ NEW: tau split label injected from workflow (e.g. cur / q255025)
-    tau_split = (os.getenv("TAU_SPLIT", "") or "").strip()
+    tau_split = _infer_tau_split(args.tag)
 
     out = {
         "TAG": args.tag,
+        "TauSplit": tau_split,  # ✅ NEW: aggregate에서 필터/그룹 가능
         "GateSuffix": args.suffix,
-
-        # ✅ NEW (for merging current vs 25/50/25 into one aggregate)
-        "TauSplit": tau_split,
-
         "ProfitTarget": float(args.profit_target),
         "MaxHoldingDays": int(args.max_days),
         "StopLevel": float(args.stop_level),
         "MaxExtendDaysParam": int(args.max_extend_days),
 
-        # ✅ cap meta
         "TP1HoldCapMode": capm["TP1HoldCapMode"],
         "TP1HoldCapDays": capm["TP1HoldCapDays"],
         "TotalHoldCapDays": capm["TotalHoldCapDays"],
@@ -378,21 +362,17 @@ def main() -> None:
         "SuccessRate": float(st["SuccessRate"]),
         "MaxLeveragePct": st["MaxLeveragePct"],
 
-        # trailing/peak
         "TrailEntryCountTotal": int(st["TrailEntryCountTotal"]),
         "TrailEntryCountPerCycleAvg": float(st["TrailEntryCountPerCycleAvg"]),
         "MaxCyclePeakReturn": st["MaxCyclePeakReturn"],
 
-        # TP1 stats
         "TP1CycleRate": tp1["TP1CycleRate"],
         "TP1CycleCount": int(tp1["TP1CycleCount"]),
         "TP1FirstDay_Mean": tp1["TP1FirstDay_Mean"],
         "TP1FirstDay_Median": tp1["TP1FirstDay_Median"],
 
-        # exit reason counts
         **rc,
 
-        # ✅ realized returns (실현)
         "MaxCycleReturn": st["MaxCycleReturn"],
         "P95CycleReturn": st["P95CycleReturn"],
         "MedianCycleReturn": st["MedianCycleReturn"],
