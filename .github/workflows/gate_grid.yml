@@ -76,6 +76,7 @@ jobs:
       TP1_FRAC: "0.50"
       TRAIL_STOPS: "0.08,0.10,0.12"
 
+      # ✅ TopK2 제거
       TOPK_CONFIGS: "1|1.0"
       MAX_LEVERAGE_PCT: "1.00"
 
@@ -190,22 +191,22 @@ jobs:
             mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
             mumumeme-tail-v3-${{ runner.os }}-
 
-      # ✅ CHANGE: TAU cache는 "두 분포(current vs 25/50/25)"를 둘 다 저장/복원해야 해서 wildcard로
+      # ✅ TAU: 두 분포 모두 캐시
       - name: Restore cache (TAU)
         uses: actions/cache@v4
         with:
           path: |
             data/labels/labels_tau_*.parquet
             data/labels/labels_tau_*.csv
-            app/tau_model*.pkl
-            app/tau_scaler*.pkl
+            app/tau_model_*.pkl
+            app/tau_scaler_*.pkl
             data/meta/train_tau_report_*.json
           key: mumumeme-tau-v4-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_tau_labels.py','scripts/train_tau_model.py','scripts/score_features.py') }}
           restore-keys: |
             mumumeme-tau-v4-${{ runner.os }}-${{ env.LABEL_KEY }}-
             mumumeme-tau-v4-${{ runner.os }}-
 
-      - name: Prepare required files (10y only + partial rebuild)
+      - name: Prepare required files (10y only + build both tau splits + make 2 features_scored)
         shell: bash
         run: |
           set -euo pipefail
@@ -275,152 +276,115 @@ jobs:
             echo "[INFO] tail model exists -> reuse"
           fi
 
-          # ✅ (1) score_features 1차: p_success / p_tail 생성 (tau 없이도 가능)
-          python scripts/score_features.py --tag "${LABEL_KEY}" --tau-h-map 30,40,50 || true
-
-          # ✅ NEW: 두 개 tau 분포 실험 태그
+          # ✅ Tau split tags
           TAU_TAG_CUR="${LABEL_KEY}_tau_cur"
           TAU_TAG_Q="${LABEL_KEY}_tau_q255025"
 
-          # ✅ (2) tau labels 생성 (반드시 --tag 넣기!)
-          #  - current: "현재분포" (legacy k1/k2 기반 성공분포를 quantile로 맞춤)
-          #  - quantile: 25/50/25
-          if [ -f scripts/build_tau_labels.py ]; then
-            if [ ! -f "data/labels/labels_tau_${TAU_TAG_CUR}.parquet" ] && [ ! -f "data/labels/labels_tau_${TAU_TAG_CUR}.csv" ]; then
-              python scripts/build_tau_labels.py \
-                --tag "${TAU_TAG_CUR}" \
-                --profit-target "${PROFIT_TARGET}" \
-                --max-days "${MAX_DAYS}" \
-                --stop-level "${STOP_LEVEL}" \
-                --max-extend-days "${MAX_EXTEND_DAYS}" \
-                --split-mode current \
-                --k1 10 --k2 20
-            else
-              echo "[INFO] labels_tau(current) exists -> reuse"
-            fi
-
-            if [ ! -f "data/labels/labels_tau_${TAU_TAG_Q}.parquet" ] && [ ! -f "data/labels/labels_tau_${TAU_TAG_Q}.csv" ]; then
-              python scripts/build_tau_labels.py \
-                --tag "${TAU_TAG_Q}" \
-                --profit-target "${PROFIT_TARGET}" \
-                --max-days "${MAX_DAYS}" \
-                --stop-level "${STOP_LEVEL}" \
-                --max-extend-days "${MAX_EXTEND_DAYS}" \
-                --split-mode quantile \
-                --q1 0.25 --q2 0.75
-            else
-              echo "[INFO] labels_tau(25/50/25) exists -> reuse"
-            fi
-          else
-            echo "[WARN] scripts/build_tau_labels.py not found -> skip tau labels"
-          fi
-
-          # ✅ (3) tau model 학습: 두 분포 각각 모델/스케일러 저장 (태그 붙여서)
-          #    -> score_features.py가 resolve_model_paths로 app/tau_model_{tag}.pkl / tau_scaler_{tag}.pkl를 자동 사용 가능
-          if [ -f scripts/train_tau_model.py ]; then
-            if [ -f "data/labels/labels_tau_${TAU_TAG_CUR}.parquet" ] || [ -f "data/labels/labels_tau_${TAU_TAG_CUR}.csv" ]; then
-              if [ ! -f "app/tau_model_${TAU_TAG_CUR}.pkl" ] || [ ! -f "app/tau_scaler_${TAU_TAG_CUR}.pkl" ]; then
-                python scripts/train_tau_model.py --tag "${TAU_TAG_CUR}" --out-model "app/tau_model_${TAU_TAG_CUR}.pkl" --out-scaler "app/tau_scaler_${TAU_TAG_CUR}.pkl"
-              else
-                echo "[INFO] tau model(current) exists -> reuse"
-              fi
-            else
-              echo "[WARN] missing labels_tau(current) -> skip training current"
-            fi
-
-            if [ -f "data/labels/labels_tau_${TAU_TAG_Q}.parquet" ] || [ -f "data/labels/labels_tau_${TAU_TAG_Q}.csv" ]; then
-              if [ ! -f "app/tau_model_${TAU_TAG_Q}.pkl" ] || [ ! -f "app/tau_scaler_${TAU_TAG_Q}.pkl" ]; then
-                python scripts/train_tau_model.py --tag "${TAU_TAG_Q}" --out-model "app/tau_model_${TAU_TAG_Q}.pkl" --out-scaler "app/tau_scaler_${TAU_TAG_Q}.pkl"
-              else
-                echo "[INFO] tau model(25/50/25) exists -> reuse"
-              fi
-            else
-              echo "[WARN] missing labels_tau(25/50/25) -> skip training q255025"
-            fi
-          else
-            echo "[WARN] scripts/train_tau_model.py not found -> skip tau training"
-          fi
-
-          # ✅ (4) features_scored 2종 생성
-          #  - 파일명을 분리해서 엔진이 각각을 쓰게 하려면, run_grid_workflow.sh에서 features_scored 경로를 바꿔가며 2번 돌리는 구조가 필요함.
-          #  - 여기서는 우선 "두 버전 csv/parquet를 따로 저장"까지 해둠.
-          if [ -f "app/tau_model_${TAU_TAG_CUR}.pkl" ] && [ -f "app/tau_scaler_${TAU_TAG_CUR}.pkl" ]; then
-            python scripts/score_features.py \
+          # ✅ (A) labels_tau: current
+          if [ ! -f "data/labels/labels_tau_${TAU_TAG_CUR}.parquet" ] && [ ! -f "data/labels/labels_tau_${TAU_TAG_CUR}.csv" ]; then
+            python scripts/build_tau_labels.py \
               --tag "${TAU_TAG_CUR}" \
-              --tau-model "app/tau_model.pkl" \
-              --tau-scaler "app/tau_scaler.pkl" \
-              --tau-h-map 30,40,50
+              --profit-target "${PROFIT_TARGET}" \
+              --max-days "${MAX_DAYS}" \
+              --stop-level "${STOP_LEVEL}" \
+              --max-extend-days "${MAX_EXTEND_DAYS}" \
+              --split-mode current \
+              --k1 10 --k2 20
+          else
+            echo "[INFO] labels_tau(current) exists -> reuse"
+          fi
 
-            # score_features는 resolve_model_paths로 app/tau_model_{tag}.pkl을 찾으려면 기본 파일명이 tau_model.pkl이어야 함.
-            # 그래서 tag별 파일을 "기본명"으로 잠깐 스왑해서 안전하게 생성.
-            # (A) current
-            cp -f "app/tau_model_${TAU_TAG_CUR}.pkl" "app/tau_model.pkl"
-            cp -f "app/tau_scaler_${TAU_TAG_CUR}.pkl" "app/tau_scaler.pkl"
-            python scripts/score_features.py --tag "${LABEL_KEY}" --tau-h-map 30,40,50
-            mv -f data/features/features_scored.parquet "data/features/features_scored_tau_cur.parquet"
-            python - <<'PY'
+          # ✅ (B) labels_tau: 25/50/25
+          if [ ! -f "data/labels/labels_tau_${TAU_TAG_Q}.parquet" ] && [ ! -f "data/labels/labels_tau_${TAU_TAG_Q}.csv" ]; then
+            python scripts/build_tau_labels.py \
+              --tag "${TAU_TAG_Q}" \
+              --profit-target "${PROFIT_TARGET}" \
+              --max-days "${MAX_DAYS}" \
+              --stop-level "${STOP_LEVEL}" \
+              --max-extend-days "${MAX_EXTEND_DAYS}" \
+              --split-mode quantile \
+              --q1 0.25 --q2 0.75
+          else
+            echo "[INFO] labels_tau(q255025) exists -> reuse"
+          fi
+
+          # ✅ train_tau_model: 두 분포 각각 별도 파일로 저장
+          if [ ! -f "app/tau_model_${TAU_TAG_CUR}.pkl" ] || [ ! -f "app/tau_scaler_${TAU_TAG_CUR}.pkl" ]; then
+            python scripts/train_tau_model.py \
+              --tag "${TAU_TAG_CUR}" \
+              --out-model "app/tau_model_${TAU_TAG_CUR}.pkl" \
+              --out-scaler "app/tau_scaler_${TAU_TAG_CUR}.pkl"
+          else
+            echo "[INFO] tau model(current) exists -> reuse"
+          fi
+
+          if [ ! -f "app/tau_model_${TAU_TAG_Q}.pkl" ] || [ ! -f "app/tau_scaler_${TAU_TAG_Q}.pkl" ]; then
+            python scripts/train_tau_model.py \
+              --tag "${TAU_TAG_Q}" \
+              --out-model "app/tau_model_${TAU_TAG_Q}.pkl" \
+              --out-scaler "app/tau_scaler_${TAU_TAG_Q}.pkl"
+          else
+            echo "[INFO] tau model(q255025) exists -> reuse"
+          fi
+
+          # ✅ score_features를 "tau 모델 파일을 명시"해서 2종 생성
+          python scripts/score_features.py \
+            --tag "${LABEL_KEY}" \
+            --tau-model "app/tau_model_${TAU_TAG_CUR}.pkl" \
+            --tau-scaler "app/tau_scaler_${TAU_TAG_CUR}.pkl" \
+            --tau-h-map 30,40,50
+          mv -f data/features/features_scored.parquet data/features/features_scored_tau_cur.parquet || true
+          python - <<'PY'
           import pandas as pd
           from pathlib import Path
           p=Path("data/features/features_scored_tau_cur.parquet")
           out=Path("data/features/features_scored_tau_cur.csv")
           if p.exists():
-              df=pd.read_parquet(p); df.to_csv(out,index=False); print("[DONE] wrote", out, "rows=", len(df))
+              df=pd.read_parquet(p); out.parent.mkdir(parents=True, exist_ok=True); df.to_csv(out,index=False)
+              print("[DONE] wrote", out, "rows=", len(df))
+          else:
+              raise SystemExit("missing features_scored_tau_cur.parquet")
           PY
-          fi
 
-          if [ -f "app/tau_model_${TAU_TAG_Q}.pkl" ] && [ -f "app/tau_scaler_${TAU_TAG_Q}.pkl" ]; then
-            # (B) q255025
-            cp -f "app/tau_model_${TAU_TAG_Q}.pkl" "app/tau_model.pkl"
-            cp -f "app/tau_scaler_${TAU_TAG_Q}.pkl" "app/tau_scaler.pkl"
-            python scripts/score_features.py --tag "${LABEL_KEY}" --tau-h-map 30,40,50
-            mv -f data/features/features_scored.parquet "data/features/features_scored_tau_q255025.parquet"
-            python - <<'PY'
+          python scripts/score_features.py \
+            --tag "${LABEL_KEY}" \
+            --tau-model "app/tau_model_${TAU_TAG_Q}.pkl" \
+            --tau-scaler "app/tau_scaler_${TAU_TAG_Q}.pkl" \
+            --tau-h-map 30,40,50
+          mv -f data/features/features_scored.parquet data/features/features_scored_tau_q255025.parquet || true
+          python - <<'PY'
           import pandas as pd
           from pathlib import Path
           p=Path("data/features/features_scored_tau_q255025.parquet")
           out=Path("data/features/features_scored_tau_q255025.csv")
           if p.exists():
-              df=pd.read_parquet(p); df.to_csv(out,index=False); print("[DONE] wrote", out, "rows=", len(df))
+              df=pd.read_parquet(p); out.parent.mkdir(parents=True, exist_ok=True); df.to_csv(out,index=False)
+              print("[DONE] wrote", out, "rows=", len(df))
+          else:
+              raise SystemExit("missing features_scored_tau_q255025.parquet")
           PY
-          fi
 
-          # ✅ (5) 기본 features_scored는 "current"로 맞춰 두기(엔진 기본 실행용)
-          if [ -f data/features/features_scored_tau_cur.parquet ]; then
-            cp -f data/features/features_scored_tau_cur.parquet data/features/features_scored.parquet
-            cp -f data/features/features_scored_tau_cur.csv data/features/features_scored.csv
-            echo "[INFO] set default features_scored = tau_cur"
-          elif [ -f data/features/features_scored_tau_q255025.parquet ]; then
-            cp -f data/features/features_scored_tau_q255025.parquet data/features/features_scored.parquet
-            cp -f data/features/features_scored_tau_q255025.csv data/features/features_scored.csv
-            echo "[INFO] set default features_scored = tau_q255025"
-          else
-            echo "[WARN] no tau-scored features produced; keeping existing features_scored if any"
-          fi
-
-      - name: Run gate grid (predict + simulate + summarize)
+      - name: Run gate grid twice (cur + q255025) and keep outputs separated
         shell: bash
         run: |
           set -euo pipefail
           chmod +x scripts/run_grid_workflow.sh
 
-          # ✅ RUN #1: current distribution (features_scored already set to tau_cur by Prepare step)
-          echo "[INFO] RUN grid with tau_cur (default features_scored)"
-          bash scripts/run_grid_workflow.sh
+          # ---------- RUN #1: current ----------
+          cp -f data/features/features_scored_tau_cur.parquet data/features/features_scored.parquet
+          cp -f data/features/features_scored_tau_cur.csv data/features/features_scored.csv
 
-          # ✅ RUN #2: 25/50/25 distribution
-          if [ -f data/features/features_scored_tau_q255025.parquet ]; then
-            cp -f data/features/features_scored_tau_q255025.parquet data/features/features_scored.parquet
-            cp -f data/features/features_scored_tau_q255025.csv data/features/features_scored.csv
-            echo "[INFO] RUN grid with tau_q255025 (swapped features_scored)"
+          echo "[INFO] RUN#1 tau_split=cur"
+          ( export TAU_SPLIT="cur"; export LABEL_KEY="${LABEL_KEY}_taucur"; bash scripts/run_grid_workflow.sh )
 
-            # tag를 바꿔서 결과 파일명이 섞이지 않게 (LABEL_KEY 기반 TAG는 run_grid_workflow.sh에서 LABEL_KEY를 씀)
-            echo "LABEL_KEY=${LABEL_KEY}_tauq" >> "$GITHUB_ENV"
-            bash scripts/run_grid_workflow.sh
-          else
-            echo "[WARN] missing features_scored_tau_q255025.parquet -> skip RUN #2"
-          fi
+          # ---------- RUN #2: q255025 ----------
+          cp -f data/features/features_scored_tau_q255025.parquet data/features/features_scored.parquet
+          cp -f data/features/features_scored_tau_q255025.csv data/features/features_scored.csv
 
-      - name: Aggregate summaries
+          echo "[INFO] RUN#2 tau_split=q255025"
+          ( export TAU_SPLIT="q255025"; export LABEL_KEY="${LABEL_KEY}_tauq255025"; bash scripts/run_grid_workflow.sh )
+
+      - name: Aggregate summaries (single file containing BOTH splits)
         shell: bash
         run: |
           set -euo pipefail
