@@ -300,7 +300,24 @@ jobs:
             echo "[WARN] tau training skipped (missing script or labels_tau)"
           fi
 
+          # 5) score features (parquet이 기본)
           python scripts/score_features.py --tag "${LABEL_KEY}"
+
+          # ✅ 추가: features_scored.parquet -> features_scored.csv 강제 생성
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+
+          p = Path("data/features/features_scored.parquet")
+          out = Path("data/features/features_scored.csv")
+          if p.exists():
+              df = pd.read_parquet(p)
+              out.parent.mkdir(parents=True, exist_ok=True)
+              df.to_csv(out, index=False)
+              print(f"[DONE] wrote {out} rows={len(df)}")
+          else:
+              print("[WARN] missing data/features/features_scored.parquet -> cannot write CSV")
+          PY
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
@@ -332,5 +349,6 @@ jobs:
             data/signals/picks_meta_*.json
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
-            data/signals/features/features_scored.csv
+            data/features/features_scored.csv
+            data/features/features_scored.parquet
           if-no-files-found: error
