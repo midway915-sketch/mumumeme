@@ -195,6 +195,7 @@ def main() -> None:
             "Fixes:\n"
             " - CycleReturn always numeric (uses cycle_buy_total / cycle_sell_total)\n"
             " - Invested/Proceeds no longer become 0 just because legs were zeroed\n"
+            " - NEW: reset buy/sell totals at cycle start (hard reset to prevent residue)\n"
         )
     )
 
@@ -207,12 +208,12 @@ def main() -> None:
 
     ap.add_argument("--initial-seed", default=40_000_000, type=float)
 
-    ap.add_argument("--profit-target", required=True, type=float)   # PT (e.g. 0.10)
-    ap.add_argument("--max-days", required=True, type=int)          # fallback H if tau missing
-    ap.add_argument("--stop-level", required=True, type=float)      # legacy (metadata)
-    ap.add_argument("--max-extend-days", required=True, type=int)   # legacy (metadata)
+    ap.add_argument("--profit-target", required=True, type=float)
+    ap.add_argument("--max-days", required=True, type=int)
+    ap.add_argument("--stop-level", required=True, type=float)
+    ap.add_argument("--max-extend-days", required=True, type=int)
 
-    ap.add_argument("--max-leverage-pct", default=1.0, type=float)  # 1.0 => 100%
+    ap.add_argument("--max-leverage-pct", default=1.0, type=float)
 
     ap.add_argument("--enable-trailing", default="true", type=str)
     ap.add_argument("--tp1-frac", default=0.50, type=float)
@@ -293,9 +294,7 @@ def main() -> None:
     curve = []
 
     def liquidate_all_legs(day_prices_close: dict[str, float]) -> float:
-        """
-        Sell ALL remaining shares at close. Returns proceeds for the liquidation part only.
-        """
+        """Sell ALL remaining shares at close. Returns proceeds for the liquidation part only."""
         proceeds = 0.0
         for leg in st.legs:
             px = float(day_prices_close.get(leg.ticker, np.nan))
@@ -310,7 +309,6 @@ def main() -> None:
     def close_cycle(exit_date: pd.Timestamp, day_prices_close: dict[str, float], reason: str) -> None:
         nonlocal cooldown_today, st, trades
 
-        # 1) liquidate remaining shares at close and add to sell_total
         liq_proceeds = liquidate_all_legs(day_prices_close)
         st.cycle_sell_total += float(liq_proceeds)
 
@@ -347,7 +345,6 @@ def main() -> None:
             "MaxLeveragePctCap": float(args.max_leverage_pct),
             "MaxLeveragePct": float(st.max_leverage_pct),
 
-            # ✅ FIX: always from totals
             "Invested": invested_total,
             "Proceeds": proceeds_total,
             "CycleReturn": float(cycle_return),
@@ -359,12 +356,10 @@ def main() -> None:
             "MaxDrawdown": st.max_dd,
             "Win": win,
 
-            # ✅ new
             "TrailingEntries": int(st.trailing_entries),   # 0/1 per cycle
             "DcaLocked": int(st.dca_locked),
         })
 
-        # 2) add liquidation proceeds already included in cycle_sell_total (cash-in)
         st.seed += float(liq_proceeds)
 
         # reset cycle core
@@ -483,7 +478,6 @@ def main() -> None:
                             sell_shares = float(min(leg.shares, max(0.0, sell_shares)))
                             proceeds = sell_shares * tp_px
 
-                            # reduce position
                             before_shares = leg.shares
                             leg.shares -= sell_shares
                             if before_shares > 0:
@@ -492,12 +486,12 @@ def main() -> None:
                                 leg.invested = 0.0
 
                             st.seed += proceeds
-                            st.cycle_sell_total += float(proceeds)  # ✅ realized proceeds tracking
+                            st.cycle_sell_total += float(proceeds)
 
                             leg.tp1_done = True
                             leg.peak = float(max(high_px, tp_px))
 
-                            # ✅ A-version: first TP1 in cycle => trailing starts (count max 1) + DCA lock
+                            # first TP1 => trailing starts + DCA lock
                             if not st.trailing_started:
                                 st.trailing_started = True
                                 st.trailing_entries = 1
@@ -513,7 +507,7 @@ def main() -> None:
                             if np.isfinite(low_px) and low_px <= stop_px:
                                 proceeds = leg.shares * stop_px
                                 st.seed += proceeds
-                                st.cycle_sell_total += float(proceeds)  # ✅ realized proceeds tracking
+                                st.cycle_sell_total += float(proceeds)
                                 leg.shares = 0.0
                                 leg.invested = 0.0
 
@@ -559,7 +553,7 @@ def main() -> None:
                     st.update_dd(day_prices_close)
                     st.update_cycle_max_return(day_prices_close)
 
-            # 5) Normal mode DCA (only when not extending and not pending_reval)
+            # 5) Normal mode DCA
             if st.in_cycle and (not st.extending) and (not st.pending_reval):
                 if not st.dca_locked:
                     desired_total = float(st.unit)
@@ -573,7 +567,6 @@ def main() -> None:
                         avg = leg.avg_price()
                         desired_leg = desired_total * float(leg.weight)
 
-                        # buy rule: only <=avg, soften in near zone
                         if np.isfinite(avg) and avg > 0:
                             if close_px <= avg:
                                 pass
@@ -587,7 +580,7 @@ def main() -> None:
                         )
                         if invest > 0:
                             st.seed -= invest
-                            st.cycle_buy_total += float(invest)  # ✅ realized invested tracking
+                            st.cycle_buy_total += float(invest)
                             leg.invested += invest
                             leg.shares += invest / close_px
                             st.update_lev(float(args.max_leverage_pct))
@@ -618,6 +611,10 @@ def main() -> None:
                     H_eff = int(max(Hs)) if Hs else int(args.max_days)
                     H_eff = int(max(1, H_eff))
 
+                    # ✅ NEW: HARD RESET totals right before starting a new cycle
+                    st.cycle_buy_total = 0.0
+                    st.cycle_sell_total = 0.0
+
                     S0 = float(st.seed)
                     unit = (S0 / float(H_eff)) if H_eff > 0 else 0.0
 
@@ -630,7 +627,7 @@ def main() -> None:
                         invest = clamp_invest_by_leverage(st.seed, S0, desired, float(args.max_leverage_pct))
                         if invest > 0:
                             st.seed -= invest
-                            st.cycle_buy_total += float(invest)  # ✅ realized invested tracking
+                            st.cycle_buy_total += float(invest)
                             leg.invested += invest
                             leg.shares += invest / px
                             invested_total += invest
@@ -654,21 +651,17 @@ def main() -> None:
                         st.max_leverage_pct = 0.0
                         st.legs = legs
 
-                        # ✅ reset A-version stats
+                        # reset A-version stats
                         st.dca_locked = False
                         st.trailing_started = False
                         st.trailing_entries = 0
                         st.cycle_max_return = np.nan
 
-                        # ✅ reset realized totals (defensive, should already be 0 when not in cycle)
-                        st.cycle_buy_total = float(st.cycle_buy_total)  # keep what we just bought
-                        st.cycle_sell_total = 0.0
-
                         st.update_lev(float(args.max_leverage_pct))
                         st.update_dd(day_prices_close)
                         st.update_cycle_max_return(day_prices_close)
 
-        # ----- record curve (mark-to-close)
+        # ----- record curve
         prices_for_eq = day_prices_close if st.in_cycle else {}
         eq = st.equity(prices_for_eq)
 
@@ -688,12 +681,10 @@ def main() -> None:
             "MaxLeveragePctCycle": st.max_leverage_pct if st.in_cycle else 0.0,
             "MaxDrawdownPortfolio": st.max_dd,
 
-            # ✅ A-version: visibility
             "DcaLocked": int(st.dca_locked) if st.in_cycle else 0,
             "TrailingEntriesCycle": int(st.trailing_entries) if st.in_cycle else 0,
             "CycleMaxReturnSoFar": float(st.cycle_max_return) if (st.in_cycle and np.isfinite(st.cycle_max_return)) else np.nan,
 
-            # ✅ realized totals visibility (optional but helpful)
             "CycleBuyTotal": float(st.cycle_buy_total) if st.in_cycle else 0.0,
             "CycleSellTotal": float(st.cycle_sell_total) if st.in_cycle else 0.0,
         })
