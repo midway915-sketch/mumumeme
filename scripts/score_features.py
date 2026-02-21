@@ -124,14 +124,15 @@ def load_tau_feature_cols(tag: str) -> list[str] | None:
 def parse_tau_h_map(s: str) -> list[int]:
     parts = [p.strip() for p in (s or "").split(",") if p.strip()]
     if not parts:
-        return [20, 40, 60]
+        # ✅ 기본은 30/40/50 (비교 실험 공통 고정)
+        return [30, 40, 50]
     out: list[int] = []
     for p in parts:
         try:
             out.append(int(float(p)))
         except Exception:
             pass
-    return out if out else [20, 40, 60]
+    return out if out else [30, 40, 50]
 
 
 def class_to_h(cls: int, hmap: list[int]) -> int:
@@ -211,9 +212,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--tau-h-map",
-        default="20,40,60",
+        default="30,40,50",  # ✅ 비교 실험 공통: 30/40/50 고정
         type=str,
-        help="tau_class->H mapping. e.g. '20,40,60' means class0=20 class1=40 class2=60",
+        help="tau_class->H mapping. e.g. '30,40,50' means class0=30 class1=40 class2=50",
     )
 
     args = ap.parse_args()
@@ -344,7 +345,11 @@ def main() -> None:
     else:
         feats["tau_class"] = -1
         feats["tau_pmax"] = 0.0
-        feats["tau_H"] = int(hmap[0]) if hmap else 40
+        # ✅ tau 비활성 폴백은 '중앙 H'가 더 안전(비교 실험/운영 둘 다)
+        if hmap and len(hmap) >= 2:
+            feats["tau_H"] = int(hmap[1])  # 40
+        else:
+            feats["tau_H"] = 40
 
     # -------------------------
     # write outputs
@@ -368,6 +373,7 @@ def main() -> None:
     print("p_success cols source:", ps_cols_src, "cols:", ps_cols)
     print("p_tail enabled:", bool(tail_model_path.exists() and tail_scaler_path.exists()))
     print("tau enabled:", bool(tau_model_path.exists() and tau_scaler_path.exists()))
+    print("tau_h_map:", hmap)
     print("=" * 60)
 
 
