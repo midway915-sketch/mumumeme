@@ -332,4 +332,5 @@ jobs:
             data/signals/picks_meta_*.json
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
+            data/features/features_scored.csv
           if-no-files-found: error
