@@ -98,6 +98,9 @@ class CycleState:
     trailing_started: bool = False
     trailing_entries: int = 0
 
+    # ✅ TP1 첫 발생 시점(holding day index) 기록 (기간제한용)
+    tp1_first_holding_day: int = 0  # 0 means "not set"
+
     # ✅ 사이클 중 최대 수익률(마크투클로즈 기준): (Equity - S0) / S0 의 최대값
     cycle_max_return: float = np.nan
 
@@ -196,6 +199,11 @@ def main() -> None:
             " - CycleReturn always numeric (uses cycle_buy_total / cycle_sell_total)\n"
             " - Invested/Proceeds no longer become 0 just because legs were zeroed\n"
             " - NEW: reset buy/sell totals at cycle start (hard reset to prevent residue)\n"
+            "NEW (period cap after TP1; stop-loss still NOT applied in engine):\n"
+            " - --tp1-hold-cap none|h2|total\n"
+            "   none : no extra cap after TP1 (legacy behavior)\n"
+            "   h2   : after first TP1, allow only +H//2 holding days then force close\n"
+            "   total: after first TP1, force close when holding_days >= H + H//2\n"
         )
     )
 
@@ -210,7 +218,7 @@ def main() -> None:
 
     ap.add_argument("--profit-target", required=True, type=float)
     ap.add_argument("--max-days", required=True, type=int)
-    ap.add_argument("--stop-level", required=True, type=float)
+    ap.add_argument("--stop-level", required=True, type=float)  # kept for metadata compatibility
     ap.add_argument("--max-extend-days", required=True, type=int)
 
     ap.add_argument("--max-leverage-pct", default=1.0, type=float)
@@ -224,6 +232,9 @@ def main() -> None:
 
     ap.add_argument("--topk", default=1, type=int)
     ap.add_argument("--weights", default="1.0", type=str)
+
+    # ✅ NEW: period cap policy after TP1
+    ap.add_argument("--tp1-hold-cap", default="none", type=str, choices=["none", "h2", "total"])
 
     # re-eval thresholds
     ap.add_argument("--reval-ps-strong", default=0.70, type=float)
@@ -239,6 +250,10 @@ def main() -> None:
 
     enable_trailing = str(args.enable_trailing).lower() in ("1", "true", "yes", "y")
     _ = str(args.tp1_trail_unlimited).lower() in ("1", "true", "yes", "y")  # compat only
+
+    tp1_hold_cap = str(args.tp1_hold_cap).lower().strip()
+    if tp1_hold_cap not in ("none", "h2", "total"):
+        raise ValueError("--tp1-hold-cap must be one of: none|h2|total")
 
     topk = int(args.topk)
     if topk < 1 or topk > 2:
@@ -325,6 +340,11 @@ def main() -> None:
 
         cmr = float(st.cycle_max_return) if np.isfinite(st.cycle_max_return) else np.nan
 
+        # cap days info (for audit)
+        H_half = int(max(1, int(st.H) // 2)) if int(st.H) > 0 else 0
+        total_cap = int(st.H + H_half) if int(st.H) > 0 else 0
+        tp1_cap = int(H_half) if int(st.H) > 0 else 0
+
         trades.append({
             "CycleType": "MAIN",
             "EntryDate": st.entry_date,
@@ -339,6 +359,12 @@ def main() -> None:
             "MaxDaysInput": int(args.max_days),
             "StopLevelInput": float(args.stop_level),
             "MaxExtendDaysInput": int(args.max_extend_days),
+
+            "TP1HoldCapMode": tp1_hold_cap,
+            "TP1HoldCapDays": tp1_cap,
+            "TotalHoldCapDays": total_cap,
+            "TP1FirstHoldingDay": int(st.tp1_first_holding_day),
+
             "GraceDays": int(st.grace_days_total),
             "RevalStrength": st.reval_strength,
             "RecoveryThreshold": float(st.recovery_threshold) if np.isfinite(st.recovery_threshold) else np.nan,
@@ -385,6 +411,7 @@ def main() -> None:
         st.dca_locked = False
         st.trailing_started = False
         st.trailing_entries = 0
+        st.tp1_first_holding_day = 0
         st.cycle_max_return = np.nan
 
         # ✅ reset realized totals for next cycle
@@ -420,6 +447,40 @@ def main() -> None:
         if ps_m >= float(args.reval_ps_pass) and pt_m <= float(args.reval_pt_pass):
             return "WEAK", ps_m, pt_m
         return "FAIL", ps_m, pt_m
+
+    def should_force_close_after_tp1() -> tuple[bool, str]:
+        """
+        Apply cap only AFTER at least one TP1 in the cycle.
+        - none : never force close due to cap
+        - h2   : if holding_days >= (tp1_first_holding_day + H//2)
+        - total: if holding_days >= (H + H//2)
+        """
+        if not st.in_cycle:
+            return False, ""
+        if tp1_hold_cap == "none":
+            return False, ""
+        if st.tp1_first_holding_day <= 0:
+            return False, ""  # no TP1 yet
+
+        H = int(st.H)
+        if H <= 0:
+            return False, ""
+
+        H_half = int(max(1, H // 2))
+
+        if tp1_hold_cap == "h2":
+            cap_day = int(st.tp1_first_holding_day + H_half)
+            if int(st.holding_days) >= cap_day:
+                return True, "TP1_H2_CAP_EXIT"
+            return False, ""
+
+        if tp1_hold_cap == "total":
+            cap_day = int(H + H_half)
+            if int(st.holding_days) >= cap_day:
+                return True, "TP1_TOTAL_CAP_EXIT"
+            return False, ""
+
+        return False, ""
 
     # simulate
     for date, day_df in grouped:
@@ -495,8 +556,10 @@ def main() -> None:
                             if not st.trailing_started:
                                 st.trailing_started = True
                                 st.trailing_entries = 1
-                            st.dca_locked = True
+                                # ✅ record TP1 first day index for cap policy
+                                st.tp1_first_holding_day = int(st.holding_days)
 
+                            st.dca_locked = True
                             st.update_lev(float(args.max_leverage_pct))
 
                         # trailing after TP1
@@ -514,6 +577,12 @@ def main() -> None:
                 # 2) if all legs emptied -> close
                 if st.in_cycle and all((leg.shares <= 0 for leg in st.legs)):
                     close_cycle(date, day_prices_close, reason="TRAIL_EXIT_ALL")
+
+            # ✅ 2.5) TP1-period cap (only after at least one TP1)
+            if st.in_cycle:
+                force, why = should_force_close_after_tp1()
+                if force:
+                    close_cycle(date, day_prices_close, reason=why)
 
             # 3) H reached: set pending_reval only if no TP1 anywhere
             if st.in_cycle and (not st.extending) and (not st.pending_reval):
@@ -655,6 +724,7 @@ def main() -> None:
                         st.dca_locked = False
                         st.trailing_started = False
                         st.trailing_entries = 0
+                        st.tp1_first_holding_day = 0
                         st.cycle_max_return = np.nan
 
                         st.update_lev(float(args.max_leverage_pct))
@@ -683,6 +753,9 @@ def main() -> None:
 
             "DcaLocked": int(st.dca_locked) if st.in_cycle else 0,
             "TrailingEntriesCycle": int(st.trailing_entries) if st.in_cycle else 0,
+            "TP1FirstHoldingDay": int(st.tp1_first_holding_day) if st.in_cycle else 0,
+            "TP1HoldCapMode": tp1_hold_cap if st.in_cycle else "",
+
             "CycleMaxReturnSoFar": float(st.cycle_max_return) if (st.in_cycle and np.isfinite(st.cycle_max_return)) else np.nan,
 
             "CycleBuyTotal": float(st.cycle_buy_total) if st.in_cycle else 0.0,
