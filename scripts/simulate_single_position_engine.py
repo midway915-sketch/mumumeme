@@ -101,6 +101,10 @@ class CycleState:
     # ✅ 사이클 중 최대 수익률(마크투클로즈 기준): (Equity - S0) / S0 의 최대값
     cycle_max_return: float = np.nan
 
+    # ✅ FIX: 사이클 실현 수익률용 누적 (Invested/Proceeds가 0 되는 문제 방지)
+    cycle_buy_total: float = 0.0   # 사이클 동안 실제 매수 총액(현금 유출)
+    cycle_sell_total: float = 0.0  # 사이클 동안 실제 매도 총액(현금 유입)
+
     legs: list[Leg] = None  # type: ignore
 
     def equity(self, prices: dict[str, float]) -> float:
@@ -188,6 +192,9 @@ def main() -> None:
             " - DCA is locked for the rest of the cycle once ANY TP1 happens (cycle-level lock).\n"
             " - trailing entry count is max 1 per cycle (first TP1 only).\n"
             " - CycleMaxReturn is tracked as max((Equity - S0)/S0) during the cycle.\n"
+            "Fixes:\n"
+            " - CycleReturn always numeric (uses cycle_buy_total / cycle_sell_total)\n"
+            " - Invested/Proceeds no longer become 0 just because legs were zeroed\n"
         )
     )
 
@@ -230,9 +237,7 @@ def main() -> None:
     args = ap.parse_args()
 
     enable_trailing = str(args.enable_trailing).lower() in ("1", "true", "yes", "y")
-
-    # compat parse (unused)
-    _ = str(args.tp1_trail_unlimited).lower() in ("1", "true", "yes", "y")
+    _ = str(args.tp1_trail_unlimited).lower() in ("1", "true", "yes", "y")  # compat only
 
     topk = int(args.topk)
     if topk < 1 or topk > 2:
@@ -242,10 +247,8 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # features_scored map (tau + reval)
     feat_map = load_feat_map(args.features_scored_parq, args.features_scored_csv)
 
-    # picks
     picks_path = Path(args.picks_path)
     if not picks_path.exists():
         raise FileNotFoundError(f"Missing picks file: {picks_path}")
@@ -260,7 +263,6 @@ def main() -> None:
     picks = picks.dropna(subset=["Date", "Ticker"]).sort_values(["Date"]).reset_index(drop=True)
     picks = picks.groupby("Date", group_keys=False).head(topk).reset_index(drop=True)
 
-    # prices
     prices = read_table(args.prices_parq, args.prices_csv).copy()
     if "Date" not in prices.columns or "Ticker" not in prices.columns:
         raise ValueError("prices must have Date,Ticker")
@@ -271,7 +273,6 @@ def main() -> None:
             raise ValueError(f"prices missing {c}")
     prices = prices.dropna(subset=["Date", "Ticker", "Close"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
-    # date -> picks list
     picks_by_date: dict[pd.Timestamp, list[str]] = {}
     for d, g in picks.groupby("Date"):
         picks_by_date[d] = g["Ticker"].tolist()
@@ -291,25 +292,39 @@ def main() -> None:
     trades = []
     curve = []
 
-    def liquidate_all_legs(day_prices_close: dict[str, float]) -> tuple[float, float]:
+    def liquidate_all_legs(day_prices_close: dict[str, float]) -> float:
+        """
+        Sell ALL remaining shares at close. Returns proceeds for the liquidation part only.
+        """
         proceeds = 0.0
-        invested_total = 0.0
         for leg in st.legs:
             px = float(day_prices_close.get(leg.ticker, np.nan))
             if not np.isfinite(px) or px <= 0:
                 continue
-            proceeds += leg.shares * px
-            invested_total += leg.invested
-        return proceeds, invested_total
+            if leg.shares > 0:
+                proceeds += leg.shares * px
+                leg.shares = 0.0
+                leg.invested = 0.0
+        return float(proceeds)
 
     def close_cycle(exit_date: pd.Timestamp, day_prices_close: dict[str, float], reason: str) -> None:
         nonlocal cooldown_today, st, trades
-        proceeds, invested_total = liquidate_all_legs(day_prices_close)
 
-        cycle_return = (proceeds - invested_total) / invested_total if invested_total > 0 else np.nan
-        win = int(cycle_return > 0) if np.isfinite(cycle_return) else 0
+        # 1) liquidate remaining shares at close and add to sell_total
+        liq_proceeds = liquidate_all_legs(day_prices_close)
+        st.cycle_sell_total += float(liq_proceeds)
 
-        # cycle_max_return already tracked vs entry_seed (S0)
+        invested_total = float(st.cycle_buy_total)
+        proceeds_total = float(st.cycle_sell_total)
+
+        # ✅ always numeric
+        if invested_total > 0:
+            cycle_return = (proceeds_total - invested_total) / invested_total
+        else:
+            cycle_return = 0.0
+
+        win = int(cycle_return > 0)
+
         cmr = float(st.cycle_max_return) if np.isfinite(st.cycle_max_return) else np.nan
 
         trades.append({
@@ -331,9 +346,12 @@ def main() -> None:
             "RecoveryThreshold": float(st.recovery_threshold) if np.isfinite(st.recovery_threshold) else np.nan,
             "MaxLeveragePctCap": float(args.max_leverage_pct),
             "MaxLeveragePct": float(st.max_leverage_pct),
+
+            # ✅ FIX: always from totals
             "Invested": invested_total,
-            "Proceeds": proceeds,
-            "CycleReturn": cycle_return,
+            "Proceeds": proceeds_total,
+            "CycleReturn": float(cycle_return),
+
             "CycleMaxReturn": cmr,
             "HoldingDays": st.holding_days,
             "Extending": int(st.extending),
@@ -346,9 +364,10 @@ def main() -> None:
             "DcaLocked": int(st.dca_locked),
         })
 
-        st.seed += proceeds
+        # 2) add liquidation proceeds already included in cycle_sell_total (cash-in)
+        st.seed += float(liq_proceeds)
 
-        # reset cycle
+        # reset cycle core
         st.in_cycle = False
         st.entry_date = None
         st.entry_seed = 0.0
@@ -373,13 +392,13 @@ def main() -> None:
         st.trailing_entries = 0
         st.cycle_max_return = np.nan
 
+        # ✅ reset realized totals for next cycle
+        st.cycle_buy_total = 0.0
+        st.cycle_sell_total = 0.0
+
         cooldown_today = True
 
     def reval_strength_for_day(date: pd.Timestamp) -> tuple[str, float, float]:
-        """
-        Return (strength, p_success_mean, p_tail_mean) based on features_scored at T+1.
-        If missing -> FAIL.
-        """
         if feat_map.empty:
             return "FAIL", 0.0, 1.0
 
@@ -473,6 +492,8 @@ def main() -> None:
                                 leg.invested = 0.0
 
                             st.seed += proceeds
+                            st.cycle_sell_total += float(proceeds)  # ✅ realized proceeds tracking
+
                             leg.tp1_done = True
                             leg.peak = float(max(high_px, tp_px))
 
@@ -492,6 +513,7 @@ def main() -> None:
                             if np.isfinite(low_px) and low_px <= stop_px:
                                 proceeds = leg.shares * stop_px
                                 st.seed += proceeds
+                                st.cycle_sell_total += float(proceeds)  # ✅ realized proceeds tracking
                                 leg.shares = 0.0
                                 leg.invested = 0.0
 
@@ -539,7 +561,6 @@ def main() -> None:
 
             # 5) Normal mode DCA (only when not extending and not pending_reval)
             if st.in_cycle and (not st.extending) and (not st.pending_reval):
-                # ✅ A-version: DCA lock이면 사이클 끝날 때까지 DCA 전면 금지
                 if not st.dca_locked:
                     desired_total = float(st.unit)
                     for leg in st.legs:
@@ -566,6 +587,7 @@ def main() -> None:
                         )
                         if invest > 0:
                             st.seed -= invest
+                            st.cycle_buy_total += float(invest)  # ✅ realized invested tracking
                             leg.invested += invest
                             leg.shares += invest / close_px
                             st.update_lev(float(args.max_leverage_pct))
@@ -608,6 +630,7 @@ def main() -> None:
                         invest = clamp_invest_by_leverage(st.seed, S0, desired, float(args.max_leverage_pct))
                         if invest > 0:
                             st.seed -= invest
+                            st.cycle_buy_total += float(invest)  # ✅ realized invested tracking
                             leg.invested += invest
                             leg.shares += invest / px
                             invested_total += invest
@@ -637,6 +660,10 @@ def main() -> None:
                         st.trailing_entries = 0
                         st.cycle_max_return = np.nan
 
+                        # ✅ reset realized totals (defensive, should already be 0 when not in cycle)
+                        st.cycle_buy_total = float(st.cycle_buy_total)  # keep what we just bought
+                        st.cycle_sell_total = 0.0
+
                         st.update_lev(float(args.max_leverage_pct))
                         st.update_dd(day_prices_close)
                         st.update_cycle_max_return(day_prices_close)
@@ -665,6 +692,10 @@ def main() -> None:
             "DcaLocked": int(st.dca_locked) if st.in_cycle else 0,
             "TrailingEntriesCycle": int(st.trailing_entries) if st.in_cycle else 0,
             "CycleMaxReturnSoFar": float(st.cycle_max_return) if (st.in_cycle and np.isfinite(st.cycle_max_return)) else np.nan,
+
+            # ✅ realized totals visibility (optional but helpful)
+            "CycleBuyTotal": float(st.cycle_buy_total) if st.in_cycle else 0.0,
+            "CycleSellTotal": float(st.cycle_sell_total) if st.in_cycle else 0.0,
         })
 
         # ----- force close on last day
