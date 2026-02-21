@@ -85,6 +85,16 @@ def _pick_first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | N
     return None
 
 
+def _quantile_safe(x: pd.Series, q: float) -> float:
+    x = _safe_num(x).dropna()
+    if x.empty:
+        return float("nan")
+    try:
+        return float(x.quantile(q))
+    except Exception:
+        return float("nan")
+
+
 def _cycle_stats(trades: pd.DataFrame) -> dict:
     """
     trades(사이클 단위 테이블)에서 요약 통계 산출.
@@ -92,6 +102,7 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
     호환:
       - trailing entry: TrailingEntries(신규) 또는 TrailEntryCount(구버전)
       - peak cycle return: CycleMaxReturn(신규) 또는 PeakCycleReturn(구버전)
+      - realized cycle return: CycleReturn (기본)
     """
     if trades is None or trades.empty:
         return {
@@ -99,12 +110,25 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
             "SuccessRate": 0.0,
             "MaxHoldingDaysObserved": np.nan,
             "MaxLeveragePct": np.nan,
+
             "TrailEntryCountTotal": 0,
             "TrailEntryCountPerCycleAvg": 0.0,
             "MaxCyclePeakReturn": np.nan,
+
+            # ✅ realized return stats
+            "MaxCycleReturn": np.nan,
+            "P95CycleReturn": np.nan,
+            "MedianCycleReturn": np.nan,
+            "MeanCycleReturn": np.nan,
         }
 
     cycle_cnt = int(len(trades))
+
+    # --- realized returns (실현)
+    if "CycleReturn" in trades.columns:
+        cr = _safe_num(trades["CycleReturn"]).replace([np.inf, -np.inf], np.nan)
+    else:
+        cr = pd.Series([np.nan] * cycle_cnt, index=trades.index, dtype=float)
 
     # success
     if "Win" in trades.columns:
@@ -112,7 +136,7 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
     elif "CycleReturn" in trades.columns:
         wins = (_safe_num(trades["CycleReturn"], 0.0) > 0).astype(int)
     else:
-        wins = pd.Series([0] * cycle_cnt)
+        wins = pd.Series([0] * cycle_cnt, index=trades.index, dtype=int)
 
     success_rate = float(wins.sum() / cycle_cnt) if cycle_cnt > 0 else 0.0
 
@@ -129,7 +153,7 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
         mv = _safe_num(trades[lev_col]).max()
         max_lev = float(mv) if np.isfinite(mv) else np.nan
 
-    # ✅ trailing entry stats (신규/구버전 둘 다)
+    # trailing entry stats (신규/구버전 둘 다)
     trail_col = _pick_first_existing_col(trades, ["TrailingEntries", "TrailEntryCount"])
     trail_total = 0
     trail_avg = 0.0
@@ -138,21 +162,33 @@ def _cycle_stats(trades: pd.DataFrame) -> dict:
         trail_total = int(te.sum())
         trail_avg = float(te.mean()) if cycle_cnt > 0 else 0.0
 
-    # ✅ peak cycle return (신규/구버전 둘 다)
+    # peak cycle return (신규/구버전 둘 다)
     peak_col = _pick_first_existing_col(trades, ["CycleMaxReturn", "PeakCycleReturn"])
     max_peak_ret = np.nan
     if peak_col:
         mpr = _safe_num(trades[peak_col]).max()
         max_peak_ret = float(mpr) if np.isfinite(mpr) else np.nan
 
+    # realized return stats
+    max_cycle_ret = float(_safe_num(cr).max()) if _safe_num(cr).notna().any() else np.nan
+    p95_cycle_ret = _quantile_safe(cr, 0.95)
+    med_cycle_ret = _quantile_safe(cr, 0.50)
+    mean_cycle_ret = float(_safe_num(cr).dropna().mean()) if _safe_num(cr).dropna().shape[0] else np.nan
+
     return {
         "CycleCount": cycle_cnt,
         "SuccessRate": float(success_rate),
         "MaxHoldingDaysObserved": max_hold_obs,
         "MaxLeveragePct": max_lev,
+
         "TrailEntryCountTotal": int(trail_total),
         "TrailEntryCountPerCycleAvg": float(trail_avg),
         "MaxCyclePeakReturn": max_peak_ret,
+
+        "MaxCycleReturn": max_cycle_ret,
+        "P95CycleReturn": p95_cycle_ret,
+        "MedianCycleReturn": med_cycle_ret,
+        "MeanCycleReturn": mean_cycle_ret,
     }
 
 
@@ -208,10 +244,16 @@ def main() -> None:
         "SuccessRate": float(st["SuccessRate"]),
         "MaxLeveragePct": st["MaxLeveragePct"],
 
-        # ✅ NEW
+        # trailing/peak
         "TrailEntryCountTotal": int(st["TrailEntryCountTotal"]),
         "TrailEntryCountPerCycleAvg": float(st["TrailEntryCountPerCycleAvg"]),
         "MaxCyclePeakReturn": st["MaxCyclePeakReturn"],
+
+        # ✅ realized returns (실현)
+        "MaxCycleReturn": st["MaxCycleReturn"],
+        "P95CycleReturn": st["P95CycleReturn"],
+        "MedianCycleReturn": st["MedianCycleReturn"],
+        "MeanCycleReturn": st["MeanCycleReturn"],
 
         "TradesFile": str(trades_path),
         "CurveFile": str(curve_path) if curve_path.exists() else "",
