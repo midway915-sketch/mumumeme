@@ -24,7 +24,6 @@ from scripts.feature_spec import (
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
 FEAT_DIR = DATA_DIR / "features"
-UNIVERSE_CSV = DATA_DIR / "universe.csv"
 
 PRICES_PARQ = RAW_DIR / "prices.parquet"
 PRICES_CSV = RAW_DIR / "prices.csv"
@@ -32,7 +31,10 @@ PRICES_CSV = RAW_DIR / "prices.csv"
 OUT_PARQ = FEAT_DIR / "features_model.parquet"
 OUT_CSV = FEAT_DIR / "features_model.csv"
 
-MARKET_TICKER = "SPY"  # market proxy (must exist in raw prices)
+# 시장 피처(드로우다운/ATR/beta) 기준
+MARKET_TICKER = "SPY"   # market proxy
+# ✅ 상대강도(RelStrength) 기준 (요청: UPRO)
+REL_BENCH_TICKER = "UPRO"
 
 # ✅ 룩어헤드 방지: "당일 종가 진입(B)" 기준이면 무조건 1일 lag 피처만 사용
 LOOKAHEAD_SHIFT_DAYS = 1
@@ -61,7 +63,6 @@ def read_prices() -> pd.DataFrame:
         if c not in df.columns:
             raise ValueError(f"prices missing required column: {c}")
 
-    # numeric coerce
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -72,29 +73,6 @@ def read_prices() -> pd.DataFrame:
         .reset_index(drop=True)
     )
     return df
-
-
-def read_universe_groups_strict() -> dict[str, str]:
-    """
-    ✅ sector features를 '무조건' 쓰려면 Group 매핑이 필수.
-    universe.csv 없거나 Group 컬럼 없으면 여기서 바로 에러.
-    """
-    if not UNIVERSE_CSV.exists():
-        raise FileNotFoundError(f"Missing {UNIVERSE_CSV}. Sector features require universe.csv with Group column.")
-
-    uni = pd.read_csv(UNIVERSE_CSV)
-    if "Ticker" not in uni.columns or "Group" not in uni.columns:
-        raise ValueError("universe.csv must include columns: Ticker, Group (required for sector features).")
-
-    uni = uni.copy()
-    uni["Ticker"] = uni["Ticker"].astype(str).str.upper().str.strip()
-    uni["Group"] = uni["Group"].astype(str).str.strip()
-    uni = uni.dropna(subset=["Ticker", "Group"])
-
-    m = dict(zip(uni["Ticker"].tolist(), uni["Group"].tolist()))
-    if not m:
-        raise ValueError("universe.csv Group mapping is empty. Sector features require non-empty Group mapping.")
-    return m
 
 
 # -----------------------------
@@ -122,6 +100,13 @@ def compute_atr_ratio(g: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def compute_market_features(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Market features based on MARKET_TICKER (default SPY):
+      - Market_Drawdown
+      - Market_ATR_ratio
+      - Market_ret_1d (for beta)
+      - Market_ret_20 ✅ NEW (SSOT)
+    """
     m = prices.loc[prices["Ticker"] == MARKET_TICKER].sort_values("Date").copy()
     if m.empty:
         raise ValueError(f"Market ticker {MARKET_TICKER} not found. Use fetch_prices.py --include-extra")
@@ -136,19 +121,35 @@ def compute_market_features(prices: pd.DataFrame) -> pd.DataFrame:
 
     atr_ratio = compute_atr_ratio(m, n=14)
 
-    # daily returns for beta
-    mret = c.pct_change()
+    mret_1d = c.pct_change()
+    mret_20 = (c / c.shift(20)) - 1.0  # ✅ NEW
 
     out = pd.DataFrame(
         {
             "Date": m["Date"].to_numpy(),
             "Market_Drawdown": mdd.to_numpy(),
             "Market_ATR_ratio": atr_ratio.to_numpy(),
-            "Market_ret_1d": mret.to_numpy(),
+            "Market_ret_1d": mret_1d.to_numpy(),
+            "Market_ret_20": mret_20.to_numpy(),  # ✅ NEW
         }
     ).sort_values("Date").reset_index(drop=True)
 
     return out
+
+
+def compute_benchmark_ret20(prices: pd.DataFrame, bench_ticker: str) -> pd.DataFrame:
+    """
+    Bench 20d return series for RelStrength:
+      RelStrength = ret_20(ticker) - bench_ret_20(UPRO)
+    """
+    b = prices.loc[prices["Ticker"] == bench_ticker].sort_values("Date").copy()
+    if b.empty:
+        raise ValueError(f"Benchmark ticker {bench_ticker} not found in prices. (need in universe + fetch_prices include)")
+    b["Date"] = pd.to_datetime(b["Date"], errors="coerce").dt.tz_localize(None)
+    b = b.dropna(subset=["Date"]).reset_index(drop=True)
+    c = pd.to_numeric(b["Close"], errors="coerce")
+    bench_ret_20 = (c / c.shift(20)) - 1.0
+    return pd.DataFrame({"Date": b["Date"].to_numpy(), "Bench_ret_20": bench_ret_20.to_numpy()})
 
 
 def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> pd.DataFrame:
@@ -205,7 +206,6 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
     var = mret.rolling(60, min_periods=60).var()
     beta_60 = cov / var
 
-    # ✅ 방어: 길이 체크
     n = len(g)
     cols_for_len = {
         "Date": len(dt),
@@ -235,7 +235,6 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
         {
             "Date": dt.to_numpy(),
             "Ticker": g["Ticker"].to_numpy(),
-
             "Drawdown_252": dd_252.to_numpy(),
             "Drawdown_60": dd_60.to_numpy(),
             "ATR_ratio": atr_ratio.to_numpy(),
@@ -243,7 +242,6 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
             "MACD_hist": macd_hist.to_numpy(),
             "MA20_slope": ma20_slope.to_numpy(),
             "ret_score": ret_score.to_numpy(),
-
             "ret_5": ret_5.to_numpy(),
             "ret_10": ret_10.to_numpy(),
             "ret_20": ret_20.to_numpy(),
@@ -251,124 +249,13 @@ def compute_ticker_features(g: pd.DataFrame, market_ret_by_date: pd.Series) -> p
             "vol_surge": vol_surge.to_numpy(),
             "trend_align": trend_align.to_numpy(),
             "beta_60": beta_60.to_numpy(),
-
-            # debug columns (not in SSOT, but keep)
+            # debug columns
             "Volume": v.to_numpy(),
             "Close": c.to_numpy(),
         }
     )
-
     return out
 
-
-def add_sector_strength_strict(feats: pd.DataFrame, ticker_to_group: dict) -> pd.DataFrame:
-    """
-    Adds sector-relative features:
-      - Sector_Ret_20: average 20d return of the ticker's Group
-      - RelStrength   : ret_20 - Sector_Ret_20
-
-    STRICT policy:
-      - all tickers in feats must have Group mapping
-      - EXCEPT "NON_SECTOR" tickers (benchmark / index / volatility etc.)
-        -> they get Sector_Ret_20=0, RelStrength=0
-    """
-    if feats is None or feats.empty:
-        return feats
-
-    out = feats.copy()
-    out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
-
-    # ✅ Benchmarks / non-sector instruments
-    NON_SECTOR = {"SPY", "^VIX", "QQQ"}  # 필요하면 여기에 추가
-
-    # --- init columns safely (avoid missing column later) ---
-    if "Sector_Ret_20" not in out.columns:
-        out["Sector_Ret_20"] = np.nan
-    if "RelStrength" not in out.columns:
-        out["RelStrength"] = np.nan
-
-    # set NON_SECTOR to zeros
-    mask_non_sector = out["Ticker"].isin(NON_SECTOR)
-    if mask_non_sector.any():
-        out.loc[mask_non_sector, "Sector_Ret_20"] = 0.0
-        out.loc[mask_non_sector, "RelStrength"] = 0.0
-
-    # sector 대상만 따로 계산
-    sec = out.loc[~mask_non_sector].copy()
-    if sec.empty:
-        out["Sector_Ret_20"] = pd.to_numeric(out["Sector_Ret_20"], errors="coerce").fillna(0.0).astype(float)
-        out["RelStrength"] = pd.to_numeric(out["RelStrength"], errors="coerce").fillna(0.0).astype(float)
-        return out
-
-    # ✅ merge 충돌 방지: sec에 이미 있으면 제거하고 새로 계산
-    for col in ["Sector_Ret_20", "RelStrength"]:
-        if col in sec.columns:
-            sec = sec.drop(columns=[col])
-
-    # --- STRICT mapping check (ONLY for sector 대상) ---
-    tickers = sec["Ticker"].astype(str).str.upper().unique().tolist()
-    missing = [t for t in tickers if str(t) not in ticker_to_group]
-    if missing:
-        raise ValueError(
-            f"Missing Group mapping for tickers (sector features required): {missing}\n"
-            f"-> Fix data/universe.csv Group values."
-        )
-
-    # --- compute Sector_Ret_20 / RelStrength ---
-    if "ret_20" not in sec.columns:
-        raise ValueError("ret_20 missing - sector strength requires ret_20.")
-    if "Date" not in sec.columns:
-        raise ValueError("Date missing - sector strength requires Date.")
-
-    sec["ret_20"] = pd.to_numeric(sec["ret_20"], errors="coerce").fillna(0.0).astype(float)
-    sec["Group"] = sec["Ticker"].map(ticker_to_group)
-
-    sec["Date"] = pd.to_datetime(sec["Date"], errors="coerce").dt.tz_localize(None)
-    sec = sec.dropna(subset=["Date", "Ticker", "Group"]).copy()
-
-    grp_mean = (
-        sec.groupby(["Date", "Group"], as_index=False)["ret_20"]
-        .mean()
-        .rename(columns={"ret_20": "Sector_Ret_20"})
-    )
-
-    # merge (should produce Sector_Ret_20)
-    sec = sec.merge(grp_mean, on=["Date", "Group"], how="left")
-
-    # ✅ suffix 케이스 방어 (혹시라도 남아있으면 정리)
-    if "Sector_Ret_20" not in sec.columns:
-        if "Sector_Ret_20_y" in sec.columns:
-            sec["Sector_Ret_20"] = sec["Sector_Ret_20_y"]
-        elif "Sector_Ret_20_x" in sec.columns:
-            sec["Sector_Ret_20"] = sec["Sector_Ret_20_x"]
-        else:
-            sec["Sector_Ret_20"] = 0.0
-
-    sec["Sector_Ret_20"] = pd.to_numeric(sec["Sector_Ret_20"], errors="coerce").fillna(0.0).astype(float)
-
-    sec["RelStrength"] = sec["ret_20"] - sec["Sector_Ret_20"]
-    sec["RelStrength"] = pd.to_numeric(sec["RelStrength"], errors="coerce").fillna(0.0).astype(float)
-
-    # 결과를 out에 되돌리기 (Date+Ticker 키로 안전하게 merge back)
-    key_cols = ["Date", "Ticker"]
-    sec_back = sec[key_cols + ["Sector_Ret_20", "RelStrength"]].copy()
-
-    out = out.merge(sec_back, on=key_cols, how="left", suffixes=("", "_new"))
-
-    # fill from _new where available (only for sector tickers)
-    if "Sector_Ret_20_new" in out.columns:
-        out.loc[~mask_non_sector, "Sector_Ret_20"] = out.loc[~mask_non_sector, "Sector_Ret_20_new"]
-        out = out.drop(columns=["Sector_Ret_20_new"])
-    if "RelStrength_new" in out.columns:
-        out.loc[~mask_non_sector, "RelStrength"] = out.loc[~mask_non_sector, "RelStrength_new"]
-        out = out.drop(columns=["RelStrength_new"])
-
-    # final numeric cleanup
-    out["Sector_Ret_20"] = pd.to_numeric(out["Sector_Ret_20"], errors="coerce").fillna(0.0).astype(float)
-    out["RelStrength"] = pd.to_numeric(out["RelStrength"], errors="coerce").fillna(0.0).astype(float)
-
-    return out
-    
 
 def apply_lookahead_shift_per_ticker(df: pd.DataFrame, cols: list[str], shift_days: int) -> pd.DataFrame:
     """
@@ -405,6 +292,7 @@ def main() -> None:
         compute_start = start_date - pd.Timedelta(days=lookback_days)
         prices = prices.loc[prices["Date"] >= compute_start].copy()
 
+    # market (SPY) features
     market = compute_market_features(prices).sort_values("Date").reset_index(drop=True)
 
     market_ret_by_date = pd.Series(
@@ -425,19 +313,25 @@ def main() -> None:
     feats = feats.dropna(subset=["Date", "Ticker"]).reset_index(drop=True)
 
     # merge market columns needed by SSOT
-    market_merge_cols = ["Date", "Market_Drawdown", "Market_ATR_ratio"]
+    market_merge_cols = ["Date", "Market_Drawdown", "Market_ATR_ratio", "Market_ret_20"]
     feats = feats.merge(market[market_merge_cols], on="Date", how="left", validate="many_to_one")
 
     if args.min_volume and args.min_volume > 0:
         feats = feats.loc[pd.to_numeric(feats["Volume"], errors="coerce") >= float(args.min_volume)].copy()
 
-    # ✅ sector features REQUIRED
-    ticker_to_group = read_universe_groups_strict()
-    feats = add_sector_strength_strict(feats, ticker_to_group=ticker_to_group)
+    # ✅ RelStrength = ret_20 - ret_20(UPRO)
+    bench = compute_benchmark_ret20(prices, bench_ticker=REL_BENCH_TICKER)
+    feats = feats.merge(bench, on="Date", how="left", validate="many_to_one")
 
-    # ✅ SSOT 18개 강제(섹터 포함)
-    sector_enabled = True
-    FEATURE_COLS = get_feature_cols(sector_enabled=sector_enabled)
+    feats["Bench_ret_20"] = pd.to_numeric(feats["Bench_ret_20"], errors="coerce")
+    feats["ret_20"] = pd.to_numeric(feats["ret_20"], errors="coerce")
+    feats["RelStrength"] = feats["ret_20"] - feats["Bench_ret_20"]
+
+    # (debug용으로 남기고 싶으면 아래 drop 주석 처리)
+    feats = feats.drop(columns=["Bench_ret_20"], errors="ignore")
+
+    # ✅ SSOT 18개 강제
+    FEATURE_COLS = get_feature_cols(sector_enabled=False)
     if len(FEATURE_COLS) != 18:
         raise RuntimeError(f"SSOT feature cols must be 18, got {len(FEATURE_COLS)}: {FEATURE_COLS}")
 
@@ -445,13 +339,13 @@ def main() -> None:
     if missing_cols:
         raise RuntimeError(f"Computed features missing SSOT columns: {missing_cols}")
 
-    # ✅ ✅ ✅ LOOK-AHEAD GUARD: ticker별 1일 shift
+    # ✅ LOOK-AHEAD GUARD: ticker별 1일 shift
     feats = apply_lookahead_shift_per_ticker(feats, FEATURE_COLS, LOOKAHEAD_SHIFT_DAYS)
 
     # shift 후 NaN 생기는 구간 제거(초반부)
     feats = feats.dropna(subset=FEATURE_COLS + ["Date", "Ticker"]).copy()
 
-    # start-date cut (true output cut)
+    # start-date cut
     if start_date is not None:
         feats = feats.loc[pd.to_datetime(feats["Date"], errors="coerce") >= start_date].copy()
 
@@ -468,8 +362,8 @@ def main() -> None:
         print(f"[WARN] parquet save failed ({e}) -> writing csv only")
     feats.to_csv(OUT_CSV, index=False)
 
-    # ✅ SSOT meta write (cols= 시그니처)
-    meta_path = write_feature_cols_meta(cols=FEATURE_COLS, sector_enabled=sector_enabled)
+    # ✅ SSOT meta write
+    meta_path = write_feature_cols_meta(cols=FEATURE_COLS, sector_enabled=False)
 
     print(f"[DONE] wrote: {OUT_PARQ} rows={len(feats)}")
     if len(feats):
@@ -477,7 +371,8 @@ def main() -> None:
         dmax = pd.to_datetime(feats["Date"]).max().date()
         print(f"[INFO] range: {dmin}..{dmax}")
         print(f"[INFO] lookahead_shift_days: {LOOKAHEAD_SHIFT_DAYS} (B: enter at close)")
-        print("[INFO] sector strength: ENABLED (required)")
+        print(f"[INFO] market proxy: {MARKET_TICKER} (Market_*)")
+        print(f"[INFO] relstrength bench: {REL_BENCH_TICKER} (RelStrength = ret_20 - bench_ret_20)")
         print(f"[INFO] feature_cols_meta: {meta_path}")
         print(f"[INFO] feature_cols({len(FEATURE_COLS)}): {FEATURE_COLS}")
 
