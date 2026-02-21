@@ -10,6 +10,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import argparse
+import inspect
 import json
 from pathlib import Path
 
@@ -116,8 +117,7 @@ def _date_based_train_test_split(df: pd.DataFrame, date_col: str, train_ratio: f
 def _make_date_cv_splits(df_train: pd.DataFrame, date_col: str, n_splits: int) -> list[tuple[np.ndarray, np.ndarray]]:
     """
     ✅ CV도 Date 단위로만 진행 (같은 날짜 혼재 방지)
-    Returns list[(train_idx, val_idx)] for CalibratedClassifierCV-like APIs,
-    but 여기서는 우리가 직접 fold loop 돌릴 때도 그대로 사용 가능.
+    Returns list[(train_idx, val_idx)] for our manual fold loop.
     """
     d = pd.to_datetime(df_train[date_col], errors="coerce").dt.tz_localize(None)
     uniq_dates = pd.Series(d.dropna().unique()).sort_values().to_list()
@@ -163,6 +163,32 @@ def _coerce_tau_class(y: pd.Series) -> np.ndarray:
     return yy.to_numpy(dtype=int)
 
 
+def _make_logreg(max_iter: int) -> LogisticRegression:
+    """
+    ✅ sklearn 버전/빌드 차이로 LogisticRegression 인자 호환이 깨지는 것을 방지.
+    - 가능한 인자만 signature 기반으로 필터링해서 전달한다.
+    """
+    desired = {
+        # 기본
+        "solver": "lbfgs",
+        "max_iter": int(max_iter),
+
+        # 최신 sklearn에서 다중 클래스에서 multinomial로 잘 가도록 (가능하면)
+        "multi_class": "auto",
+
+        # 일부 빌드/버전에서만 지원되는 옵션들 (있으면 넣고 없으면 무시)
+        "n_jobs": 1,
+    }
+
+    sig = inspect.signature(LogisticRegression)
+    allowed = set(sig.parameters.keys())
+    filtered = {k: v for k, v in desired.items() if k in allowed}
+
+    # 혹시 'multi_class'가 지원되면 auto 넣고,
+    # 지원 안 하면(이번 에러) 그냥 빼고 진행
+    return LogisticRegression(**filtered)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train tau (FAST/MID/SLOW) multi-class model. (A + date-split/CV)")
 
@@ -193,9 +219,6 @@ def main() -> None:
         raise ValueError("--tag is required.")
 
     # ✅ tau labels path resolution
-    # Priority:
-    #   1) tagged labels: data/labels/labels_tau_{tag}.parquet|csv
-    #   2) legacy untagged labels: data/labels/labels_tau.parquet|csv  (workflow/older script output)
     tagged_parq = LABELS_DIR / f"labels_tau_{tag}.parquet"
     tagged_csv = LABELS_DIR / f"labels_tau_{tag}.csv"
     legacy_parq = LABELS_DIR / "labels_tau.parquet"
@@ -270,14 +293,12 @@ def main() -> None:
 
     # targets / X
     y_all = _coerce_tau_class(df[args.target_col])
-    X_all = df[feat_cols].to_numpy(dtype=float)
+    if len(np.unique(y_all)) < 2:
+        raise RuntimeError("TauClass has only one class in data. Cannot train model.")
 
     n = len(df)
     if n < 200:
         raise RuntimeError(f"Not enough training rows: {n}")
-
-    if len(np.unique(y_all)) < 2:
-        raise RuntimeError("TauClass has only one class in data. Cannot train multinomial model.")
 
     # ✅ Date-based train/test split
     train_df, test_df, cut_date = _date_based_train_test_split(df, args.date_col, float(args.train_ratio))
@@ -295,13 +316,8 @@ def main() -> None:
     # CV (date-based)
     splits = _make_date_cv_splits(train_df, args.date_col, int(args.n_splits))
 
-    # Model: multinomial logistic regression
-    model = LogisticRegression(
-        multi_class="multinomial",
-        solver="lbfgs",
-        max_iter=int(args.max_iter),
-        n_jobs=1,
-    )
+    # ✅ model factory (sklearn 호환 필터)
+    model = _make_logreg(int(args.max_iter))
 
     # Fold eval
     fold_losses: list[float] = []
@@ -311,12 +327,7 @@ def main() -> None:
         X_va = X_train_s[va_idx]
         y_va = y_train[va_idx]
 
-        m = LogisticRegression(
-            multi_class="multinomial",
-            solver="lbfgs",
-            max_iter=int(args.max_iter),
-            n_jobs=1,
-        )
+        m = _make_logreg(int(args.max_iter))
         m.fit(X_tr, y_tr)
 
         proba = m.predict_proba(X_va)
