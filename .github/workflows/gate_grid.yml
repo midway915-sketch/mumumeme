@@ -76,7 +76,7 @@ jobs:
       TP1_FRAC: "0.50"
       TRAIL_STOPS: "0.08,0.10,0.12"
 
-      TOPK_CONFIGS: "1|1.0;2|0.7,0.3;2|0.6,0.4"
+      TOPK_CONFIGS: "1|1.0"
       MAX_LEVERAGE_PCT: "1.00"
 
       OUT_DIR: "data/signals"
