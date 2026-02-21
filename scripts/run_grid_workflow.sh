@@ -53,6 +53,10 @@ echo "[INFO] MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS (auto: H//2 when not provided)"
 # ✅ 옵션B 제거: tp1-trail-unlimited는 true만 사용
 TP1_TRAIL_UNLIMITED="true"
 
+# ✅ NEW: TP1 이후 기간제한 모드들
+TP1_HOLD_CAP_MODES="${TP1_HOLD_CAP_MODES:-none,h2,total}"
+echo "[INFO] TP1_HOLD_CAP_MODES=$TP1_HOLD_CAP_MODES"
+
 # ----- helpers
 split_csv() {
   local s="$1"
@@ -181,12 +185,13 @@ PY
 )"
               tu_s="tu1"  # ✅ 옵션B 제거 -> 항상 tu1
 
-              suffix="${mode}_${tu_s}_t${t_s}_q${uq_s}_r${rank_by}_lam${lam_s}_ps${ps_s}_k${K}_w$(echo "$W" | tr ',' '_')_tp${tp_pct}_tr${tr_s}"
+              base_suffix="${mode}_${tu_s}_t${t_s}_q${uq_s}_r${rank_by}_lam${lam_s}_ps${ps_s}_k${K}_w$(echo "$W" | tr ',' '_')_tp${tp_pct}_tr${tr_s}"
 
               echo "=============================="
-              echo "[RUN] tp1_unlim=$TP1_TRAIL_UNLIMITED mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin topk=$K weights=$W trail=$trail suffix=$suffix"
+              echo "[RUN] mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin topk=$K weights=$W trail=$trail base_suffix=$base_suffix"
               echo "=============================="
 
+              # ---- PREDICT (once per base_suffix)
               python "$PRED" \
                 --profit-target "$PROFIT_TARGET" \
                 --max-days "$MAX_DAYS" \
@@ -200,15 +205,15 @@ PY
                 --topk "$K" \
                 --ps-min "$psmin" \
                 --tag "$TAG" \
-                --suffix "$suffix" \
+                --suffix "$base_suffix" \
                 --exclude-tickers "$EXCLUDE_TICKERS" \
                 --out-dir "$OUT_DIR" \
                 --require-files "$REQUIRE_FILES"
 
-              picks_path="$OUT_DIR/picks_${TAG}_gate_${suffix}.csv"
+              picks_path="$OUT_DIR/picks_${TAG}_gate_${base_suffix}.csv"
 
               if [ ! -f "$picks_path" ]; then
-                echo "[WARN] picks missing -> skip simulate/summarize (suffix=$suffix)"
+                echo "[WARN] picks missing -> skip simulate/summarize (base_suffix=$base_suffix)"
                 continue
               fi
 
@@ -222,47 +227,69 @@ except Exception:
 PY
 )"
               if [ "${rows:-0}" = "0" ]; then
-                echo "[INFO] picks rows=0 -> skip simulate/summarize (suffix=$suffix)"
+                echo "[INFO] picks rows=0 -> skip simulate/summarize (base_suffix=$base_suffix)"
                 continue
               fi
 
+              # ---- DEDUPE is applied at PREDICT-level only (avoid re-running identical picks across many configs)
+              # NOTE: we still want to run SIM for each cap mode for comparison.
               if [ "$DEDUP_PICKS" = "true" ]; then
                 h="$(picks_hash "$picks_path")"
                 if is_hash_seen "$h"; then
-                  echo "[INFO] duplicate picks hash=$h -> skip simulate/summarize (suffix=$suffix)"
+                  echo "[INFO] duplicate picks hash=$h -> (picks-level) still run cap modes? NO -> skip all sims for this base_suffix"
+                  # if you want to still run sims even when picks duplicate across base_suffix,
+                  # change this 'continue' to 'echo ...' only.
                   continue
                 fi
                 mark_hash_seen "$h"
               fi
 
-              python "$SIM" \
-                --picks-path "$picks_path" \
-                --profit-target "$PROFIT_TARGET" \
-                --max-days "$MAX_DAYS" \
-                --stop-level "$STOP_LEVEL" \
-                --max-extend-days "$MAX_EXTEND_DAYS" \
-                --max-leverage-pct "$MAX_LEVERAGE_PCT" \
-                --enable-trailing "$ENABLE_TRAILING" \
-                --tp1-frac "$TP1_FRAC" \
-                --trail-stop "$trail" \
-                --tp1-trail-unlimited "$TP1_TRAIL_UNLIMITED" \
-                --topk "$K" \
-                --weights "$W" \
-                --tag "$TAG" \
-                --suffix "$suffix" \
-                --out-dir "$OUT_DIR"
+              # ---- SIMULATE + SUMMARIZE for each TP1 hold cap mode
+              while read -r cap_mode; do
+                cap_mode="$(echo "$cap_mode" | tr '[:upper:]' '[:lower:]' | xargs)"
+                [ -z "$cap_mode" ] && continue
+                if [[ "$cap_mode" != "none" && "$cap_mode" != "h2" && "$cap_mode" != "total" ]]; then
+                  echo "[ERROR] invalid cap_mode=$cap_mode (must be none|h2|total)"
+                  exit 1
+                fi
 
-              trades_path="$OUT_DIR/sim_engine_trades_${TAG}_gate_${suffix}.parquet"
+                cap_suffix="${base_suffix}_cap${cap_mode}"
 
-              python "$SUM" \
-                --trades-path "$trades_path" \
-                --tag "$TAG" \
-                --suffix "$suffix" \
-                --profit-target "$PROFIT_TARGET" \
-                --max-days "$MAX_DAYS" \
-                --stop-level "$STOP_LEVEL" \
-                --max-extend-days "$MAX_EXTEND_DAYS" \
-                --out-dir "$OUT_DIR"
+                echo "------------------------------"
+                echo "[SIM] cap_mode=$cap_mode cap_suffix=$cap_suffix"
+                echo "------------------------------"
+
+                python "$SIM" \
+                  --picks-path "$picks_path" \
+                  --profit-target "$PROFIT_TARGET" \
+                  --max-days "$MAX_DAYS" \
+                  --stop-level "$STOP_LEVEL" \
+                  --max-extend-days "$MAX_EXTEND_DAYS" \
+                  --max-leverage-pct "$MAX_LEVERAGE_PCT" \
+                  --enable-trailing "$ENABLE_TRAILING" \
+                  --tp1-frac "$TP1_FRAC" \
+                  --trail-stop "$trail" \
+                  --tp1-trail-unlimited "$TP1_TRAIL_UNLIMITED" \
+                  --tp1-hold-cap "$cap_mode" \
+                  --topk "$K" \
+                  --weights "$W" \
+                  --tag "$TAG" \
+                  --suffix "$cap_suffix" \
+                  --out-dir "$OUT_DIR"
+
+                trades_path="$OUT_DIR/sim_engine_trades_${TAG}_gate_${cap_suffix}.parquet"
+
+                python "$SUM" \
+                  --trades-path "$trades_path" \
+                  --tag "$TAG" \
+                  --suffix "$cap_suffix" \
+                  --profit-target "$PROFIT_TARGET" \
+                  --max-days "$MAX_DAYS" \
+                  --stop-level "$STOP_LEVEL" \
+                  --max-extend-days "$MAX_EXTEND_DAYS" \
+                  --out-dir "$OUT_DIR"
+
+              done < <(split_csv "$TP1_HOLD_CAP_MODES")
 
             done < <(split_csv "$TRAIL_STOPS")
           done < <(split_scsv "$TOPK_CONFIGS")
