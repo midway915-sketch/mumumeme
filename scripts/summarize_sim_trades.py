@@ -95,6 +95,123 @@ def _quantile_safe(x: pd.Series, q: float) -> float:
         return float("nan")
 
 
+def _reason_counts(trades: pd.DataFrame) -> dict[str, int]:
+    if trades is None or trades.empty or "Reason" not in trades.columns:
+        return {
+            "Exit_TrailAll": 0,
+            "Exit_GraceEnd": 0,
+            "Exit_GraceRecovery": 0,
+            "Exit_RevalFail": 0,
+            "Exit_FinalClose": 0,
+            "Exit_TP1H2Cap": 0,
+            "Exit_TP1TotalCap": 0,
+            "Exit_Other": 0,
+        }
+
+    r = trades["Reason"].astype(str).fillna("")
+    def _cnt(prefix: str) -> int:
+        return int((r.str.startswith(prefix)).sum())
+
+    c_trail = int((r == "TRAIL_EXIT_ALL").sum())
+    c_grace_end = int((r == "GRACE_END_EXIT").sum())
+    c_grace_rec = int((r == "GRACE_RECOVERY_EXIT").sum())
+    c_reval_fail = _cnt("REVAL_FAIL")
+    c_final = int((r == "FINAL_CLOSE").sum())
+    c_h2 = int((r == "TP1_H2_CAP_EXIT").sum())
+    c_total = int((r == "TP1_TOTAL_CAP_EXIT").sum())
+
+    known = c_trail + c_grace_end + c_grace_rec + c_reval_fail + c_final + c_h2 + c_total
+    other = int(max(0, len(trades) - known))
+
+    return {
+        "Exit_TrailAll": c_trail,
+        "Exit_GraceEnd": c_grace_end,
+        "Exit_GraceRecovery": c_grace_rec,
+        "Exit_RevalFail": c_reval_fail,
+        "Exit_FinalClose": c_final,
+        "Exit_TP1H2Cap": c_h2,
+        "Exit_TP1TotalCap": c_total,
+        "Exit_Other": other,
+    }
+
+
+def _tp1_stats(trades: pd.DataFrame) -> dict:
+    """
+    TP1 발생 관련 통계:
+      - TP1FirstHoldingDay > 0 이면 TP1이 발생한 사이클로 간주
+      - 평균/중앙 TP1 발생일(holding_days 기준)
+    """
+    if trades is None or trades.empty:
+        return {
+            "TP1CycleRate": 0.0,
+            "TP1CycleCount": 0,
+            "TP1FirstDay_Mean": np.nan,
+            "TP1FirstDay_Median": np.nan,
+        }
+
+    col = _pick_first_existing_col(trades, ["TP1FirstHoldingDay", "tp1_first_holding_day"])
+    if not col:
+        return {
+            "TP1CycleRate": 0.0,
+            "TP1CycleCount": 0,
+            "TP1FirstDay_Mean": np.nan,
+            "TP1FirstDay_Median": np.nan,
+        }
+
+    v = _safe_num(trades[col], 0.0).fillna(0.0)
+    hit = (v > 0).astype(int)
+    cnt = int(hit.sum())
+    rate = float(cnt / len(trades)) if len(trades) else 0.0
+
+    vv = v[v > 0]
+    mean_day = float(vv.mean()) if len(vv) else np.nan
+    med_day = float(vv.median()) if len(vv) else np.nan
+
+    return {
+        "TP1CycleRate": rate,
+        "TP1CycleCount": cnt,
+        "TP1FirstDay_Mean": mean_day,
+        "TP1FirstDay_Median": med_day,
+    }
+
+
+def _cap_meta(trades: pd.DataFrame) -> dict:
+    """
+    엔진에서 내려준 cap 모드/값을 summary로 끌고 오기 (없으면 NaN/빈값).
+    """
+    if trades is None or trades.empty:
+        return {
+            "TP1HoldCapMode": "",
+            "TP1HoldCapDays": np.nan,
+            "TotalHoldCapDays": np.nan,
+        }
+
+    mode_col = _pick_first_existing_col(trades, ["TP1HoldCapMode"])
+    tp1_days_col = _pick_first_existing_col(trades, ["TP1HoldCapDays"])
+    total_days_col = _pick_first_existing_col(trades, ["TotalHoldCapDays"])
+
+    mode = ""
+    if mode_col:
+        m = trades[mode_col].astype(str).replace("nan", "").fillna("")
+        mode = str(m.iloc[0]) if len(m) else ""
+
+    tp1_days = np.nan
+    if tp1_days_col:
+        x = _safe_num(trades[tp1_days_col]).dropna()
+        tp1_days = float(x.iloc[0]) if len(x) else np.nan
+
+    total_days = np.nan
+    if total_days_col:
+        x = _safe_num(trades[total_days_col]).dropna()
+        total_days = float(x.iloc[0]) if len(x) else np.nan
+
+    return {
+        "TP1HoldCapMode": mode,
+        "TP1HoldCapDays": tp1_days,
+        "TotalHoldCapDays": total_days,
+    }
+
+
 def _cycle_stats(trades: pd.DataFrame) -> dict:
     """
     trades(사이클 단위 테이블)에서 요약 통계 산출.
@@ -218,6 +335,9 @@ def main() -> None:
         curve = _read_any(curve_path)
 
     st = _cycle_stats(trades)
+    rc = _reason_counts(trades)
+    tp1 = _tp1_stats(trades)
+    capm = _cap_meta(trades)
 
     seed_mult = _seed_multiple_from_curve(curve) if isinstance(curve, pd.DataFrame) else None
     recent10y = _recent10y_seed_multiple_from_curve(curve) if isinstance(curve, pd.DataFrame) else None
@@ -234,6 +354,11 @@ def main() -> None:
         "StopLevel": float(args.stop_level),
         "MaxExtendDaysParam": int(args.max_extend_days),
 
+        # ✅ cap meta
+        "TP1HoldCapMode": capm["TP1HoldCapMode"],
+        "TP1HoldCapDays": capm["TP1HoldCapDays"],
+        "TotalHoldCapDays": capm["TotalHoldCapDays"],
+
         "SeedMultiple": seed_mult if seed_mult is not None else np.nan,
         "Recent10Y_SeedMultiple": recent10y if recent10y is not None else np.nan,
 
@@ -248,6 +373,15 @@ def main() -> None:
         "TrailEntryCountTotal": int(st["TrailEntryCountTotal"]),
         "TrailEntryCountPerCycleAvg": float(st["TrailEntryCountPerCycleAvg"]),
         "MaxCyclePeakReturn": st["MaxCyclePeakReturn"],
+
+        # TP1 stats
+        "TP1CycleRate": tp1["TP1CycleRate"],
+        "TP1CycleCount": int(tp1["TP1CycleCount"]),
+        "TP1FirstDay_Mean": tp1["TP1FirstDay_Mean"],
+        "TP1FirstDay_Median": tp1["TP1FirstDay_Median"],
+
+        # exit reason counts
+        **rc,
 
         # ✅ realized returns (실현)
         "MaxCycleReturn": st["MaxCycleReturn"],
