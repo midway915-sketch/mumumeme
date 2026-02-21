@@ -231,17 +231,14 @@ PY
                 continue
               fi
 
-              # ---- DEDUPE is applied at PREDICT-level only (avoid re-running identical picks across many configs)
-              # NOTE: we still want to run SIM for each cap mode for comparison.
+              # ---- DEDUPE: 기록/로그만 하고, ✅cap 비교(sim 3종)는 무조건 돌린다
               if [ "$DEDUP_PICKS" = "true" ]; then
                 h="$(picks_hash "$picks_path")"
                 if is_hash_seen "$h"; then
-                  echo "[INFO] duplicate picks hash=$h -> (picks-level) still run cap modes? NO -> skip all sims for this base_suffix"
-                  # if you want to still run sims even when picks duplicate across base_suffix,
-                  # change this 'continue' to 'echo ...' only.
-                  continue
+                  echo "[INFO] duplicate picks hash=$h -> still run cap modes for comparison (base_suffix=$base_suffix)"
+                else
+                  mark_hash_seen "$h"
                 fi
-                mark_hash_seen "$h"
               fi
 
               # ---- SIMULATE + SUMMARIZE for each TP1 hold cap mode
