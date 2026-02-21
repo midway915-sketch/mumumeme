@@ -26,10 +26,7 @@ META_DIR = DATA_DIR / "meta"
 PRICES_PARQ = RAW_DIR / "prices.parquet"
 PRICES_CSV = RAW_DIR / "prices.csv"
 
-# ✅ FIX: build_tail_labels 단계에서는 features_scored가 없을 수 있음(워크플로우 순서상)
-# 따라서 features_scored 우선(있으면), 없으면 features_model로 fallback
-FEATURES_SCORED_PARQ = FEAT_DIR / "features_scored.parquet"
-FEATURES_SCORED_CSV = FEAT_DIR / "features_scored.csv"
+# ✅ 강제: tail labels는 features_model 기준으로만 align
 FEATURES_MODEL_PARQ = FEAT_DIR / "features_model.parquet"
 FEATURES_MODEL_CSV = FEAT_DIR / "features_model.csv"
 
@@ -41,8 +38,7 @@ def _validate_18_cols(cols: list[str], src: str) -> None:
     if len(cols) != 18:
         raise RuntimeError(f"SSOT feature cols must be 18, got {len(cols)} from {src}: {cols}")
 
-    # ✅ feature_spec.py 기준: Sector_Ret_20 제거됨
-    # ✅ RelStrength는 필수
+    # ✅ 현재 SSOT: Sector_Ret_20 제거, RelStrength는 필수
     need = ["RelStrength"]
     miss = [c for c in need if c not in cols]
     if miss:
@@ -56,7 +52,7 @@ def resolve_feature_cols_forced(args_feature_cols: str) -> tuple[list[str], str]
     ✅ 18개 SSOT 강제 (Sector_Ret_20 제거 반영)
 
     규칙:
-      - --feature-cols override는 허용 안 함(흔들리면 라벨/모델 불일치)
+      - --feature-cols override는 허용 안 함(라벨/모델 불일치 방지)
       - SSOT(meta/feature_cols.json) 있으면 그걸 사용
       - 없으면 get_feature_cols(sector_enabled=False) 사용
       - 무엇을 쓰든 반드시:
@@ -103,6 +99,7 @@ def read_prices() -> pd.DataFrame:
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
     df = (
         df.dropna(subset=["Date", "Ticker", "Close", "High", "Low"])
         .sort_values(["Ticker", "Date"])
@@ -112,18 +109,11 @@ def read_prices() -> pd.DataFrame:
     return df
 
 
-def read_features_any() -> tuple[pd.DataFrame, str]:
+def read_features_model() -> tuple[pd.DataFrame, str]:
     """
-    ✅ features_scored가 있으면 그걸 쓰고, 없으면 features_model로 fallback.
-    build_tail_labels 단계에서는 일반적으로 features_model만 존재하는 게 정상.
+    ✅ 강제: features_model만 사용 (features_scored 절대 사용 안 함)
     """
-    if FEATURES_SCORED_PARQ.exists():
-        df = pd.read_parquet(FEATURES_SCORED_PARQ).copy()
-        src = str(FEATURES_SCORED_PARQ)
-    elif FEATURES_SCORED_CSV.exists():
-        df = pd.read_csv(FEATURES_SCORED_CSV).copy()
-        src = str(FEATURES_SCORED_CSV)
-    elif FEATURES_MODEL_PARQ.exists():
+    if FEATURES_MODEL_PARQ.exists():
         df = pd.read_parquet(FEATURES_MODEL_PARQ).copy()
         src = str(FEATURES_MODEL_PARQ)
     elif FEATURES_MODEL_CSV.exists():
@@ -131,13 +121,13 @@ def read_features_any() -> tuple[pd.DataFrame, str]:
         src = str(FEATURES_MODEL_CSV)
     else:
         raise FileNotFoundError(
-            "Missing features input. Expected one of:\n"
-            f"- {FEATURES_SCORED_PARQ}\n- {FEATURES_SCORED_CSV}\n"
-            f"- {FEATURES_MODEL_PARQ}\n- {FEATURES_MODEL_CSV}\n"
+            "Missing features_model. Expected one of:\n"
+            f"- {FEATURES_MODEL_PARQ}\n"
+            f"- {FEATURES_MODEL_CSV}\n"
         )
 
     if "Date" not in df.columns or "Ticker" not in df.columns:
-        raise ValueError(f"features file missing Date/Ticker: {src}")
+        raise ValueError(f"features_model missing Date/Ticker: {src}")
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
@@ -156,19 +146,13 @@ def compute_trade_path(
     max_extend_days: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    For each entry day t:
-      - Evaluate over horizon H=max_days
-      - If hit TP before SL: success
-      - If hit SL before TP: fail
-      - Else: extend max_extend_days to check "tail" outcome
-
-    Tail definition used here:
-      - If SL hit first within H and later (within extension window) TP is reached -> p_tail=1
-      - Otherwise p_tail=0
+    Tail definition:
+      - If SL hit first within H, and then TP is reached within extension window => p_tail=1
+      - else p_tail=0
 
     Returns:
       y_tail (0/1)
-      y_pmax: max profit observed within extension window (diagnostic)
+      y_pmax: max profit within extension window (diagnostic)
     """
     g = g.sort_values("Date").reset_index(drop=True)
     close = pd.to_numeric(g["Close"], errors="coerce").to_numpy(dtype=float)
@@ -206,17 +190,18 @@ def compute_trade_path(
         if len(win_ext) > 0:
             y_pmax[i] = float(np.nanmax((win_ext / entry) - 1.0))
 
+        # already success or no event: tail=0
         if tp_hit is None and sl_hit is None:
             y_tail[i] = 0
         elif tp_hit is not None and (sl_hit is None or tp_hit <= sl_hit):
             y_tail[i] = 0
         else:
+            # SL first -> check recovery to TP within extension
             recovered = False
             start = (sl_hit + 1) if sl_hit is not None else (end_main + 1)
             if start <= end_ext:
                 for k in range(start, end_ext + 1):
-                    ret2 = (close[k] / entry) - 1.0
-                    if ret2 >= profit_target:
+                    if ((close[k] / entry) - 1.0) >= profit_target:
                         recovered = True
                         break
             y_tail[i] = 1 if recovered else 0
@@ -225,14 +210,13 @@ def compute_trade_path(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build tail labels (p_tail) aligned with SSOT 18 features (no sector).")
+    ap = argparse.ArgumentParser(description="Build tail labels (p_tail) aligned to features_model only.")
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
     ap.add_argument("--max-extend-days", type=int, required=True)
 
-    ap.add_argument("--feature-cols", type=str, default="", help="(DISALLOWED) override; kept only for compatibility")
-
+    ap.add_argument("--feature-cols", type=str, default="", help="(DISALLOWED) override; kept for compatibility")
     args = ap.parse_args()
 
     pt = float(args.profit_target)
@@ -244,7 +228,7 @@ def main() -> None:
     print(f"[INFO] SSOT feature cols source={src} cols={cols}")
 
     prices = read_prices()
-    feats, feats_src = read_features_any()
+    feats, feats_src = read_features_model()
     print(f"[INFO] features source={feats_src} rows={len(feats)}")
 
     pt100 = int(round(pt * 100))
@@ -287,12 +271,12 @@ def main() -> None:
     labels["Ticker"] = labels["Ticker"].astype(str).str.upper().str.strip()
     labels = labels.dropna(subset=["Date", "Ticker"]).reset_index(drop=True)
 
-    # ✅ Align labels to whichever features file we used (features_model or features_scored)
-    merged = feats.merge(labels, on=["Date", "Ticker"], how="inner")
+    # ✅ Align to features_model keys only
+    merged = feats[["Date", "Ticker"]].merge(labels, on=["Date", "Ticker"], how="inner")
     if merged.empty:
         raise RuntimeError(
-            "No overlap between features input and computed tail labels. "
-            "Check that prices/universe tickers match and date ranges overlap."
+            "No overlap between features_model and computed tail labels. "
+            "Check universe tickers & date ranges."
         )
 
     out = merged[["Date", "Ticker", "p_tail", "tail_pmax"]].copy()
@@ -317,7 +301,8 @@ def main() -> None:
         "ssot_feature_cols_source": src,
         "ssot_feature_cols": cols,
         "features_source_used": feats_src,
-        "notes": "Aligned with feature_spec: Sector_Ret_20 removed; RelStrength required. Uses features_model if features_scored not present.",
+        "label_cols": ["p_tail", "tail_pmax"],
+        "notes": "features_model only. Sector_Ret_20 removed; RelStrength required.",
     }
     with open(meta_json, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
