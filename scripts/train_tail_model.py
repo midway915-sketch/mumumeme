@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-# ✅ FIX(A): "python scripts/xxx.py" 실행에서도 scripts.* import 되도록 repo root를 sys.path에 추가
+# ✅ sys.path guard
 import sys
 from pathlib import Path as _Path
 
@@ -19,266 +19,180 @@ import pandas as pd
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import log_loss
 
 from scripts.feature_spec import read_feature_cols_meta, get_feature_cols
 
 
+DATA_DIR = Path("data")
+LABELS_DIR = DATA_DIR / "labels"
+FEATURES_DIR = DATA_DIR / "features"
+META_DIR = DATA_DIR / "meta"
 APP_DIR = Path("app")
-META_DIR = Path("data/meta")
-LABELS_DIR = Path("data/labels")
 
 
-def read_table(parq: Path, csv: Path) -> pd.DataFrame:
+def read_table(parq: Path, csv: Path) -> tuple[pd.DataFrame, str]:
     if parq.exists():
-        return pd.read_parquet(parq)
+        return pd.read_parquet(parq).copy(), str(parq)
     if csv.exists():
-        return pd.read_csv(csv)
+        return pd.read_csv(csv).copy(), str(csv)
     raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
 
 
-def parse_csv_list(s: str) -> list[str]:
-    if s is None:
-        return []
-    items = [x.strip() for x in str(s).split(",")]
-    return [x for x in items if x]
+def norm_date(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
-def resolve_feature_cols(args_features: str) -> tuple[list[str], str]:
+def resolve_feature_cols_ssot() -> tuple[list[str], str]:
+    cols, _sector_enabled = read_feature_cols_meta()
+    if cols:
+        return cols, "data/meta/feature_cols.json"
+    cols = get_feature_cols(sector_enabled=False)
+    return cols, "scripts/feature_spec.py:get_feature_cols(sector_enabled=False)"
+
+
+def pick_tail_target_column(df: pd.DataFrame, src: str) -> str:
     """
-    Priority:
-      1) --features (explicit override)
-      2) data/meta/feature_cols.json (SSOT written by build_features.py)
-      3) fallback SSOT default (sector disabled)
-    Returns: (feature_cols, source_string)
+    ✅ FIX: label 파일에 TailTarget이 아니라 p_tail이 있을 수 있음.
+    우선순위:
+      1) p_tail
+      2) TailTarget
+      3) tail_target
     """
-    override = parse_csv_list(args_features)
-    if override:
-        return [str(c).strip() for c in override if str(c).strip()], "--features"
-
-    cols_meta, _sector_enabled = read_feature_cols_meta()
-    if cols_meta:
-        return cols_meta, "data/meta/feature_cols.json"
-
-    return get_feature_cols(sector_enabled=False), "feature_spec.py (fallback)"
-
-
-def ensure_feature_columns_strict(df: pd.DataFrame, feat_cols: list[str], source_hint: str = "") -> None:
-    missing = [c for c in feat_cols if c not in df.columns]
-    if missing:
-        hint = f" (src={source_hint})" if source_hint else ""
-        raise ValueError(
-            f"Missing feature columns{hint}: {missing}\n"
-            f"-> build_tail_labels.py가 SSOT feature_cols를 포함하도록 먼저 맞춰져 있어야 함."
-        )
-
-
-def coerce_features_numeric(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
-    df = df.copy()
-    for c in feat_cols:
-        df[c] = (
-            pd.to_numeric(df[c], errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(0.0)
-            .astype(float)
-        )
-    return df
-
-
-def _date_based_train_test_split(df: pd.DataFrame, date_col: str, train_ratio: float) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """
-    ✅ row split 금지: Date 단위로 split
-    Returns: (train_df, test_df, cut_date_str)
-    """
-    d = pd.to_datetime(df[date_col], errors="coerce").dt.tz_localize(None)
-    uniq = pd.Series(d.dropna().unique()).sort_values().to_list()
-    if len(uniq) < 10:
-        raise RuntimeError(f"Not enough unique dates for split: {len(uniq)}")
-
-    cut_i = int(len(uniq) * float(train_ratio)) - 1
-    cut_i = max(0, min(cut_i, len(uniq) - 2))  # test 최소 1일 확보
-    cut_date = pd.Timestamp(uniq[cut_i])
-
-    train_df = df.loc[pd.to_datetime(df[date_col], errors="coerce").dt.tz_localize(None) <= cut_date].copy()
-    test_df = df.loc[pd.to_datetime(df[date_col], errors="coerce").dt.tz_localize(None) > cut_date].copy()
-
-    if len(train_df) < 50 or len(test_df) < 50:
-        raise RuntimeError(f"Split too small. train={len(train_df)} test={len(test_df)} cut_date={cut_date.date()}")
-
-    return train_df, test_df, str(cut_date.date())
-
-
-def _make_date_cv_splits(df_train: pd.DataFrame, date_col: str, n_splits: int) -> list[tuple[np.ndarray, np.ndarray]]:
-    """
-    ✅ CV도 Date 단위로만 진행 (같은 날짜 혼재 방지)
-    CalibratedClassifierCV(cv=...)에 넣을 수 있는 (train_idx, val_idx) list 반환
-    """
-    d = pd.to_datetime(df_train[date_col], errors="coerce").dt.tz_localize(None)
-    uniq_dates = pd.Series(d.dropna().unique()).sort_values().to_list()
-
-    if len(uniq_dates) < (n_splits + 2):
-        # 데이터가 적으면 splits를 줄임
-        n_splits = max(2, min(int(n_splits), max(2, len(uniq_dates) - 2)))
-
-    if len(uniq_dates) < 4:
-        raise RuntimeError(f"Not enough unique dates for CV: {len(uniq_dates)}")
-
-    date_to_id = {pd.Timestamp(x): i for i, x in enumerate(uniq_dates)}
-    date_ids = d.map(lambda x: date_to_id.get(pd.Timestamp(x), -1)).to_numpy(dtype=int)
-
-    tscv = TimeSeriesSplit(n_splits=int(n_splits))
-    U = len(uniq_dates)
-    dummy = np.arange(U)
-
-    splits: list[tuple[np.ndarray, np.ndarray]] = []
-    for tr_u, te_u in tscv.split(dummy):
-        tr_mask = np.isin(date_ids, tr_u)
-        te_mask = np.isin(date_ids, te_u)
-        tr_idx = np.where(tr_mask)[0]
-        te_idx = np.where(te_mask)[0]
-        if len(tr_idx) == 0 or len(te_idx) == 0:
-            continue
-        splits.append((tr_idx, te_idx))
-
-    if not splits:
-        raise RuntimeError("Failed to build date-based CV splits.")
-    return splits
-
-
-def _fit_model(X_train_s, y_train, cv_splits, max_iter: int):
-    base = LogisticRegression(max_iter=int(max_iter))
-    try:
-        clf = CalibratedClassifierCV(estimator=base, method="isotonic", cv=cv_splits)
-    except TypeError:
-        clf = CalibratedClassifierCV(base_estimator=base, method="isotonic", cv=cv_splits)
-    clf.fit(X_train_s, y_train)
-    return clf
+    candidates = ["p_tail", "TailTarget", "tail_target"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise ValueError(
+        f"Tail target column missing. expected one of {candidates} (labels_src={src}) "
+        f"cols={list(df.columns)[:30]}"
+    )
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--profit-target", required=True, type=float)
-    ap.add_argument("--max-days", required=True, type=int)
-    ap.add_argument("--stop-level", required=True, type=float)
-    ap.add_argument("--max-extend-days", required=True, type=int)
+    ap = argparse.ArgumentParser(description="Train tail model (p_tail classifier) aligned with SSOT features.")
+    ap.add_argument("--profit-target", type=float, required=True)
+    ap.add_argument("--max-days", type=int, required=True)
+    ap.add_argument("--stop-level", type=float, required=True)
+    ap.add_argument("--max-extend-days", type=int, required=True)
 
-    # default: SSOT/meta. override only if you really want.
-    ap.add_argument("--features", default="", type=str, help="comma-separated feature cols (override SSOT/meta)")
+    ap.add_argument("--train-ratio", type=float, default=0.8)
+    ap.add_argument("--max-iter", type=int, default=800)
 
-    ap.add_argument("--train-ratio", default=0.8, type=float)
-    ap.add_argument("--n-splits", default=3, type=int)
-    ap.add_argument("--max-iter", default=500, type=int)
     args = ap.parse_args()
 
-    pt_tag = int(round(args.profit_target * 100))
-    sl_tag = int(round(abs(args.stop_level) * 100))
-    tag = f"pt{pt_tag}_h{args.max_days}_sl{sl_tag}_ex{args.max_extend_days}"
+    pt100 = int(round(float(args.profit_target) * 100))
+    H = int(args.max_days)
+    sl100 = int(round(abs(float(args.stop_level)) * 100))
+    ex = int(args.max_extend_days)
 
-    # ✅ A안 SSOT: labels_tail_{tag}만 허용 (fallback 제거)
-    parq = LABELS_DIR / f"labels_tail_{tag}.parquet"
-    csv = LABELS_DIR / f"labels_tail_{tag}.csv"
-    if not parq.exists() and not csv.exists():
-        raise FileNotFoundError(
-            f"Missing tail labels for tag={tag}.\n"
-            f"-> expected: {parq} (or {csv})\n"
-            f"-> run: python scripts/build_tail_labels.py --profit-target ... --max-days ... --stop-level ... --max-extend-days ..."
+    tag = f"pt{pt100}_h{H}_sl{sl100}_ex{ex}"
+
+    labels_parq = LABELS_DIR / f"labels_tail_{tag}.parquet"
+    labels_csv = LABELS_DIR / f"labels_tail_{tag}.csv"
+
+    feats_parq = FEATURES_DIR / "features_model.parquet"
+    feats_csv = FEATURES_DIR / "features_model.csv"
+
+    labels_df, src = read_table(labels_parq, labels_csv)
+    feats_df, feats_src = read_table(feats_parq, feats_csv)
+
+    # normalize keys
+    for df in (labels_df, feats_df):
+        df["Date"] = norm_date(df["Date"])
+        df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    labels_df = labels_df.dropna(subset=["Date", "Ticker"]).copy()
+    feats_df = feats_df.dropna(subset=["Date", "Ticker"]).copy()
+
+    # ✅ pick correct target
+    target_col = pick_tail_target_column(labels_df, src)
+
+    # SSOT feature cols
+    feat_cols, feat_src = resolve_feature_cols_ssot()
+    feat_cols = [c.strip() for c in feat_cols if c.strip()]
+    if len(feat_cols) != 18:
+        raise RuntimeError(f"SSOT feature cols must be 18, got {len(feat_cols)} from {feat_src}: {feat_cols}")
+    if "RelStrength" not in feat_cols:
+        raise RuntimeError(f"SSOT must include RelStrength (src={feat_src}). got={feat_cols}")
+
+    missing = [c for c in feat_cols if c not in feats_df.columns]
+    if missing:
+        raise RuntimeError(
+            f"features_model missing SSOT columns: {missing}\n"
+            f"-> features_src={feats_src}\n"
+            f"-> ssot_src={feat_src}"
         )
 
-    df = read_table(parq, csv).copy()
-    src = str(parq if parq.exists() else csv)
+    # merge
+    df = feats_df[["Date", "Ticker"] + feat_cols].merge(
+        labels_df[["Date", "Ticker", target_col]],
+        on=["Date", "Ticker"],
+        how="inner",
+    )
+    if df.empty:
+        raise RuntimeError("No overlap between features_model and labels_tail. Check date/ticker ranges.")
 
-    if "Date" not in df.columns:
-        raise ValueError(f"Date column missing (labels_src={src})")
+    # numeric coercion
+    for c in feat_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
-    df = df.dropna(subset=["Date"]).sort_values(["Date"]).reset_index(drop=True)
+    y = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int).clip(0, 1).to_numpy(dtype=int)
+    if len(np.unique(y)) < 2:
+        raise RuntimeError(f"Tail target has only one class after merge. target_col={target_col}")
 
-    if "TailTarget" not in df.columns:
-        raise ValueError(f"TailTarget column missing (labels_src={src})")
+    df = df.sort_values("Date").reset_index(drop=True)
+    X = df[feat_cols].to_numpy(dtype=float)
 
-    feat_cols, feat_src = resolve_feature_cols(args.features)
-    feat_cols = [str(c).strip() for c in feat_cols if str(c).strip()]
+    # time split (by row after sorting; acceptable since Date is sorted and join is stable)
+    n = len(df)
+    cut = int(n * float(args.train_ratio))
+    cut = max(100, min(cut, n - 100))
 
-    # STRICT: missing features -> fail fast
-    ensure_feature_columns_strict(df, feat_cols, source_hint=f"{feat_src}, labels_src={src}")
-
-    df = coerce_features_numeric(df, feat_cols)
-
-    use = df.dropna(subset=feat_cols + ["TailTarget"]).copy()
-    y_all = pd.to_numeric(use["TailTarget"], errors="coerce").fillna(0).astype(int).to_numpy()
-
-    if len(use) < 200:
-        raise RuntimeError(f"Not enough training rows: {len(use)} (labels_src={src})")
-
-    if len(np.unique(y_all)) < 2:
-        raise RuntimeError(f"TailTarget has only one class in training data (labels_src={src}).")
-
-    # ✅ Date-based train/test split
-    train_df, test_df, cut_date = _date_based_train_test_split(use, date_col="Date", train_ratio=float(args.train_ratio))
-
-    y_train = pd.to_numeric(train_df["TailTarget"], errors="coerce").fillna(0).astype(int).to_numpy()
-    X_train = train_df[feat_cols].to_numpy(dtype=float)
-
-    y_test = pd.to_numeric(test_df["TailTarget"], errors="coerce").fillna(0).astype(int).to_numpy()
-    X_test = test_df[feat_cols].to_numpy(dtype=float)
+    X_train, X_test = X[:cut], X[cut:]
+    y_train, y_test = y[:cut], y[cut:]
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    # ✅ Date-based CV splits
-    cv_splits = _make_date_cv_splits(train_df, date_col="Date", n_splits=int(args.n_splits))
+    # LogisticRegression (keep args minimal for maximum compatibility)
+    model = LogisticRegression(solver="lbfgs", max_iter=int(args.max_iter))
+    model.fit(X_train_s, y_train)
 
-    model = _fit_model(X_train_s, y_train, cv_splits=cv_splits, max_iter=int(args.max_iter))
-
-    probs = model.predict_proba(X_test_s)[:, 1]
-    auc = float("nan")
-    if len(np.unique(y_test)) > 1:
-        auc = float(roc_auc_score(y_test, probs))
+    proba = model.predict_proba(X_test_s)[:, 1]
+    ll = float(log_loss(y_test, np.vstack([1 - proba, proba]).T, labels=[0, 1]))
 
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    META_DIR.mkdir(parents=True, exist_ok=True)
-
-    out_model = APP_DIR / "tail_model.pkl"
-    out_scaler = APP_DIR / "tail_scaler.pkl"
-    joblib.dump(model, out_model)
-    joblib.dump(scaler, out_scaler)
+    model_path = APP_DIR / "tail_model.pkl"
+    scaler_path = APP_DIR / "tail_scaler.pkl"
+    joblib.dump(model, model_path)
+    joblib.dump(scaler, scaler_path)
 
     report = {
         "tag": tag,
-        "labels_src": src,
-
-        "rows_used": int(len(use)),
-        "train_rows": int(len(train_df)),
-        "test_rows": int(len(test_df)),
-        "cut_date": cut_date,
-
-        "feature_cols_source": feat_src,
+        "labels_source": src,
+        "features_source": feats_src,
+        "ssot_feature_cols_source": feat_src,
         "feature_cols": feat_cols,
-
-        "auc": (round(auc, 6) if np.isfinite(auc) else None),
-        "base_rate_test": (round(float(np.mean(y_test)), 6) if len(y_test) else None),
-        "pred_mean_test": (round(float(np.mean(probs)), 6) if len(probs) else None),
-
-        "n_splits": int(len(cv_splits)),
-        "paths": {"model": str(out_model), "scaler": str(out_scaler)},
+        "target_col_used": target_col,
+        "n_rows": int(n),
+        "train_ratio": float(args.train_ratio),
+        "n_train": int(len(y_train)),
+        "n_test": int(len(y_test)),
+        "test_logloss": ll,
+        "class_counts_train": {str(k): int(v) for k, v in pd.Series(y_train).value_counts().to_dict().items()},
+        "class_counts_test": {str(k): int(v) for k, v in pd.Series(y_test).value_counts().to_dict().items()},
     }
-    (META_DIR / f"train_tail_report_{tag}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    print("=" * 60)
-    print("[DONE] train_tail_model.py (A + date-split/CV)")
-    print("tag:", tag)
-    print("labels_src:", src)
-    print("cut_date(train<=):", cut_date)
-    print("AUC:", report["auc"])
-    print("base_rate_test:", report["base_rate_test"])
-    print("pred_mean_test:", report["pred_mean_test"])
-    print("feature_cols_source:", feat_src)
-    print("features:", feat_cols)
-    print("n_splits(date-cv):", report["n_splits"])
-    print("=" * 60)
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    rep_path = META_DIR / f"train_tail_report_{tag}.json"
+    with open(rep_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    print(f"[DONE] saved model: {model_path}")
+    print(f"[DONE] saved scaler: {scaler_path}")
+    print(f"[DONE] wrote report: {rep_path}")
+    print(f"[INFO] test logloss={ll:.6f} target_col={target_col}")
 
 
 if __name__ == "__main__":
