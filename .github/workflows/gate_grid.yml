@@ -278,9 +278,6 @@ jobs:
 
           # ✅ (2) 그 다음 tau labels 생성 (features_scored에 p_success/p_tail 있어야 함)
           if [ -f scripts/build_tau_labels.py ]; then
-            # labels_tau가 캐시로 남아있으면 "옛날 p_success/p_tail"로 만들어진 걸 수 있어서
-            # 안전하게 태우려면 아래 rm을 켜도 됨 (원하면 켜)
-            # rm -f data/labels/labels_tau.parquet data/labels/labels_tau.csv || true
             if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
               python scripts/build_tau_labels.py \
                 --profit-target "${PROFIT_TARGET}" \
@@ -308,6 +305,21 @@ jobs:
 
           # ✅ (4) score_features 2차: tau_model을 읽어서 tau_class/tau_pmax/tau_H 채움 (덮어쓰기)
           python scripts/score_features.py --tag "${LABEL_KEY}"
+
+          # ✅ (5) features_scored.parquet -> features_scored.csv 생성 (아티팩트로 받기용)
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+          p = Path("data/features/features_scored.parquet")
+          out = Path("data/features/features_scored.csv")
+          if p.exists():
+              df = pd.read_parquet(p)
+              out.parent.mkdir(parents=True, exist_ok=True)
+              df.to_csv(out, index=False)
+              print(f"[DONE] wrote {out} rows={len(df)}")
+          else:
+              print("[WARN] missing data/features/features_scored.parquet -> cannot write CSV")
+          PY
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
@@ -339,4 +351,6 @@ jobs:
             data/signals/picks_meta_*.json
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
+            data/features/features_scored.csv
+            data/features/features_scored.parquet
           if-no-files-found: error
