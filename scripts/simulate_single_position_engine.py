@@ -10,9 +10,6 @@ import numpy as np
 import pandas as pd
 
 
-TAU_CLASS_TO_H = {0: 20, 1: 40, 2: 60}
-
-
 def read_table(parq: str, csv: str) -> pd.DataFrame:
     p = Path(parq)
     c = Path(csv)
@@ -187,6 +184,29 @@ def load_feat_map(features_parq: str, features_csv: str) -> pd.DataFrame:
     return df
 
 
+def parse_tau_h_map(s: str) -> list[int]:
+    parts = [p.strip() for p in (s or "").split(",") if p.strip()]
+    if not parts:
+        return [30, 40, 50]
+    out: list[int] = []
+    for p in parts:
+        try:
+            out.append(int(float(p)))
+        except Exception:
+            pass
+    return out if out else [30, 40, 50]
+
+
+def class_to_h(cls: int, hmap: list[int]) -> int:
+    if not hmap:
+        return 40
+    if cls < 0:
+        return hmap[0]
+    if cls >= len(hmap):
+        return hmap[-1]
+    return hmap[cls]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
@@ -204,6 +224,8 @@ def main() -> None:
             "   none : no extra cap after TP1 (legacy behavior)\n"
             "   h2   : after first TP1, allow only +H//2 holding days then force close\n"
             "   total: after first TP1, force close when holding_days >= H + H//2\n"
+            "NEW (tau mapping stabilization for fair comparison):\n"
+            " - --tau-h-map 30,40,50 (used when tau_H missing; or when only tau_class exists)\n"
         )
     )
 
@@ -236,6 +258,9 @@ def main() -> None:
     # ✅ NEW: period cap policy after TP1
     ap.add_argument("--tp1-hold-cap", default="none", type=str, choices=["none", "h2", "total"])
 
+    # ✅ NEW: tau class -> H mapping (fallback / stabilization)
+    ap.add_argument("--tau-h-map", default="30,40,50", type=str)
+
     # re-eval thresholds
     ap.add_argument("--reval-ps-strong", default=0.70, type=float)
     ap.add_argument("--reval-pt-strong", default=0.20, type=float)
@@ -254,6 +279,8 @@ def main() -> None:
     tp1_hold_cap = str(args.tp1_hold_cap).lower().strip()
     if tp1_hold_cap not in ("none", "h2", "total"):
         raise ValueError("--tp1-hold-cap must be one of: none|h2|total")
+
+    hmap = parse_tau_h_map(args.tau_h_map)
 
     topk = int(args.topk)
     if topk < 1 or topk > 2:
@@ -364,6 +391,8 @@ def main() -> None:
             "TP1HoldCapDays": tp1_cap,
             "TotalHoldCapDays": total_cap,
             "TP1FirstHoldingDay": int(st.tp1_first_holding_day),
+
+            "TauHMap": ",".join([str(x) for x in hmap]),
 
             "GraceDays": int(st.grace_days_total),
             "RevalStrength": st.reval_strength,
@@ -665,7 +694,10 @@ def main() -> None:
                 if len(valid) >= 1:
                     chosen = valid[:topk]
 
-                    # decide H from tau_H (use max across legs); fallback to args.max_days
+                    # ✅ decide H from features_scored:
+                    #   1) tau_H (preferred)
+                    #   2) tau_class -> tau-h-map
+                    #   3) fallback to middle of hmap (default 40)
                     Hs = []
                     if not feat_map.empty:
                         for t in chosen:
@@ -675,12 +707,19 @@ def main() -> None:
                                     hh = int(row["tau_H"])
                                     if hh > 0:
                                         Hs.append(hh)
+                                elif "tau_class" in row.index:
+                                    cls = int(row["tau_class"])
+                                    hh = int(class_to_h(cls, hmap))
+                                    if hh > 0:
+                                        Hs.append(hh)
                             except Exception:
                                 pass
-                    H_eff = int(max(Hs)) if Hs else int(args.max_days)
+
+                    fallback_H = int(hmap[1] if len(hmap) >= 2 else (hmap[0] if hmap else 40))
+                    H_eff = int(max(Hs)) if Hs else int(fallback_H)
                     H_eff = int(max(1, H_eff))
 
-                    # ✅ NEW: HARD RESET totals right before starting a new cycle
+                    # ✅ HARD RESET totals right before starting a new cycle
                     st.cycle_buy_total = 0.0
                     st.cycle_sell_total = 0.0
 
