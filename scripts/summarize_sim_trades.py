@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import os  # ✅ NEW
 import pandas as pd
 import numpy as np
 
@@ -109,6 +110,7 @@ def _reason_counts(trades: pd.DataFrame) -> dict[str, int]:
         }
 
     r = trades["Reason"].astype(str).fillna("")
+
     def _cnt(prefix: str) -> int:
         return int((r.str.startswith(prefix)).sum())
 
@@ -346,9 +348,16 @@ def main() -> None:
     if np.isfinite(st["MaxHoldingDaysObserved"]):
         max_extend_obs = float(max(0.0, float(st["MaxHoldingDaysObserved"]) - float(args.max_days)))
 
+    # ✅ NEW: tau split label injected from workflow (e.g. cur / q255025)
+    tau_split = (os.getenv("TAU_SPLIT", "") or "").strip()
+
     out = {
         "TAG": args.tag,
         "GateSuffix": args.suffix,
+
+        # ✅ NEW (for merging current vs 25/50/25 into one aggregate)
+        "TauSplit": tau_split,
+
         "ProfitTarget": float(args.profit_target),
         "MaxHoldingDays": int(args.max_days),
         "StopLevel": float(args.stop_level),
