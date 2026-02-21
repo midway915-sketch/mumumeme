@@ -274,7 +274,7 @@ def main() -> None:
 
     out = pd.DataFrame(rows)
 
-    # ---- robust numeric conversions for scoring columns (✅ NEW cols included)
+    # ---- robust numeric conversions for scoring columns
     num_cols = [
         "Recent10Y_SeedMultiple", "SeedMultiple",
         "MaxHoldingDaysObserved", "MaxExtendDaysObserved",
@@ -283,7 +283,7 @@ def main() -> None:
         "CAGR_AfterWarmup", "QQQ_CAGR_SamePeriod", "ExcessCAGR_AfterWarmup",
         "IdlePctAfterWarmup",
         "QQQ_SeedMultiple_SamePeriod",
-        # summarize_sim_trades.py NEW (existing)
+        # summarize_sim_trades.py (existing)
         "TrailEntryCountTotal", "TrailEntryCountPerCycleAvg", "MaxCyclePeakReturn",
         # ✅ summarize_sim_trades.py NEW (realized return stats)
         "MaxCycleReturn", "P95CycleReturn", "MedianCycleReturn", "MeanCycleReturn",
@@ -298,8 +298,7 @@ def main() -> None:
         sm = out["SeedMultiple"].astype(float)
         out["SeedMultiple_LevAdj"] = sm / (1.0 + lev)
 
-    # ---- ✅ NEW: risk-ish score (optional)
-    # 목적: SeedMultiple은 그대로 보되, "너무 레버/너무 idle/트레일링 과다/피크 과열"은 살짝 눌러줌
+    # ---- risk-ish score (optional) (※ 그대로 둠)
     if "SeedMultiple" in out.columns:
         sm = out["SeedMultiple"].astype(float)
 
@@ -309,7 +308,6 @@ def main() -> None:
         trail = out["TrailEntryCountPerCycleAvg"].fillna(0.0) if "TrailEntryCountPerCycleAvg" in out.columns else 0.0
         peak = out["MaxCyclePeakReturn"].fillna(0.0) if "MaxCyclePeakReturn" in out.columns else 0.0
 
-        # penalty terms (약하게)
         pen = (0.25 * lev) + (0.15 * idle) + (0.05 * trail) + (0.03 * np.maximum(0.0, peak - 0.50))
         out["RiskAdjScore"] = sm / (1.0 + pen)
 
@@ -343,7 +341,7 @@ def main() -> None:
     top.to_csv(top_path, index=False)
     print(f"[DONE] wrote top: {top_path} rows={len(top)}")
 
-    # ---- quick headline (정렬은 안 바꾸고, 표시만 추가)
+    # ---- quick headline (표시만 추가)
     if len(out):
         best = out.iloc[0].to_dict()
         print("=" * 60)
@@ -355,7 +353,12 @@ def main() -> None:
         print(f"IdlePctAfterWarmup={best.get('IdlePctAfterWarmup')}  MaxLevPct={best.get('MaxLeveragePct')}")
         print(f"TrailAvg={best.get('TrailEntryCountPerCycleAvg')}  PeakCycleRet={best.get('MaxCyclePeakReturn')}")
         # ✅ realized returns display
-        print(f"MaxCycleReturn={best.get('MaxCycleReturn')}  P95={best.get('P95CycleReturn')}  Median={best.get('MedianCycleReturn')}  Mean={best.get('MeanCycleReturn')}")
+        print(
+            f"MaxCycleReturn={best.get('MaxCycleReturn')}  "
+            f"P95={best.get('P95CycleReturn')}  "
+            f"Median={best.get('MedianCycleReturn')}  "
+            f"Mean={best.get('MeanCycleReturn')}"
+        )
         print("=" * 60)
 
 
