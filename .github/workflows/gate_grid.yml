@@ -19,33 +19,33 @@ on:
       p_tail_thresholds:
         description: "comma-separated p_tail thresholds (e.g. 0.10,0.20,0.30)"
         required: true
-        default: "0.10,0.20,0.30"
+        default: "0.05,0.10,0.20"
       utility_quantiles:
         description: "comma-separated utility quantiles (e.g. 0.60,0.75,0.90)"
         required: true
-        default: "0.60,0.75,0.90"
+        default: "0.20,0.40"
       ps_mins:
         description: "comma-separated p_success minimum cutoffs (e.g. 0.50,0.60,0.70)"
         required: true
-        default: "0.00,0.50,0.60,0.70"
+        default: "0.00,0.05,0.10,0.50"
       rank_metrics:
         description: "comma-separated rank metric (utility|ret_score|p_success). e.g. utility,ret_score"
         required: true
-        default: "utility,ret_score"
+        default: "utility,ret_score,p_success"
       lambda_tail:
         description: "utility tail penalty lambda (single float, e.g. 0.05)"
         required: true
-        default: "0.05"
+        default: "0.05,0.10"
 
       rebuild_all:
         description: "true to rebuild prices/features/labels/models from scratch"
         required: true
-        default: "false"
+        default: "true"
 
       dedup_picks:
         description: "true=dedupe picks (skip duplicate hashes), false=run all"
         required: true
-        default: "true"
+        default: "false"
 
   schedule:
     - cron: "10 23 * * *"
@@ -73,8 +73,8 @@ jobs:
       GATE_MODES: "none,tail,utility,tail_utility"
 
       ENABLE_TRAILING: "true"
-      TP1_FRAC: "0.50"
-      TRAIL_STOPS: "0.08,0.10,0.12"
+      TP1_FRAC: "0.00,0.50,1.00"
+      TRAIL_STOPS: "0.05,0.08,0.10,0.20"
 
       # ✅ TopK2 제거
       TOPK_CONFIGS: "1|1.0"
