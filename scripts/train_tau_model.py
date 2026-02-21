@@ -166,7 +166,7 @@ def _coerce_tau_class(y: pd.Series) -> np.ndarray:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train tau (FAST/MID/SLOW) multi-class model. (A + date-split/CV)")
 
-    # ✅ A안: tag 필수 (labels_tau_{tag} 강제)
+    # ✅ tag는 계속 받되, tau labels 파일은 tagged/legacy 둘 다 허용 (workflow 호환)
     ap.add_argument("--tag", required=True, type=str, help="e.g. pt10_h40_sl10_ex20")
 
     ap.add_argument("--features-parq", default=str(FEATURES_DIR / "features_model.parquet"), type=str)
@@ -190,28 +190,48 @@ def main() -> None:
 
     tag = (args.tag or "").strip()
     if not tag:
-        raise ValueError("--tag is required (A mode).")
+        raise ValueError("--tag is required.")
 
-    # ✅ A안: labels_tau_{tag}만 허용 (fallback 제거)
-    labels_parq = LABELS_DIR / f"labels_tau_{tag}.parquet"
-    labels_csv = LABELS_DIR / f"labels_tau_{tag}.csv"
-    if not labels_parq.exists() and not labels_csv.exists():
+    # ✅ tau labels path resolution
+    # Priority:
+    #   1) tagged labels: data/labels/labels_tau_{tag}.parquet|csv
+    #   2) legacy untagged labels: data/labels/labels_tau.parquet|csv  (workflow/older script output)
+    tagged_parq = LABELS_DIR / f"labels_tau_{tag}.parquet"
+    tagged_csv = LABELS_DIR / f"labels_tau_{tag}.csv"
+    legacy_parq = LABELS_DIR / "labels_tau.parquet"
+    legacy_csv = LABELS_DIR / "labels_tau.csv"
+
+    labels_parq = tagged_parq
+    labels_csv = tagged_csv
+    labels_name = f"labels_tau_{tag}"
+
+    if labels_parq.exists() or labels_csv.exists():
+        pass
+    elif legacy_parq.exists() or legacy_csv.exists():
+        print(
+            f"[WARN] tagged tau labels not found for tag={tag}. "
+            f"Falling back to legacy tau labels: {legacy_parq} (or {legacy_csv})"
+        )
+        labels_parq, labels_csv = legacy_parq, legacy_csv
+        labels_name = "labels_tau (legacy)"
+    else:
         raise FileNotFoundError(
             f"Missing tau labels for tag={tag}.\n"
-            f"-> expected: {labels_parq} (or {labels_csv})\n"
-            f"-> run: python scripts/build_tau_labels.py ... (and make it write labels_tau_{tag}.*)"
+            f"-> expected (tagged): {tagged_parq} (or {tagged_csv})\n"
+            f"-> or (legacy): {legacy_parq} (or {legacy_csv})\n"
+            f"-> run: python scripts/build_tau_labels.py ... (and make it write labels_tau*.parquet/csv)"
         )
 
     feats = read_table(Path(args.features_parq), Path(args.features_csv)).copy()
     labs = read_table(labels_parq, labels_csv).copy()
 
     # basic schema checks
-    for df, name in [(feats, "features_model"), (labs, f"labels_tau_{tag}")]:
+    for df, name in [(feats, "features_model"), (labs, labels_name)]:
         if args.date_col not in df.columns or args.ticker_col not in df.columns:
             raise KeyError(f"{name} must have {args.date_col},{args.ticker_col}")
 
     if args.target_col not in labs.columns:
-        raise KeyError(f"labels_tau_{tag} missing target column: {args.target_col}")
+        raise KeyError(f"{labels_name} missing target column: {args.target_col}")
 
     # normalize keys
     feats[args.date_col] = norm_date(feats[args.date_col])
@@ -260,98 +280,95 @@ def main() -> None:
         raise RuntimeError("TauClass has only one class in data. Cannot train multinomial model.")
 
     # ✅ Date-based train/test split
-    df_train, df_test, cut_date = _date_based_train_test_split(df, date_col=args.date_col, train_ratio=float(args.train_ratio))
+    train_df, test_df, cut_date = _date_based_train_test_split(df, args.date_col, float(args.train_ratio))
+    y_train = _coerce_tau_class(train_df[args.target_col])
+    y_test = _coerce_tau_class(test_df[args.target_col])
 
-    y_train = _coerce_tau_class(df_train[args.target_col])
-    X_train = df_train[feat_cols].to_numpy(dtype=float)
+    X_train = train_df[feat_cols].to_numpy(dtype=float)
+    X_test = test_df[feat_cols].to_numpy(dtype=float)
 
-    y_test = _coerce_tau_class(df_test[args.target_col])
-    X_test = df_test[feat_cols].to_numpy(dtype=float)
-
+    # scaler
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    # multinomial logistic
-    base_model = LogisticRegression(
-        max_iter=int(args.max_iter),
+    # CV (date-based)
+    splits = _make_date_cv_splits(train_df, args.date_col, int(args.n_splits))
+
+    # Model: multinomial logistic regression
+    model = LogisticRegression(
         multi_class="multinomial",
         solver="lbfgs",
-        class_weight="balanced",
+        max_iter=int(args.max_iter),
+        n_jobs=1,
     )
 
-    # ✅ Date-based CV splits (train only)
-    cv_splits = _make_date_cv_splits(df_train, date_col=args.date_col, n_splits=int(args.n_splits))
+    # Fold eval
+    fold_losses: list[float] = []
+    for i, (tr_idx, va_idx) in enumerate(splits, start=1):
+        X_tr = X_train_s[tr_idx]
+        y_tr = y_train[tr_idx]
+        X_va = X_train_s[va_idx]
+        y_va = y_train[va_idx]
 
-    cv_losses = []
-    for tr_idx, va_idx in cv_splits:
         m = LogisticRegression(
-            max_iter=int(args.max_iter),
             multi_class="multinomial",
             solver="lbfgs",
-            class_weight="balanced",
+            max_iter=int(args.max_iter),
+            n_jobs=1,
         )
-        m.fit(X_train_s[tr_idx], y_train[tr_idx])
-        p_va = m.predict_proba(X_train_s[va_idx])
-        cv_losses.append(log_loss(y_train[va_idx], p_va, labels=[0, 1, 2]))
+        m.fit(X_tr, y_tr)
 
-    # fit final
-    base_model.fit(X_train_s, y_train)
+        proba = m.predict_proba(X_va)
+        ll = float(log_loss(y_va, proba, labels=[0, 1, 2]))
+        fold_losses.append(ll)
+        print(f"[INFO] fold={i} logloss={ll:.6f} n_tr={len(tr_idx)} n_va={len(va_idx)}")
 
-    ll_test = float("nan")
-    if len(X_test_s) > 0:
-        p_test = base_model.predict_proba(X_test_s)
-        ll_test = float(log_loss(y_test, p_test, labels=[0, 1, 2]))
+    # Fit full train
+    model.fit(X_train_s, y_train)
 
-    print("=" * 60)
-    print(f"[INFO] tag={tag}")
-    print(f"[INFO] rows={n} train={len(X_train)} test={len(X_test)} cut_date(train<=)={cut_date}")
-    print(f"[INFO] feature_cols_source: {feat_src}")
-    print(f"[INFO] CV logloss (date folds): {np.round(cv_losses, 4).tolist()} mean={float(np.mean(cv_losses)):.4f}")
-    print(f"[INFO] Test logloss: {ll_test:.4f}")
-    print(f"[INFO] Class distribution (all): {pd.Series(y_all).value_counts().to_dict()}")
-    print("=" * 60)
+    # Test eval
+    test_proba = model.predict_proba(X_test_s)
+    test_ll = float(log_loss(y_test, test_proba, labels=[0, 1, 2]))
 
     # outputs
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    META_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ✅ 파이프라인 호환: 기본은 고정 파일명
     out_model = Path(args.out_model) if args.out_model else (APP_DIR / "tau_model.pkl")
     out_scaler = Path(args.out_scaler) if args.out_scaler else (APP_DIR / "tau_scaler.pkl")
+    out_model.parent.mkdir(parents=True, exist_ok=True)
+    out_scaler.parent.mkdir(parents=True, exist_ok=True)
 
-    joblib.dump(base_model, out_model)
+    joblib.dump(model, out_model)
     joblib.dump(scaler, out_scaler)
     print(f"[DONE] saved model: {out_model}")
     print(f"[DONE] saved scaler: {out_scaler}")
 
+    # report
     report = {
         "tag": tag,
-        "labels_src": str(labels_parq if labels_parq.exists() else labels_csv),
-        "features_src": feats_src,
-
+        "labels_source": str(labels_parq if labels_parq.exists() else labels_csv),
+        "labels_name": labels_name,
+        "features_source": str(Path(args.features_parq)) if Path(args.features_parq).exists() else str(Path(args.features_csv)),
         "feature_cols_source": feat_src,
         "feature_cols": feat_cols,
-
-        "rows": int(n),
-        "train_rows": int(len(X_train)),
-        "test_rows": int(len(X_test)),
+        "n_rows_total": int(n),
+        "train_ratio": float(args.train_ratio),
         "cut_date": cut_date,
-
-        "cv_logloss": [float(x) for x in cv_losses],
-        "cv_logloss_mean": float(np.mean(cv_losses)) if cv_losses else None,
-        "test_logloss": ll_test,
-
-        "class_counts": {str(k): int(v) for k, v in pd.Series(y_all).value_counts().to_dict().items()},
-        "n_splits": int(len(cv_splits)),
-
-        "out_model": str(out_model),
-        "out_scaler": str(out_scaler),
+        "n_train": int(len(train_df)),
+        "n_test": int(len(test_df)),
+        "n_splits": int(len(splits)),
+        "cv_logloss_mean": float(np.mean(fold_losses)) if fold_losses else None,
+        "cv_logloss_std": float(np.std(fold_losses)) if fold_losses else None,
+        "test_logloss": float(test_ll),
+        "class_counts_train": {str(k): int(v) for k, v in pd.Series(y_train).value_counts().to_dict().items()},
+        "class_counts_test": {str(k): int(v) for k, v in pd.Series(y_test).value_counts().to_dict().items()},
     }
 
-    report_path = META_DIR / f"train_tau_report_{tag}.json"
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[DONE] wrote report: {report_path}")
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    rep_path = META_DIR / f"train_tau_report_{tag}.json"
+    with open(rep_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    print(f"[DONE] wrote report: {rep_path}")
+    print(f"[INFO] test logloss={test_ll:.6f} (cut_date={cut_date})")
 
 
 if __name__ == "__main__":
