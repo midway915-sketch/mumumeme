@@ -283,8 +283,10 @@ def main() -> None:
         "CAGR_AfterWarmup", "QQQ_CAGR_SamePeriod", "ExcessCAGR_AfterWarmup",
         "IdlePctAfterWarmup",
         "QQQ_SeedMultiple_SamePeriod",
-        # ✅ summarize_sim_trades.py NEW
+        # summarize_sim_trades.py NEW (existing)
         "TrailEntryCountTotal", "TrailEntryCountPerCycleAvg", "MaxCyclePeakReturn",
+        # ✅ summarize_sim_trades.py NEW (realized return stats)
+        "MaxCycleReturn", "P95CycleReturn", "MedianCycleReturn", "MeanCycleReturn",
     ]
     for c in num_cols:
         if c in out.columns:
@@ -311,7 +313,7 @@ def main() -> None:
         pen = (0.25 * lev) + (0.15 * idle) + (0.05 * trail) + (0.03 * np.maximum(0.0, peak - 0.50))
         out["RiskAdjScore"] = sm / (1.0 + pen)
 
-    # ---- sort aggregate
+    # ---- sort aggregate (※ 그대로 둠)
     sort_cols = []
     if "RiskAdjScore" in out.columns:
         sort_cols.append("RiskAdjScore")
@@ -341,7 +343,7 @@ def main() -> None:
     top.to_csv(top_path, index=False)
     print(f"[DONE] wrote top: {top_path} rows={len(top)}")
 
-    # ---- quick headline
+    # ---- quick headline (정렬은 안 바꾸고, 표시만 추가)
     if len(out):
         best = out.iloc[0].to_dict()
         print("=" * 60)
@@ -352,6 +354,8 @@ def main() -> None:
         print(f"CAGR_AfterWarmup={best.get('CAGR_AfterWarmup')}  QQQ_CAGR={best.get('QQQ_CAGR_SamePeriod')}  Excess={best.get('ExcessCAGR_AfterWarmup')}")
         print(f"IdlePctAfterWarmup={best.get('IdlePctAfterWarmup')}  MaxLevPct={best.get('MaxLeveragePct')}")
         print(f"TrailAvg={best.get('TrailEntryCountPerCycleAvg')}  PeakCycleRet={best.get('MaxCyclePeakReturn')}")
+        # ✅ realized returns display
+        print(f"MaxCycleReturn={best.get('MaxCycleReturn')}  P95={best.get('P95CycleReturn')}  Median={best.get('MedianCycleReturn')}  Mean={best.get('MeanCycleReturn')}")
         print("=" * 60)
 
 
