@@ -1,335 +1,363 @@
-name: gate-grid
+# scripts/aggregate_gate_grid.py
+from __future__ import annotations
 
-on:
-  workflow_dispatch:
-    inputs:
-      profit_target:
-        description: "profit target (e.g. 0.10)"
-        required: true
-        default: "0.10"
-      max_days:
-        description: "max holding days H (e.g. 40)"
-        required: true
-        default: "40"
-      stop_level:
-        description: "stop level (e.g. -0.10)"
-        required: true
-        default: "-0.10"
+import argparse
+from pathlib import Path
+import re
+import pandas as pd
+import numpy as np
 
-      p_tail_thresholds:
-        description: "comma-separated p_tail thresholds (e.g. 0.10,0.20,0.30)"
-        required: true
-        default: "0.10,0.20,0.30"
-      utility_quantiles:
-        description: "comma-separated utility quantiles (e.g. 0.60,0.75,0.90)"
-        required: true
-        default: "0.60,0.75,0.90"
-      ps_mins:
-        description: "comma-separated p_success minimum cutoffs (e.g. 0.50,0.60,0.70)"
-        required: true
-        default: "0.00,0.50,0.60,0.70"
-      rank_metrics:
-        description: "comma-separated rank metric (utility|ret_score|p_success). e.g. utility,ret_score"
-        required: true
-        default: "utility,ret_score"
-      lambda_tail:
-        description: "utility tail penalty lambda (single float, e.g. 0.05)"
-        required: true
-        default: "0.05"
 
-      rebuild_all:
-        description: "true to rebuild prices/features/labels/models from scratch"
-        required: true
-        default: "false"
+def _read_csv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path)
 
-      # ✅ 추가: dedupe 끄고 싶으면 false
-      dedup_picks:
-        description: "true=dedupe picks (skip duplicate hashes), false=run all"
-        required: true
-        default: "true"
 
-  schedule:
-    - cron: "10 23 * * *"
+def _read_prices(prices_parq: Path, prices_csv: Path) -> pd.DataFrame:
+    if prices_parq.exists():
+        df = pd.read_parquet(prices_parq)
+    elif prices_csv.exists():
+        df = pd.read_csv(prices_csv)
+    else:
+        raise FileNotFoundError(f"Missing prices: {prices_parq} (or {prices_csv})")
 
-jobs:
-  grid:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    if "Date" not in df.columns or "Ticker" not in df.columns:
+        raise ValueError("prices must have Date,Ticker")
+    if "Close" not in df.columns:
+        raise ValueError("prices missing Close")
 
-    env:
-      PROFIT_TARGET: ${{ github.event.inputs.profit_target || '0.10' }}
-      MAX_DAYS: ${{ github.event.inputs.max_days || '40' }}
-      STOP_LEVEL: ${{ github.event.inputs.stop_level || '-0.10' }}
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df = df.dropna(subset=["Date", "Ticker", "Close"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
+    return df
 
-      P_TAIL_THRESHOLDS: ${{ github.event.inputs.p_tail_thresholds || '0.10,0.20,0.30' }}
-      UTILITY_QUANTILES: ${{ github.event.inputs.utility_quantiles || '0.60,0.75,0.90' }}
-      PS_MINS: ${{ github.event.inputs.ps_mins || '0.00,0.50,0.60,0.70' }}
-      RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility,ret_score' }}
-      LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.05' }}
 
-      REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'false' }}
+def _find_suffix_from_summary_path(p: Path) -> str:
+    name = p.name
+    m = re.match(r"gate_summary_(.+)_gate_(.+)\.csv$", name)
+    if m:
+        return m.group(2)
+    return p.stem.replace("gate_summary_", "")
 
-      PRICE_START: "2015-02-21"
-      GATE_MODES: "none,tail,utility,tail_utility"
 
-      ENABLE_TRAILING: "true"
-      TP1_FRAC: "0.50"
-      TRAIL_STOPS: "0.08,0.10,0.12"
+def _curve_path(signals_dir: Path, tag: str, suffix: str) -> Path:
+    return signals_dir / f"sim_engine_curve_{tag}_gate_{suffix}.parquet"
 
-      TOPK_CONFIGS: "1|1.0;2|0.7,0.3;2|0.6,0.4"
-      MAX_LEVERAGE_PCT: "1.00"
 
-      OUT_DIR: "data/signals"
-      EXCLUDE_TICKERS: "SPY,^VIX"
-      REQUIRE_FILES: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl"
+def _trades_path(signals_dir: Path, tag: str, suffix: str) -> Path:
+    return signals_dir / f"sim_engine_trades_{tag}_gate_{suffix}.parquet"
 
-      # ✅ run_grid_workflow.sh에서 읽는 플래그
-      DEDUP_PICKS: ${{ github.event.inputs.dedup_picks || 'true' }}
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+def _safe_to_dt(x) -> pd.Series:
+    return pd.to_datetime(x, errors="coerce").dt.tz_localize(None)
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
-      - name: Install deps
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas numpy yfinance pyarrow scikit-learn joblib
-          fi
+def _calc_cagr(start_equity: float, end_equity: float, days: float) -> float:
+    if not np.isfinite(start_equity) or not np.isfinite(end_equity) or start_equity <= 0 or end_equity <= 0:
+        return float("nan")
+    if not np.isfinite(days) or days <= 0:
+        return float("nan")
+    years = days / 365.0
+    if years <= 0:
+        return float("nan")
+    return float((end_equity / start_equity) ** (1.0 / years) - 1.0)
 
-      - name: Ensure folders
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      - name: Set env keys (LABEL_KEY + MAX_EXTEND_DAYS auto)
-        shell: bash
-        run: |
-          set -euo pipefail
+def _qqq_stats(prices: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> tuple[float, float, float]:
+    q = prices.loc[prices["Ticker"] == "QQQ"].copy()
+    if q.empty:
+        return (float("nan"), float("nan"), float("nan"))
 
-          PT100="$(python - "$PROFIT_TARGET" <<'PY'
-          import sys
-          pt=float(sys.argv[1])
-          print(int(round(pt*100)))
-          PY
-          )"
-          SL100="$(python - "$STOP_LEVEL" <<'PY'
-          import sys
-          sl=float(sys.argv[1])
-          print(int(round(abs(sl)*100)))
-          PY
-          )"
-          echo "LABEL_KEY=pt${PT100}_h${MAX_DAYS}_sl${SL100}" >> "$GITHUB_ENV"
+    q = q.sort_values("Date")
 
-          MAX_EX="$(python - "$MAX_DAYS" <<'PY'
-          import sys
-          H=int(float(sys.argv[1]))
-          print(max(1, H//2))
-          PY
-          )"
-          echo "MAX_EXTEND_DAYS=${MAX_EX}" >> "$GITHUB_ENV"
+    q_start = q.loc[q["Date"] >= start]
+    if q_start.empty:
+        return (float("nan"), float("nan"), float("nan"))
+    p0 = float(q_start["Close"].iloc[0])
 
-      - name: Restore cache (PRICES)
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/raw/prices.parquet
-            data/raw/prices.csv
-            data/raw/prices_meta.json
-          key: mumumeme-prices-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
-          restore-keys: |
-            mumumeme-prices-v3-${{ runner.os }}-
+    q_end = q.loc[q["Date"] <= end]
+    if q_end.empty:
+        return (float("nan"), float("nan"), float("nan"))
+    p1 = float(q_end["Close"].iloc[-1])
 
-      - name: Restore cache (FEATURES_MODEL)
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/features/features_model.parquet
-            data/features/features_model.csv
-            data/meta/feature_cols.json
-          key: mumumeme-features-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py','scripts/build_features.py','scripts/feature_spec.py') }}
-          restore-keys: |
-            mumumeme-features-v3-${{ runner.os }}-
+    if not np.isfinite(p0) or p0 <= 0 or not np.isfinite(p1) or p1 <= 0:
+        return (float("nan"), float("nan"), float("nan"))
 
-      - name: Restore cache (MODEL)
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/labels/labels_model.parquet
-            data/labels/labels_model.csv
-            app/model.pkl
-            app/scaler.pkl
-            data/meta/train_model_report*.json
-          key: mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-${{ hashFiles('scripts/build_labels.py','scripts/train_model.py') }}
-          restore-keys: |
-            mumumeme-model-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
-            mumumeme-model-v3-${{ runner.os }}-
+    mult = p1 / p0
+    days = float((end - start).days)
+    cagr = _calc_cagr(1.0, mult, days)
+    return (float(mult), float(cagr), float(days))
 
-      - name: Restore cache (TAIL)
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/labels/labels_tail_*.parquet
-            data/labels/labels_tail_*.csv
-            data/labels/labels_tail_*_meta.json
-            app/tail_model.pkl
-            app/tail_scaler.pkl
-            data/meta/train_tail_report_*.json
-          key: mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-ex${{ env.MAX_EXTEND_DAYS }}-${{ hashFiles('scripts/build_tail_labels.py','scripts/train_tail_model.py') }}
-          restore-keys: |
-            mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-ex${{ env.MAX_EXTEND_DAYS }}-
-            mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
-            mumumeme-tail-v3-${{ runner.os }}-
 
-      - name: Restore cache (TAU)
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/labels/labels_tau.parquet
-            data/labels/labels_tau.csv
-            app/tau_model.pkl
-            app/tau_scaler.pkl
-            data/meta/train_tau_report*.json
-          key: mumumeme-tau-v3-${{ runner.os }}-${{ hashFiles('scripts/build_tau_labels.py','scripts/train_tau_model.py') }}
-          restore-keys: |
-            mumumeme-tau-v3-${{ runner.os }}-
+def _clean_curve(curve: pd.DataFrame) -> pd.DataFrame:
+    c = curve.copy()
 
-      - name: Prepare required files (10y only + partial rebuild)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "[INFO] PROFIT_TARGET=$PROFIT_TARGET MAX_DAYS=$MAX_DAYS STOP_LEVEL=$STOP_LEVEL MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS"
-          echo "[INFO] LABEL_KEY=$LABEL_KEY"
-          echo "[INFO] DEDUP_PICKS=$DEDUP_PICKS"
+    if "Date" not in c.columns or "Equity" not in c.columns:
+        return pd.DataFrame()
 
-          if [ "${REBUILD_ALL}" = "true" ]; then
-            rm -rf data/raw/* data/features/* data/labels/* app/* data/signals/* data/meta/* || true
-          fi
+    c["Date"] = _safe_to_dt(c["Date"])
+    c["Equity"] = pd.to_numeric(c["Equity"], errors="coerce")
 
-          python scripts/universe.py
-          if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
-            python scripts/fetch_prices.py --include-extra --reset --force-full --start "${PRICE_START}"
-          else
-            python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "${PRICE_START}"
-          fi
+    if "InCycle" in c.columns:
+        inc = pd.to_numeric(c["InCycle"], errors="coerce").fillna(0).astype(int)
+    elif "InPosition" in c.columns:
+        inc = pd.to_numeric(c["InPosition"], errors="coerce").fillna(0).astype(int)
+    else:
+        inc = pd.Series([0] * len(c), index=c.index, dtype=int)
 
-          if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
-            python scripts/build_features.py
-          else
-            echo "[INFO] features_model exists -> reuse"
-          fi
+    c["InCycle"] = (inc > 0).astype(int)
 
-          if [ ! -f data/labels/labels_model.parquet ] && [ ! -f data/labels/labels_model.csv ]; then
-            python scripts/build_labels.py \
-              --profit-target "${PROFIT_TARGET}" \
-              --max-days "${MAX_DAYS}" \
-              --stop-level "${STOP_LEVEL}"
-          else
-            echo "[INFO] labels_model exists -> reuse"
-          fi
+    c = c.dropna(subset=["Date", "Equity"]).sort_values("Date").reset_index(drop=True)
+    c = c.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+    return c
 
-          if [ ! -f app/model.pkl ] || [ ! -f app/scaler.pkl ]; then
-            python scripts/train_model.py
-          else
-            echo "[INFO] p_success model exists -> reuse"
-          fi
 
-          EX_TAG="pt$(python - "$PROFIT_TARGET" <<'PY'
-          import sys
-          pt=float(sys.argv[1]); print(int(round(pt*100)))
-          PY
-          )_h${MAX_DAYS}_sl$(python - "$STOP_LEVEL" <<'PY'
-          import sys
-          sl=float(sys.argv[1]); print(int(round(abs(sl)*100)))
-          PY
-          )_ex${MAX_EXTEND_DAYS}"
+def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) -> dict:
+    tag = str(row.get("TAG", "run"))
+    suffix = str(row.get("GateSuffix", ""))
 
-          if [ ! -f "data/labels/labels_tail_${EX_TAG}.parquet" ] && [ ! -f "data/labels/labels_tail_${EX_TAG}.csv" ]; then
-            python scripts/build_tail_labels.py \
-              --profit-target "${PROFIT_TARGET}" \
-              --max-days "${MAX_DAYS}" \
-              --stop-level "${STOP_LEVEL}" \
-              --max-extend-days "${MAX_EXTEND_DAYS}"
-          else
-            echo "[INFO] labels_tail exists -> reuse"
-          fi
+    out = {}
 
-          if [ ! -f app/tail_model.pkl ] || [ ! -f app/tail_scaler.pkl ]; then
-            python scripts/train_tail_model.py \
-              --profit-target "${PROFIT_TARGET}" \
-              --max-days "${MAX_DAYS}" \
-              --stop-level "${STOP_LEVEL}" \
-              --max-extend-days "${MAX_EXTEND_DAYS}"
-          else
-            echo "[INFO] tail model exists -> reuse"
-          fi
+    cpath = _curve_path(signals_dir, tag, suffix)
+    tpath = _trades_path(signals_dir, tag, suffix)
 
-          if [ -f scripts/build_tau_labels.py ]; then
-            if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
-              python scripts/build_tau_labels.py \
-                --profit-target "${PROFIT_TARGET}" \
-                --max-days "${MAX_DAYS}" \
-                --stop-level "${STOP_LEVEL}" \
-                --max-extend-days "${MAX_EXTEND_DAYS}"
-            else
-              echo "[INFO] labels_tau exists -> reuse"
-            fi
-          else
-            echo "[WARN] scripts/build_tau_labels.py not found -> skip tau labels"
-          fi
+    if (not cpath.exists()) or (not tpath.exists()):
+        out.update({
+            "WarmupEndDate": "",
+            "BacktestDaysAfterWarmup": np.nan,
+            "ActiveDaysAfterWarmup": np.nan,
+            "IdleDaysAfterWarmup": np.nan,
+            "IdlePctAfterWarmup": np.nan,
+            "CAGR_AfterWarmup": np.nan,
+            "QQQ_SeedMultiple_SamePeriod": np.nan,
+            "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
+        })
+        return out
 
-          if [ -f scripts/train_tau_model.py ] && ([ -f data/labels/labels_tau.parquet ] || [ -f data/labels/labels_tau.csv ]); then
-            if [ ! -f app/tau_model.pkl ] || [ ! -f app/tau_scaler.pkl ]; then
-              TAU_TAG="${LABEL_KEY}_ex${MAX_EXTEND_DAYS}"
-              python scripts/train_tau_model.py --tag "${TAU_TAG}" || true
-            else
-              echo "[INFO] tau model exists -> reuse"
-            fi
-          else
-            echo "[WARN] tau training skipped (missing script or labels_tau)"
-          fi
+    trades = pd.read_parquet(tpath)
+    if trades.empty or "EntryDate" not in trades.columns:
+        out.update({
+            "WarmupEndDate": "",
+            "BacktestDaysAfterWarmup": np.nan,
+            "ActiveDaysAfterWarmup": np.nan,
+            "IdleDaysAfterWarmup": np.nan,
+            "IdlePctAfterWarmup": np.nan,
+            "CAGR_AfterWarmup": np.nan,
+            "QQQ_SeedMultiple_SamePeriod": np.nan,
+            "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
+        })
+        return out
 
-          python scripts/score_features.py --tag "${LABEL_KEY}"
+    entry = _safe_to_dt(trades["EntryDate"]).dropna()
+    if entry.empty:
+        out.update({
+            "WarmupEndDate": "",
+            "BacktestDaysAfterWarmup": np.nan,
+            "ActiveDaysAfterWarmup": np.nan,
+            "IdleDaysAfterWarmup": np.nan,
+            "IdlePctAfterWarmup": np.nan,
+            "CAGR_AfterWarmup": np.nan,
+            "QQQ_SeedMultiple_SamePeriod": np.nan,
+            "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
+        })
+        return out
 
-      - name: Run gate grid (predict + simulate + summarize)
-        shell: bash
-        run: |
-          set -euo pipefail
-          chmod +x scripts/run_grid_workflow.sh
-          bash scripts/run_grid_workflow.sh
+    warmup_end = entry.min()
 
-      - name: Aggregate summaries
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/aggregate_gate_grid.py \
-            --signals-dir "data/signals" \
-            --out-aggregate "data/signals/gate_grid_aggregate.csv" \
-            --out-top "data/signals/gate_grid_top_by_recent10y.csv" \
-            --pattern "gate_summary_*.csv" \
-            --topn 50
+    curve_raw = pd.read_parquet(cpath)
+    curve = _clean_curve(curve_raw)
+    if curve.empty:
+        out.update({
+            "WarmupEndDate": str(warmup_end.date()),
+            "BacktestDaysAfterWarmup": np.nan,
+            "ActiveDaysAfterWarmup": np.nan,
+            "IdleDaysAfterWarmup": np.nan,
+            "IdlePctAfterWarmup": np.nan,
+            "CAGR_AfterWarmup": np.nan,
+            "QQQ_SeedMultiple_SamePeriod": np.nan,
+            "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
+        })
+        return out
 
-      - name: Upload artifacts (signals)
-        uses: actions/upload-artifact@v4
-        with:
-          name: gate-grid-results
-          path: |
-            data/signals/gate_summary_*.csv
-            data/signals/gate_grid_aggregate.csv
-            data/signals/gate_grid_top_by_recent10y.csv
-            data/signals/picks_*.csv
-            data/signals/picks_meta_*.json
-            data/signals/sim_engine_trades_*.parquet
-            data/signals/sim_engine_curve_*.parquet
-          if-no-files-found: error
+    cur2 = curve.loc[curve["Date"] >= warmup_end].copy()
+    if cur2.empty:
+        out.update({
+            "WarmupEndDate": str(warmup_end.date()),
+            "BacktestDaysAfterWarmup": np.nan,
+            "ActiveDaysAfterWarmup": np.nan,
+            "IdleDaysAfterWarmup": np.nan,
+            "IdlePctAfterWarmup": np.nan,
+            "CAGR_AfterWarmup": np.nan,
+            "QQQ_SeedMultiple_SamePeriod": np.nan,
+            "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessCAGR_AfterWarmup": np.nan,
+        })
+        return out
+
+    start_date = pd.Timestamp(cur2["Date"].iloc[0])
+    end_date = pd.Timestamp(cur2["Date"].iloc[-1])
+    days = float((end_date - start_date).days)
+
+    start_eq = float(cur2["Equity"].iloc[0])
+    end_eq = float(cur2["Equity"].iloc[-1])
+
+    cagr = _calc_cagr(start_eq, end_eq, days)
+
+    total_days = int(cur2["Date"].nunique())
+    active_days = int((cur2["InCycle"] > 0).sum())
+    idle_days = int(max(0, total_days - active_days))
+    idle_pct = float(idle_days / total_days) if total_days > 0 else float("nan")
+
+    qqq_mult, qqq_cagr, _ = _qqq_stats(prices, start_date, end_date)
+    excess_cagr = cagr - qqq_cagr if np.isfinite(cagr) and np.isfinite(qqq_cagr) else float("nan")
+
+    out.update({
+        "WarmupEndDate": str(warmup_end.date()),
+        "BacktestDaysAfterWarmup": days,
+        "ActiveDaysAfterWarmup": active_days,
+        "IdleDaysAfterWarmup": idle_days,
+        "IdlePctAfterWarmup": idle_pct,
+        "CAGR_AfterWarmup": cagr,
+        "QQQ_SeedMultiple_SamePeriod": qqq_mult,
+        "QQQ_CAGR_SamePeriod": qqq_cagr,
+        "ExcessCAGR_AfterWarmup": excess_cagr,
+    })
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--signals-dir", default="data/signals", type=str)
+    ap.add_argument("--out-aggregate", default="data/signals/gate_grid_aggregate.csv", type=str)
+    ap.add_argument("--out-top", default="data/signals/gate_grid_top_by_recent10y.csv", type=str)
+    ap.add_argument("--pattern", default="gate_summary_*.csv", type=str)
+    ap.add_argument("--topn", default=50, type=int)
+
+    ap.add_argument("--prices-parq", default="data/raw/prices.parquet", type=str)
+    ap.add_argument("--prices-csv", default="data/raw/prices.csv", type=str)
+
+    args = ap.parse_args()
+
+    signals_dir = Path(args.signals_dir)
+    if not signals_dir.exists():
+        raise FileNotFoundError(f"signals dir not found: {signals_dir}")
+
+    summaries = sorted(signals_dir.glob(args.pattern))
+    if not summaries:
+        raise FileNotFoundError(f"No summary files found: {signals_dir}/{args.pattern}")
+
+    prices = _read_prices(Path(args.prices_parq), Path(args.prices_csv))
+
+    rows = []
+    for sp in summaries:
+        df = _read_csv(sp)
+        if df.empty:
+            continue
+
+        row = df.iloc[0].copy()
+
+        if "TAG" not in row.index:
+            row["TAG"] = "run"
+        if "GateSuffix" not in row.index:
+            row["GateSuffix"] = _find_suffix_from_summary_path(sp)
+
+        enriched = enrich_one_summary(row, signals_dir=signals_dir, prices=prices)
+        for k, v in enriched.items():
+            row[k] = v
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+
+    # ---- robust numeric conversions for scoring columns (✅ NEW cols included)
+    num_cols = [
+        "Recent10Y_SeedMultiple", "SeedMultiple",
+        "MaxHoldingDaysObserved", "MaxExtendDaysObserved",
+        "CycleCount", "SuccessRate",
+        "MaxLeveragePct",
+        "CAGR_AfterWarmup", "QQQ_CAGR_SamePeriod", "ExcessCAGR_AfterWarmup",
+        "IdlePctAfterWarmup",
+        "QQQ_SeedMultiple_SamePeriod",
+        # summarize_sim_trades.py NEW (existing)
+        "TrailEntryCountTotal", "TrailEntryCountPerCycleAvg", "MaxCyclePeakReturn",
+        # ✅ summarize_sim_trades.py NEW (realized return stats)
+        "MaxCycleReturn", "P95CycleReturn", "MedianCycleReturn", "MeanCycleReturn",
+    ]
+    for c in num_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    # ---- leverage-adjusted score
+    if "SeedMultiple" in out.columns and "MaxLeveragePct" in out.columns:
+        lev = out["MaxLeveragePct"].fillna(0.0)
+        sm = out["SeedMultiple"].astype(float)
+        out["SeedMultiple_LevAdj"] = sm / (1.0 + lev)
+
+    # ---- ✅ NEW: risk-ish score (optional)
+    # 목적: SeedMultiple은 그대로 보되, "너무 레버/너무 idle/트레일링 과다/피크 과열"은 살짝 눌러줌
+    if "SeedMultiple" in out.columns:
+        sm = out["SeedMultiple"].astype(float)
+
+        lev = out["MaxLeveragePct"].fillna(0.0) if "MaxLeveragePct" in out.columns else 0.0
+        idle = out["IdlePctAfterWarmup"].fillna(0.0) if "IdlePctAfterWarmup" in out.columns else 0.0
+
+        trail = out["TrailEntryCountPerCycleAvg"].fillna(0.0) if "TrailEntryCountPerCycleAvg" in out.columns else 0.0
+        peak = out["MaxCyclePeakReturn"].fillna(0.0) if "MaxCyclePeakReturn" in out.columns else 0.0
+
+        # penalty terms (약하게)
+        pen = (0.25 * lev) + (0.15 * idle) + (0.05 * trail) + (0.03 * np.maximum(0.0, peak - 0.50))
+        out["RiskAdjScore"] = sm / (1.0 + pen)
+
+    # ---- sort aggregate (※ 그대로 둠)
+    sort_cols = []
+    if "RiskAdjScore" in out.columns:
+        sort_cols.append("RiskAdjScore")
+    if "SeedMultiple" in out.columns:
+        sort_cols.append("SeedMultiple")
+    if "SeedMultiple_LevAdj" in out.columns:
+        sort_cols.append("SeedMultiple_LevAdj")
+    if "CAGR_AfterWarmup" in out.columns:
+        sort_cols.append("CAGR_AfterWarmup")
+    if "ExcessCAGR_AfterWarmup" in out.columns:
+        sort_cols.append("ExcessCAGR_AfterWarmup")
+
+    if sort_cols:
+        out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+
+    out_path = Path(args.out_aggregate)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(out_path, index=False)
+    print(f"[DONE] wrote aggregate: {out_path} rows={len(out)}")
+
+    # ---- Top-by-recent10y
+    top = out.copy()
+    if "Recent10Y_SeedMultiple" in top.columns:
+        top = top.sort_values(["Recent10Y_SeedMultiple"], ascending=[False])
+    top = top.head(int(args.topn))
+    top_path = Path(args.out_top)
+    top.to_csv(top_path, index=False)
+    print(f"[DONE] wrote top: {top_path} rows={len(top)}")
+
+    # ---- quick headline (정렬은 안 바꾸고, 표시만 추가)
+    if len(out):
+        best = out.iloc[0].to_dict()
+        print("=" * 60)
+        print("[BEST] (by RiskAdjScore / SeedMultiple / LevAdj / CAGR / ExcessCAGR)")
+        print(f"TAG={best.get('TAG')} suffix={best.get('GateSuffix')}")
+        print(f"RiskAdjScore={best.get('RiskAdjScore')}")
+        print(f"SeedMultiple={best.get('SeedMultiple')}  Recent10Y={best.get('Recent10Y_SeedMultiple')}")
+        print(f"CAGR_AfterWarmup={best.get('CAGR_AfterWarmup')}  QQQ_CAGR={best.get('QQQ_CAGR_SamePeriod')}  Excess={best.get('ExcessCAGR_AfterWarmup')}")
+        print(f"IdlePctAfterWarmup={best.get('IdlePctAfterWarmup')}  MaxLevPct={best.get('MaxLeveragePct')}")
+        print(f"TrailAvg={best.get('TrailEntryCountPerCycleAvg')}  PeakCycleRet={best.get('MaxCyclePeakReturn')}")
+        # ✅ realized returns display
+        print(f"MaxCycleReturn={best.get('MaxCycleReturn')}  P95={best.get('P95CycleReturn')}  Median={best.get('MedianCycleReturn')}  Mean={best.get('MeanCycleReturn')}")
+        print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
