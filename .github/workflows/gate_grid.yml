@@ -42,7 +42,6 @@ on:
         required: true
         default: "false"
 
-      # ✅ 추가: dedupe 끄고 싶으면 false
       dedup_picks:
         description: "true=dedupe picks (skip duplicate hashes), false=run all"
         required: true
@@ -84,7 +83,6 @@ jobs:
       EXCLUDE_TICKERS: "SPY,^VIX"
       REQUIRE_FILES: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl"
 
-      # ✅ run_grid_workflow.sh에서 읽는 플래그
       DEDUP_PICKS: ${{ github.event.inputs.dedup_picks || 'true' }}
 
     steps:
@@ -275,7 +273,14 @@ jobs:
             echo "[INFO] tail model exists -> reuse"
           fi
 
+          # ✅ (1) 먼저 score_features 1차: p_success / p_tail 생성
+          python scripts/score_features.py --tag "${LABEL_KEY}"
+
+          # ✅ (2) 그 다음 tau labels 생성 (features_scored에 p_success/p_tail 있어야 함)
           if [ -f scripts/build_tau_labels.py ]; then
+            # labels_tau가 캐시로 남아있으면 "옛날 p_success/p_tail"로 만들어진 걸 수 있어서
+            # 안전하게 태우려면 아래 rm을 켜도 됨 (원하면 켜)
+            # rm -f data/labels/labels_tau.parquet data/labels/labels_tau.csv || true
             if [ ! -f data/labels/labels_tau.parquet ] && [ ! -f data/labels/labels_tau.csv ]; then
               python scripts/build_tau_labels.py \
                 --profit-target "${PROFIT_TARGET}" \
@@ -289,10 +294,11 @@ jobs:
             echo "[WARN] scripts/build_tau_labels.py not found -> skip tau labels"
           fi
 
+          # ✅ (3) tau model 학습 (있으면 skip)
           if [ -f scripts/train_tau_model.py ] && ([ -f data/labels/labels_tau.parquet ] || [ -f data/labels/labels_tau.csv ]); then
             if [ ! -f app/tau_model.pkl ] || [ ! -f app/tau_scaler.pkl ]; then
               TAU_TAG="${LABEL_KEY}_ex${MAX_EXTEND_DAYS}"
-              python scripts/train_tau_model.py --tag "${TAU_TAG}" || true
+              python scripts/train_tau_model.py --tag "${TAU_TAG}"
             else
               echo "[INFO] tau model exists -> reuse"
             fi
@@ -300,24 +306,8 @@ jobs:
             echo "[WARN] tau training skipped (missing script or labels_tau)"
           fi
 
-          # 5) score features (parquet이 기본)
+          # ✅ (4) score_features 2차: tau_model을 읽어서 tau_class/tau_pmax/tau_H 채움 (덮어쓰기)
           python scripts/score_features.py --tag "${LABEL_KEY}"
-
-          # ✅ 추가: features_scored.parquet -> features_scored.csv 강제 생성
-          python - <<'PY'
-          import pandas as pd
-          from pathlib import Path
-
-          p = Path("data/features/features_scored.parquet")
-          out = Path("data/features/features_scored.csv")
-          if p.exists():
-              df = pd.read_parquet(p)
-              out.parent.mkdir(parents=True, exist_ok=True)
-              df.to_csv(out, index=False)
-              print(f"[DONE] wrote {out} rows={len(df)}")
-          else:
-              print("[WARN] missing data/features/features_scored.parquet -> cannot write CSV")
-          PY
 
       - name: Run gate grid (predict + simulate + summarize)
         shell: bash
@@ -349,6 +339,4 @@ jobs:
             data/signals/picks_meta_*.json
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
-            data/features/features_scored.csv
-            data/features/features_scored.parquet
           if-no-files-found: error
