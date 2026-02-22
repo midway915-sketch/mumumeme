@@ -80,7 +80,7 @@ jobs:
       
       REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'true' }}
 
-      PRICE_START: "2010-02-21"
+      PRICE_START: "2008-01-01"
       PRICE_END: "2015-01-01"
       MAX_YEARS: "20"   # 예: 15년 + 1년 워밍업 느낌 (원하는 값으로)
 
