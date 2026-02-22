@@ -831,12 +831,21 @@ def main() -> None:
     suffix = args.suffix if args.suffix else picks_path.stem.replace("picks_", "")
 
     trades_path = Path(args.out_dir) / f"sim_engine_trades_{tag}_gate_{suffix}.parquet"
-    curve_path = Path(args.out_dir) / f"sim_engine_curve_{tag}_gate_{suffix}.parquet"
-    trades_df.to_parquet(trades_path, index=False)
-    curve_df.to_parquet(curve_path, index=False)
+curve_path = Path(args.out_dir) / f"sim_engine_curve_{tag}_gate_{suffix}.parquet"
 
-    print(f"[DONE] wrote trades: {trades_path} rows={len(trades_df)}")
-    print(f"[DONE] wrote curve : {curve_path} rows={len(curve_df)}")
+trades_df.to_parquet(trades_path, index=False)
+curve_df.to_parquet(curve_path, index=False)
+
+# ✅ ALSO WRITE CSV (for easy download / inspection)
+trades_csv_path = trades_path.with_suffix(".csv")
+curve_csv_path = curve_path.with_suffix(".csv")
+trades_df.to_csv(trades_csv_path, index=False)
+curve_df.to_csv(curve_csv_path, index=False)
+
+print(f"[DONE] wrote trades: {trades_path} rows={len(trades_df)}")
+print(f"[DONE] wrote trades: {trades_csv_path} rows={len(trades_df)}")
+print(f"[DONE] wrote curve : {curve_path} rows={len(curve_df)}")
+print(f"[DONE] wrote curve : {curve_csv_path} rows={len(curve_df)}")
     if not curve_df.empty:
         print(f"[INFO] final SeedMultiple={float(curve_df['SeedMultiple'].iloc[-1]):.4f} maxDD={float(st.max_dd):.4f}")
 
