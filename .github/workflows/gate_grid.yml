@@ -19,29 +19,29 @@ on:
       p_tail_thresholds:
         description: "comma-separated p_tail thresholds (e.g. 0.10,0.20,0.30)"
         required: true
-        default: "0.22"
+        default: "0.10,0.20,0.30"
       utility_quantiles:
         description: "comma-separated utility quantiles (e.g. 0.60,0.75,0.90)"
         required: true
-        default: "0.01,0.05"
+        default: "0.01,0.20,0.50"
       ps_mins:
         description: "comma-separated p_success minimum cutoffs (e.g. 0.50,0.60,0.70)"
         required: true
-        default: "0.50"
+        default: "0.00,0.50,0.70"
       rank_metrics:
         description: "comma-separated rank metric (utility|ret_score|p_success). e.g. utility,ret_score"
         required: true
-        default: "p_success"
+        default: "utility,ret_score,p_success"
 
       tp1_frac:
         description: "tp1_frac quantiles"
         required: true
-        default: "1.00"
+        default: "0.50,1.00"
         
       lambda_tail:
         description: "utility tail penalty lambda (single float, e.g. 0.05)"
         required: true
-        default: "0.02"
+        default: "0.20"
 
       rebuild_all:
         description: "true to rebuild prices/features/labels/models from scratch"
@@ -88,7 +88,7 @@ jobs:
 
       ENABLE_TRAILING: "true"
       TP1_FRAC: ${{ github.event.inputs.tp1_frac || '1.00' }}
-      TRAIL_STOPS: "0.01"
+      TRAIL_STOPS: "0.10"
 
       # ✅ TopK2 제거
       TOPK_CONFIGS: "1|1.0"
