@@ -425,6 +425,8 @@ jobs:
             data/signals/picks_meta_*.json
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
+            data/signals/sim_engine_trades_*.csv     # ✅ add
+            data/signals/sim_engine_curve_*.csv 
             data/features/features_scored.csv
             data/features/features_scored.parquet
             data/features/features_scored_tau_cur.csv
