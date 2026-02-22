@@ -80,7 +80,7 @@ jobs:
       
       REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'true' }}
 
-      PRICE_START: "2015-02-21"
+      PRICE_START: "2010-02-21"
       GATE_MODES: "tail,tail_utility"
 
       ENABLE_TRAILING: "true"
