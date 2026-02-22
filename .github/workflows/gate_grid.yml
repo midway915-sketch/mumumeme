@@ -81,6 +81,7 @@ jobs:
       REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'true' }}
 
       PRICE_START: "2010-02-21"
+      PRICE_END: "2015-01-01"
       MAX_YEARS: "20"   # 예: 15년 + 1년 워밍업 느낌 (원하는 값으로)
 
       GATE_MODES: "none,tail,utility,tail_utility"
@@ -237,9 +238,9 @@ jobs:
 
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
-            python scripts/fetch_prices.py --include-extra --reset --force-full --start "${PRICE_START}"
+            python scripts/fetch_prices.py --include-extra --reset --force-full --start "${PRICE_START}" --end "${PRICE_END}"
           else
-            python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "${PRICE_START}"
+            python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "${PRICE_START}" --end "${PRICE_END}"
           fi
 
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
