@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os  # ✅ ADDED
 import time
 from pathlib import Path
 from datetime import datetime, timezone
@@ -21,6 +22,9 @@ OUT_CSV_FALLBACK = RAW_DIR / "prices.csv"
 META_JSON = RAW_DIR / "prices_meta.json"
 
 DEFAULT_EXTRA_TICKERS = ["SPY", "^VIX"]
+
+# ✅ ADDED: allow workflow env to control max-years without changing CLI calls
+DEFAULT_MAX_YEARS = int(os.getenv("MAX_YEARS", "11"))
 
 
 def now_utc_iso() -> str:
@@ -229,7 +233,8 @@ def main() -> None:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--sleep-base", type=float, default=1.2)
     parser.add_argument("--include-extra", action="store_true", help="Include SPY and ^VIX for market features.")
-    parser.add_argument("--max-years", type=int, default=11, help="Limit raw price history to recent N years (default 11 = 10y + warmup).")
+    # ✅ CHANGED: default now comes from env MAX_YEARS (fallback 11)
+    parser.add_argument("--max-years", type=int, default=DEFAULT_MAX_YEARS, help="Limit raw price history to recent N years (default from env MAX_YEARS or 11).")
     args = parser.parse_args()
 
     tickers = read_universe(UNIVERSE_CSV)
