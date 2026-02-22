@@ -238,7 +238,7 @@ jobs:
 
           python scripts/universe.py
           if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
-            python scripts/fetch_prices.py --include-extra --reset --force-full --start "${PRICE_START}" --end "${PRICE_END}"
+            python scripts/fetch_prices.py --include-extra --reset --force-full --start "${PRICE_START}" --end "${PRICE_END}" --max-years 20
           else
             python scripts/fetch_prices.py --include-extra --lookback-days 10 --start "${PRICE_START}" --end "${PRICE_END}"
           fi
