@@ -90,7 +90,7 @@ jobs:
       # ✅ TopK2 제거
       TOPK_CONFIGS: "1|1.0"
       MAX_LEVERAGE_PCT: "1.00"
-
+      MAX_YEARS: "20"   # 예: 15년 + 1년 워밍업 느낌 (원하는 값으로)
       CAP_COMPARE: "false"
       TP1_HOLD_CAP_SINGLE: "none"
 
