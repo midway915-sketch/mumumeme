@@ -160,8 +160,10 @@ jobs:
             data/raw/prices.parquet
             data/raw/prices.csv
             data/raw/prices_meta.json
-          key: mumumeme-prices-v3-${{ runner.os }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
+          key: mumumeme-prices-v3-${{ runner.os }}-ys${{ env.MAX_YEARS }}-ps${{ env.PRICE_START }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
+          
           restore-keys: |
+            mumumeme-prices-v3-${{ runner.os }}-ys${{ env.MAX_YEARS }}-ps${{ env.PRICE_START }}-
             mumumeme-prices-v3-${{ runner.os }}-
 
       - name: Restore cache (FEATURES_MODEL)
