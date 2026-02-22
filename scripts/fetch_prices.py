@@ -334,9 +334,18 @@ def main() -> None:
     META_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     print(f"[DONE] saved={saved_to} rows={len(combined)} range={meta['min_date']}..{meta['max_date']}")
-    if failed and len(failed) >= max(3, len(tickers) // 2):
-        raise RuntimeError(f"Too many ticker download failures: {len(failed)}/{len(tickers)}")
 
-
+    # NOTE:
+    # In truncated backtests (e.g., 2008~2014), many tickers may not have existed yet,
+    # and yfinance returns "Empty data". That's not a fatal error as long as we got
+    # enough tickers to proceed.
+    ok = len(downloads)
+    total = len(tickers)
+    
+    # Fail only when "too few" tickers succeeded (hard floor).
+    # (Before: failed >= half -> abort)
+    min_ok = max(3, total // 4)  # require at least 25% (and at least 3 tickers)
+    if ok < min_ok:
+        raise RuntimeError(f"Too few tickers downloaded: ok={ok}/{total}, failed={len(failed)}")
 if __name__ == "__main__":
     main()
