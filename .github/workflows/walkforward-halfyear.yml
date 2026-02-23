@@ -1,9 +1,9 @@
-# .github/workflows/walkforward-halfyear.yml
 name: walkforward-halfyear
 
 on:
   workflow_dispatch:
     inputs:
+      # (1) WF controls (3)
       wf_start:
         description: "first half-year (e.g. 2018H1)"
         required: true
@@ -17,7 +17,7 @@ on:
         required: true
         default: "12"
 
-      # ✅ 인풋 3개만 (전략 핵심 파라미터)
+      # (2) Core strategy controls (3)
       PROFIT_TARGET:
         description: "profit target (e.g. 0.10)"
         required: true
@@ -31,7 +31,6 @@ on:
         required: true
         default: "-0.10"
 
-
 jobs:
   raw-data:
     runs-on: ubuntu-latest
@@ -42,7 +41,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (raw-data)
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
@@ -50,11 +49,13 @@ jobs:
 
       - name: Fetch raw prices (Yahoo)
         env:
-          MAX_YEARS: "16"   # 필요하면 조정 (예: 16년)
+          # fetch_prices.py가 MAX_YEARS env를 읽도록 너가 이미 수정해둔 버전 기준
+          MAX_YEARS: "16"
         run: |
           mkdir -p data/raw
           python scripts/fetch_prices.py --include-extra
           ls -la data/raw
+          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
       - name: Upload raw-data artifact
         uses: actions/upload-artifact@v4
@@ -150,167 +151,10 @@ jobs:
         run: |
           ls -la data/raw
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
-  make-matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
-    steps:
-      - name: Generate half-year matrix JSON
-        id: gen
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python - <<'PY' > /tmp/matrix.json
-          import json, re
-          from datetime import date, timedelta
-
-          wf_start = "${{ inputs.wf_start }}".strip()
-          wf_end   = "${{ inputs.wf_end }}".strip()
-          train_years = int("${{ inputs.train_years }}")
-
-          m = re.fullmatch(r"(\d{4})H([12])", wf_start)
-          n = re.fullmatch(r"(\d{4})H([12])", wf_end)
-          if not m or not n:
-            raise SystemExit("wf_start/wf_end must be like 2018H1")
-
-          sy, sh = int(m.group(1)), int(m.group(2))
-          ey, eh = int(n.group(1)), int(n.group(2))
-
-          def half_start(y,h):
-            return date(y, 1, 1) if h==1 else date(y, 7, 1)
-          def half_end(y,h):
-            return date(y, 6, 30) if h==1 else date(y, 12, 31)
-
-          items = []
-          y, h = sy, sh
-          while True:
-            period = f"{y}H{h}"
-
-            test_start = half_start(y,h)
-            test_end   = half_end(y,h)
-
-            # valid = 직전 반기
-            if h == 1:
-              vy, vh = y-1, 2
-            else:
-              vy, vh = y, 1
-            valid_start = half_start(vy,vh)
-            valid_end   = half_end(vy,vh)
-
-            # train: valid_start 직전까지, train_years년치(대략)
-            train_end = valid_start - timedelta(days=1)
-            train_start = date(train_end.year - train_years + 1, train_end.month, train_end.day)
-
-            cut_date = valid_end
-
-            items.append({
-              "period": period,
-              "TRAIN_START": train_start.isoformat(),
-              "TRAIN_END": train_end.isoformat(),
-              "VALID_START": valid_start.isoformat(),
-              "VALID_END": valid_end.isoformat(),
-              "TEST_START": test_start.isoformat(),
-              "TEST_END": test_end.isoformat(),
-              "CUT_DATE": cut_date.isoformat(),
-            })
-
-            if (y==ey and h==eh):
-              break
-            if h == 1:
-              h = 2
-            else:
-              y += 1
-              h = 1
-
-          print(json.dumps({"include": items}, ensure_ascii=False))
-          PY
-
-          echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
-          cat /tmp/matrix.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-  run:
-    needs: make-matrix
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      # ✅ 핵심: CI에 data/features 가 없으니 여기서 생성/학습/스코어링 먼저
-      - name: Build features + (optional) train + score (create features_scored)
-        env:
-          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
-          MAX_DAYS: ${{ inputs.MAX_DAYS }}
-          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
-          CUT_DATE: ${{ matrix.CUT_DATE }}
-        run: |
-          set -euo pipefail
-          mkdir -p data/features data/meta app
-
-          PT="$(python - <<PY
-          v=float("${PROFIT_TARGET}")
-          print(str(int(round(v*100))))
-          PY
-          )"
-                    SL="$(python - <<PY
-          v=float("${STOP_LEVEL}")
-          print(str(int(round(abs(v)*100))))
-          PY
-          )"
-          TAG="pt${PT}_h${MAX_DAYS}_sl${SL}"
-          echo "[INFO] derived TAG=$TAG (from PROFIT_TARGET/MAX_DAYS/STOP_LEVEL)"
-          echo "[INFO] CUT_DATE=$CUT_DATE"
-
-          if [ -f scripts/build_features.py ]; then
-            echo "[INFO] build_features.py"
-            python scripts/build_features.py
-          else
-            echo "[WARN] scripts/build_features.py not found -> skip"
-          fi
-
-          # (있으면) 모델 학습: CUT_DATE 기준
-          if [ -f scripts/train_model.py ]; then
-            echo "[INFO] train_model.py"
-            python scripts/train_model.py --cut-date "$CUT_DATE" --tag "$TAG"
-          else
-            echo "[WARN] scripts/train_model.py not found -> skip"
-          fi
-
-          if [ -f scripts/train_tail_model.py ]; then
-            echo "[INFO] train_tail_model.py"
-            python scripts/train_tail_model.py --cut-date "$CUT_DATE" --tag "$TAG"
-          else
-            echo "[WARN] scripts/train_tail_model.py not found -> skip"
-          fi
-
-          if [ -f scripts/train_tau_model.py ]; then
-            echo "[INFO] train_tau_model.py"
-            python scripts/train_tau_model.py --cut-date "$CUT_DATE" --tag "$TAG"
-          else
-            echo "[WARN] scripts/train_tau_model.py not found -> skip"
-          fi
-
-          echo "[INFO] score_features.py --tag $TAG"
-          python scripts/score_features.py --tag "$TAG"
-
-          echo "[INFO] files:"
-          ls -la data/features | sed -n '1,200p'
-          ls -la app | sed -n '1,200p'
 
       - name: Walkforward run (one half-year)
         env:
+          # ---- matrix slice
           WF_PERIOD: ${{ matrix.period }}
           TRAIN_START: ${{ matrix.TRAIN_START }}
           TRAIN_END: ${{ matrix.TRAIN_END }}
@@ -320,14 +164,14 @@ jobs:
           TEST_END: ${{ matrix.TEST_END }}
           CUT_DATE: ${{ matrix.CUT_DATE }}
 
-          # ✅ 인풋 3개
+          # ---- 6 inputs (wf 3 + core 3)
           PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
           MAX_DAYS: ${{ inputs.MAX_DAYS }}
           STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
 
-          # ✅ 나머지는 “워크플로우 기본값” (원하면 여기만 바꿔)
-          P_TAIL_THRESHOLDS: "0.20"
-          UTILITY_QUANTILES: "0.75"
+          # ---- grid defaults (workflow에서 고정)
+          P_TAIL_THRESHOLDS: "0.10,0.20,0.30"
+          UTILITY_QUANTILES: "0.60,0.75,0.90"
           RANK_METRICS: "utility"
           LAMBDA_TAIL: "1.0"
           GATE_MODES: "tail_utility"
@@ -335,27 +179,27 @@ jobs:
           TP1_FRAC: "0.50"
           ENABLE_TRAILING: "true"
           TOPK_CONFIGS: "1|1.0"
-          PS_MINS: "0.55"
+          PS_MINS: "0.60"
           BADEXIT_MAXES: "1.00"
           MAX_LEVERAGE_PCT: "1.0"
 
-          # ✅ 빈값이어도 OK (스크립트에서 default 처리)
+          # ---- set -u 터지는 애들: 무조건 세팅(빈 문자열 OK)
           EXCLUDE_TICKERS: ""
           REQUIRE_FILES: ""
 
-          # ✅ Regime defaults (필요하면 여기만 수정)
+          # ---- optional regime defaults (원하면 여기만 바꿔서 실험)
           REGIME_MODE: "off"
           REGIME_DD_MAX: "0.20"
           REGIME_RET20_MIN: "0.00"
           REGIME_ATR_MAX: "1.30"
           REGIME_LEVERAGE_MULT: "3.0"
 
-          # optional split/toggles
+          # ---- optional toggles (기본 off)
           TAU_SPLIT: ""
           USE_TAU_H: "false"
           ENABLE_DCA: "false"
 
-          # output partitioning
+          # ---- output partitioning
           OUT_DIR_BASE: data/signals/walkforward
           WF_TAG_BASE: wf
 
