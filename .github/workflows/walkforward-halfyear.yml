@@ -193,7 +193,7 @@ jobs:
           TP1_FRAC: "0.50"
           ENABLE_TRAILING: "true"
           TOPK_CONFIGS: "1|1.0"
-          PS_MINS: "0.60"
+          PS_MINS: "0.00"
           BADEXIT_MAXES: "1.00"
           MAX_LEVERAGE_PCT: "1.0"
 
