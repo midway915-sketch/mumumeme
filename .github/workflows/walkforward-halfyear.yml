@@ -16,6 +16,7 @@ on:
         required: true
         default: "12"
 
+      # ----- your existing grid envs
       PROFIT_TARGET:
         required: true
         default: "0.10"
@@ -71,6 +72,7 @@ on:
         required: true
         default: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl,app/tail_model.pkl,app/tail_scaler.pkl"
 
+      # regime filter envs
       REGIME_MODE:
         required: false
         default: "off"
@@ -90,7 +92,6 @@ on:
       TAU_SPLIT:
         required: false
         default: ""
-
       USE_TAU_H:
         required: false
         default: "false"
@@ -108,7 +109,7 @@ jobs:
         id: gen
         shell: bash
         run: |
-          python - <<'PY' > matrix.json
+          MATRIX_JSON="$(python - <<'PY'
           import json, re
           from datetime import date, timedelta
 
@@ -131,16 +132,15 @@ jobs:
           y,h=sy,sh
           while True:
               period=f"{y}H{h}"
-
               test_start=half_start(y,h); test_end=half_end(y,h)
 
               # valid = 직전 반기
-              vy,vh = (y-1,2) if h==1 else (y,1)
+              vy,vh=(y-1,2) if h==1 else (y,1)
               valid_start=half_start(vy,vh); valid_end=half_end(vy,vh)
 
-              # train = valid_start 직전까지 train_years년(대략) 롤링
+              # train = valid_start 이전 train_years년치(대략)
               train_end = valid_start - timedelta(days=1)
-              train_start = date(train_end.year-train_years+1, train_end.month, train_end.day)
+              train_start = date(train_end.year - train_years + 1, train_end.month, train_end.day)
 
               cut_date = valid_end
 
@@ -164,12 +164,13 @@ jobs:
 
           print(json.dumps({"include": items}, ensure_ascii=False))
           PY
+          )"
 
           echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
-          cat matrix.json >> "$GITHUB_OUTPUT"
+          echo "$MATRIX_JSON" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-  wf:
+  run:
     needs: make-matrix
     runs-on: ubuntu-latest
     strategy:
@@ -228,6 +229,7 @@ jobs:
 
           OUT_DIR_BASE: data/signals/walkforward
           WF_TAG_BASE: wf
+
         run: |
           chmod +x scripts/run_walkforward_halfyear.sh
           ./scripts/run_walkforward_halfyear.sh
