@@ -99,9 +99,8 @@ def _get_feature_cols(df: pd.DataFrame) -> list[str]:
             pass
 
     # fallback: numeric columns except known keys/probs
-    drop = {"Date", "Ticker", "p_success", "p_tail", "tau_H", "tau_class", "ret_score", "utility"}
+    drop = {"Date", "Ticker", "p_success", "p_tail", "p_badexit", "tau_H", "tau_class", "ret_score", "utility"}
     cols = [c for c in df.columns if c not in drop]
-    # only keep columns that look numeric-ish
     out = []
     for c in cols:
         if pd.api.types.is_numeric_dtype(df[c]):
@@ -121,6 +120,96 @@ def _coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
             .astype(float)
         )
     return out
+
+
+def _apply_regime_filter(
+    df: pd.DataFrame,
+    mode: str,
+    dd_max: float,
+    ret20_min: float,
+    atr_max: float,
+    leverage_mult: float,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Regime filter is applied per-row using Market_* columns (already in your feature set).
+    - mode=off    : no filter
+    - mode=basic  : requires Market_Drawdown >= -dd_max_adj AND Market_ATR_ratio <= atr_max_adj
+    - mode=trend  : requires Market_ret_20 >= ret20_min
+    - mode=dd     : requires Market_Drawdown >= -dd_max_adj
+    - mode=combo  : basic + trend (all)
+    Leverage handling:
+      For leveraged universe (e.g. 3x), we tighten dd/atr thresholds:
+        dd_max_adj  = dd_max / leverage_mult
+        atr_max_adj = 1 + (atr_max - 1)/leverage_mult
+      (keeps thresholds sane; not overly harsh like multiplying ret requirements)
+    """
+    mode = (mode or "off").strip().lower()
+    audit = {
+        "enabled": mode != "off",
+        "mode": mode,
+        "inputs": {
+            "dd_max": float(dd_max),
+            "ret20_min": float(ret20_min),
+            "atr_max": float(atr_max),
+            "leverage_mult": float(leverage_mult),
+        },
+        "used_cols": [],
+        "thresholds_used": {},
+        "n_before": int(len(df)),
+        "n_after": int(len(df)),
+        "n_dropped": 0,
+        "reason": "",
+    }
+    if mode == "off":
+        return df, audit
+
+    # check required cols exist
+    need_cols = set()
+    if mode in ("basic", "dd", "combo"):
+        need_cols.add("Market_Drawdown")
+    if mode in ("basic", "combo"):
+        need_cols.add("Market_ATR_ratio")
+    if mode in ("trend", "combo"):
+        need_cols.add("Market_ret_20")
+
+    missing = [c for c in sorted(need_cols) if c not in df.columns]
+    if missing:
+        audit["reason"] = f"missing_cols:{missing}"
+        # fail open (do not drop anything) to avoid accidental empty picks
+        return df, audit
+
+    lev = float(leverage_mult) if np.isfinite(leverage_mult) and leverage_mult > 0 else 1.0
+    dd_max = float(dd_max) if np.isfinite(dd_max) and dd_max > 0 else 0.20
+    atr_max = float(atr_max) if np.isfinite(atr_max) and atr_max > 0 else 1.30
+    ret20_min = float(ret20_min) if np.isfinite(ret20_min) else 0.0
+
+    dd_max_adj = dd_max / lev
+    atr_max_adj = 1.0 + (atr_max - 1.0) / lev
+
+    mask = pd.Series(True, index=df.index)
+
+    if mode in ("basic", "dd", "combo"):
+        md = pd.to_numeric(df["Market_Drawdown"], errors="coerce").fillna(-999.0)
+        mask &= (md >= -abs(dd_max_adj))
+        audit["used_cols"].append("Market_Drawdown")
+        audit["thresholds_used"]["Market_Drawdown_min"] = -abs(dd_max_adj)
+
+    if mode in ("basic", "combo"):
+        ma = pd.to_numeric(df["Market_ATR_ratio"], errors="coerce").fillna(999.0)
+        mask &= (ma <= atr_max_adj)
+        audit["used_cols"].append("Market_ATR_ratio")
+        audit["thresholds_used"]["Market_ATR_ratio_max"] = atr_max_adj
+
+    if mode in ("trend", "combo"):
+        mr = pd.to_numeric(df["Market_ret_20"], errors="coerce").fillna(-999.0)
+        mask &= (mr >= ret20_min)
+        audit["used_cols"].append("Market_ret_20")
+        audit["thresholds_used"]["Market_ret_20_min"] = ret20_min
+
+    out = df.loc[mask].copy()
+    audit["n_after"] = int(len(out))
+    audit["n_dropped"] = int(audit["n_before"] - audit["n_after"])
+    return out, audit
 
 
 def main():
@@ -155,6 +244,23 @@ def main():
         help="comma-separated file paths that must exist; missing -> exit code 2",
     )
 
+    # ✅ Regime filter (gate-level)
+    ap.add_argument(
+        "--regime-mode",
+        default="off",
+        choices=["off", "basic", "trend", "dd", "combo"],
+        help="regime filter mode applied before ranking",
+    )
+    ap.add_argument("--regime-dd-max", default=0.20, type=float, help="max allowed market drawdown (e.g. 0.20 => -20%)")
+    ap.add_argument("--regime-ret20-min", default=0.00, type=float, help="min market 20d return (e.g. 0.00)")
+    ap.add_argument("--regime-atr-max", default=1.30, type=float, help="max market ATR ratio (e.g. 1.30)")
+    ap.add_argument(
+        "--regime-leverage-mult",
+        default=3.0,
+        type=float,
+        help="universe leverage multiplier (e.g. 3.0 for 3x ETFs) to tighten dd/atr thresholds",
+    )
+
     args = ap.parse_args()
 
     # ---- fail-fast required files (CI safety)
@@ -178,24 +284,23 @@ def main():
     X = feats2[feat_cols].to_numpy(dtype=float)
     Xs = scaler.transform(X)
     proba = model.predict_proba(Xs)
-    # assume class 1 is success
     if proba.shape[1] >= 2:
         p_success = proba[:, 1]
     else:
         p_success = proba[:, 0]
-
     feats2["p_success"] = p_success
 
     # tail probs (p_tail)
     tail_model, tail_scaler = _load_tail_models()
     Xt = tail_scaler.transform(X)
     tproba = tail_model.predict_proba(Xt)
-    # assume class 1 is tail (bad tail)
     if tproba.shape[1] >= 2:
         p_tail = tproba[:, 1]
     else:
         p_tail = tproba[:, 0]
     feats2["p_tail"] = p_tail
+
+    n0 = int(len(feats2))
 
     # basic filters
     if args.exclude_tickers:
@@ -204,15 +309,40 @@ def main():
             feats2 = feats2[~feats2["Ticker"].isin(ex)].copy()
 
     feats2 = feats2[feats2["p_success"] >= float(args.ps_min)].copy()
+    n_after_ps = int(len(feats2))
+
+    # ✅ regime filter (gate-level)
+    feats2, regime_audit = _apply_regime_filter(
+        feats2,
+        mode=str(args.regime_mode),
+        dd_max=float(args.regime_dd_max),
+        ret20_min=float(args.regime_ret20_min),
+        atr_max=float(args.regime_atr_max),
+        leverage_mult=float(args.regime_leverage_mult),
+    )
+    n_after_regime = int(len(feats2))
+
     if feats2.empty:
-        # still write empty picks for reproducibility
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
         debug_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.debug.json"
         pd.DataFrame(columns=["Date", "Ticker"]).to_csv(picks_path, index=False)
-        debug_path.write_text(json.dumps({"empty": True, "reason": "ps_min_filter"}, indent=2), encoding="utf-8")
-        print(f"[WARN] empty picks (ps_min={args.ps_min}) -> wrote {picks_path}")
+        debug_path.write_text(
+            json.dumps(
+                {
+                    "empty": True,
+                    "reason": "filters",
+                    "n0": n0,
+                    "n_after_ps": n_after_ps,
+                    "regime_audit": regime_audit,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        print(f"[WARN] empty picks after filters -> wrote {picks_path}")
         return
 
     # compute score by mode
@@ -221,7 +351,6 @@ def main():
     uq = float(args.utility_quantile)
     lam = float(args.lambda_tail)
 
-    # utility: penalize tail if enabled
     feats2["ret_score"] = feats2.get("ret_score", np.nan)
     feats2["utility_raw"] = feats2.get("utility", np.nan)
 
@@ -293,7 +422,11 @@ def main():
         "exclude_tickers": args.exclude_tickers,
         "features_path": args.features_path or "data/features/features_scored.(parquet/csv)",
         "out_dir": str(out_dir),
-        "n_rows_features": int(len(feats2)),
+        "n0": n0,
+        "n_after_ps": n_after_ps,
+        "regime_audit": regime_audit,
+        "n_after_regime": n_after_regime,
+        "n_rows_final_pool": int(len(feats2)),
         "n_rows_picks": int(len(picks)),
     }
     debug_path.write_text(json.dumps(dbg, ensure_ascii=False, indent=2), encoding="utf-8")
