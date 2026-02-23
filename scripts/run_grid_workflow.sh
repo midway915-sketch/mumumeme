@@ -26,12 +26,10 @@ echo "[INFO] OUT_DIR=$OUT_DIR"
 : "${ENABLE_TRAILING:?}"
 : "${TOPK_CONFIGS:?}"
 : "${PS_MINS:?}"
+: "${BADEXIT_MAXES:?}"          # ✅ NEW
 : "${MAX_LEVERAGE_PCT:?}"
 : "${EXCLUDE_TICKERS:?}"
 : "${REQUIRE_FILES:?}"
-
-# ✅ NEW: BadExit gate thresholds (p_badexit <= badexit_max)
-: "${BADEXIT_MAXES:?}"
 
 # ✅ NEW: re-eval thresholds (engine args)
 REVAL_PS_STRONG="${REVAL_PS_STRONG:-0.70}"
@@ -39,7 +37,6 @@ REVAL_PT_STRONG="${REVAL_PT_STRONG:-0.20}"
 REVAL_PS_PASS="${REVAL_PS_PASS:-0.60}"
 REVAL_PT_PASS="${REVAL_PT_PASS:-0.35}"
 echo "[INFO] REVAL_PS_STRONG=$REVAL_PS_STRONG REVAL_PT_STRONG=$REVAL_PT_STRONG REVAL_PS_PASS=$REVAL_PS_PASS REVAL_PT_PASS=$REVAL_PT_PASS"
-echo "[INFO] BADEXIT_MAXES=$BADEXIT_MAXES"
 
 # ✅ dedupe on/off (default: true)
 DEDUP_PICKS="${DEDUP_PICKS:-true}"
@@ -149,19 +146,19 @@ PY
 # ----- print config
 echo "[INFO] TOPK_CONFIGS=$TOPK_CONFIGS"
 echo "[INFO] TRAIL_STOPS=$TRAIL_STOPS TP1_FRAC=$TP1_FRAC ENABLE_TRAILING=$ENABLE_TRAILING"
-echo "[INFO] PS_MINS=$PS_MINS MAX_LEVERAGE_PCT=$MAX_LEVERAGE_PCT"
+echo "[INFO] PS_MINS=$PS_MINS BADEXIT_MAXES=$BADEXIT_MAXES MAX_LEVERAGE_PCT=$MAX_LEVERAGE_PCT"
 echo "[INFO] TP1_TRAIL_UNLIMITED=$TP1_TRAIL_UNLIMITED"
 
 DEFAULT_TMAX="$(first_csv_item "$P_TAIL_THRESHOLDS")"
 DEFAULT_UQ="$(first_csv_item "$UTILITY_QUANTILES")"
-DEFAULT_BMAX="$(first_csv_item "$BADEXIT_MAXES")"
-if [ -z "$DEFAULT_TMAX" ] || [ -z "$DEFAULT_UQ" ] || [ -z "$DEFAULT_BMAX" ]; then
+DEFAULT_BE="$(first_csv_item "$BADEXIT_MAXES")"
+if [ -z "$DEFAULT_TMAX" ] || [ -z "$DEFAULT_UQ" ] || [ -z "$DEFAULT_BE" ]; then
   echo "[ERROR] P_TAIL_THRESHOLDS / UTILITY_QUANTILES / BADEXIT_MAXES must be non-empty CSV."
   exit 1
 fi
 echo "[INFO] DEFAULT_TMAX(for unused dim)=$DEFAULT_TMAX"
 echo "[INFO] DEFAULT_UQ(for unused dim)=$DEFAULT_UQ"
-echo "[INFO] DEFAULT_BMAX(for unused dim)=$DEFAULT_BMAX"
+echo "[INFO] DEFAULT_BE(for unused dim)=$DEFAULT_BE"
 
 HASH_DIR="$OUT_DIR/_picks_hash"
 mkdir -p "$HASH_DIR"
@@ -206,8 +203,7 @@ while read -r mode; do
     while read -r uq; do
       while read -r rank_by; do
         while read -r psmin; do
-          # ✅ NEW: badexit gate loop
-          while read -r bmax; do
+          while read -r be; do   # ✅ NEW: badexit_max loop
             while read -r topk_line; do
               K="${topk_line%%|*}"
               W="${topk_line#*|}"
@@ -217,7 +213,7 @@ while read -r mode; do
                 uq_s="$(suffix_float "$uq")"
                 lam_s="$(suffix_float "$LAMBDA_TAIL")"
                 ps_s="$(suffix_float "$psmin")"
-                be_s="$(suffix_float "$bmax")"
+                be_s="$(suffix_float "$be")"     # ✅ NEW
                 tr_s="$(suffix_float "$trail")"
                 tp_pct="$(python - <<PY
 f=float("$TP1_FRAC")
@@ -229,7 +225,7 @@ PY
                 base_suffix="${mode}_${tu_s}_t${t_s}_q${uq_s}_r${rank_by}_lam${lam_s}_ps${ps_s}_be${be_s}_k${K}_w$(echo "$W" | tr ',' '_')_tp${tp_pct}_tr${tr_s}"
 
                 echo "=============================="
-                echo "[RUN] mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin badexit_max=$bmax topk=$K weights=$W trail=$trail base_suffix=$base_suffix"
+                echo "[RUN] mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin badexit_max=$be topk=$K weights=$W trail=$trail base_suffix=$base_suffix"
                 echo "=============================="
 
                 # ---- PREDICT
@@ -245,7 +241,7 @@ PY
                   --lambda-tail "$LAMBDA_TAIL" \
                   --topk "$K" \
                   --ps-min "$psmin" \
-                  --badexit-max "$bmax" \
+                  --badexit-max "$be" \        # ✅ NEW
                   --tag "$TAG" \
                   --suffix "$base_suffix" \
                   --exclude-tickers "$EXCLUDE_TICKERS" \
@@ -335,7 +331,7 @@ PY
 
               done < <(split_csv "$TRAIL_STOPS")
             done < <(split_scsv "$TOPK_CONFIGS")
-          done < <(split_csv "$BADEXIT_MAXES")
+          done < <(split_csv "$BADEXIT_MAXES"))
         done < <(split_csv "$PS_MINS")
       done < <(split_csv "$RANK_METRICS")
     done < <(split_csv "$UQ_LIST")
