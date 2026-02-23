@@ -1,311 +1,199 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""
-scripts/predict_gate.py
-
-Gate picks generator.
-
-- If tau_H exists and tail primitives (labels_tail_base_*.parquet/csv) are available,
-  derive p_tail_effective using H=tau_H and EX=max_extend_days.
-"""
-
 import argparse
-import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-# ----------------------------
-# IO helpers
-# ----------------------------
-def read_table(parq_path: Path, csv_path: Path) -> pd.DataFrame:
-    if parq_path.exists():
-        return pd.read_parquet(parq_path)
-    if csv_path.exists():
-        return pd.read_csv(csv_path)
-    raise FileNotFoundError(f"Missing file: {parq_path} (or {csv_path})")
+DATA_DIR = Path("data")
+FEATURES_DIR = DATA_DIR / "features"
+
+
+def read_table(parq: Path, csv: Path) -> pd.DataFrame:
+    if parq.exists():
+        return pd.read_parquet(parq)
+    if csv.exists():
+        return pd.read_csv(csv)
+    raise FileNotFoundError(f"Missing file: {parq} (or {csv})")
 
 
 def norm_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
 
-def coerce_num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
-    if col not in df.columns:
-        return pd.Series([default] * len(df), index=df.index, dtype=float)
-    x = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
-    return x.astype(float)
+def parse_csv_list(s: str) -> list[str]:
+    items = [x.strip() for x in str(s or "").split(",")]
+    return [x for x in items if x]
 
 
-def parse_require_files(s: str) -> List[Path]:
-    parts = [p.strip() for p in (s or "").split(",") if p.strip()]
-    return [Path(p) for p in parts]
+@dataclass
+class GateConfig:
+    mode: str
+    tail_threshold: float
+    utility_quantile: float
+    rank_by: str
+    lambda_tail: float
+    topk: int
+    ps_min: float
+    badexit_max: float
 
 
-def ensure_required_files_exist(require_files: List[Path]) -> None:
-    missing = [str(p) for p in require_files if not p.exists()]
-    if missing:
-        raise FileNotFoundError(f"Missing required files: {missing}")
+def compute_utility(df: pd.DataFrame, lam: float) -> pd.Series:
+    # utility = p_success - lam * p_tail
+    ps = pd.to_numeric(df.get("p_success", 0.0), errors="coerce").fillna(0.0).astype(float)
+    pt = pd.to_numeric(df.get("p_tail", 0.0), errors="coerce").fillna(0.0).astype(float)
+    return ps - float(lam) * pt
 
 
-# ----------------------------
-# Column normalization
-# ----------------------------
-def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Gate picks builder")
 
-    colmap = {c.lower(): c for c in out.columns}
+    ap.add_argument("--profit-target", required=True, type=float)
+    ap.add_argument("--max-days", required=True, type=int)
+    ap.add_argument("--stop-level", required=True, type=float)
+    ap.add_argument("--max-extend-days", required=True, type=int)
 
-    if "date" in colmap and "Date" not in out.columns:
-        out = out.rename(columns={colmap["date"]: "Date"})
-    if "datetime" in colmap and "Date" not in out.columns:
-        out = out.rename(columns={colmap["datetime"]: "Date"})
-    if "timestamp" in colmap and "Date" not in out.columns:
-        out = out.rename(columns={colmap["timestamp"]: "Date"})
+    ap.add_argument("--mode", required=True, type=str, choices=["none", "tail", "utility", "tail_utility"])
+    ap.add_argument("--tail-threshold", required=True, type=float)
+    ap.add_argument("--utility-quantile", required=True, type=float)
+    ap.add_argument("--rank-by", required=True, type=str, choices=["utility", "ret_score", "p_success"])
+    ap.add_argument("--lambda-tail", required=True, type=float)
 
-    if "ticker" in colmap and "Ticker" not in out.columns:
-        out = out.rename(columns={colmap["ticker"]: "Ticker"})
-    if "symbol" in colmap and "Ticker" not in out.columns:
-        out = out.rename(columns={colmap["symbol"]: "Ticker"})
+    ap.add_argument("--topk", default=1, type=int)
+    ap.add_argument("--ps-min", default=0.0, type=float)
+    ap.add_argument("--badexit-max", default=1.0, type=float)
 
-    if "Date" not in out.columns:
-        raise KeyError("Date column missing.")
-    if "Ticker" not in out.columns:
-        raise KeyError("Ticker column missing.")
-
-    return out
-
-
-def apply_exclude_tickers(df: pd.DataFrame, exclude_csv: str) -> pd.DataFrame:
-    ex = [t.strip().upper() for t in (exclude_csv or "").split(",") if t.strip()]
-    if not ex:
-        return df
-    return df[~df["Ticker"].isin(ex)].copy()
-
-
-# ----------------------------
-# Tail primitives discovery
-# ----------------------------
-def _try_find_tail_base_file(pt: float, sl: float, exmax: int):
-    pt100 = int(round(pt * 100))
-    sl100 = int(round(abs(sl) * 100))
-
-    base = Path("data/labels")
-    if not base.exists():
-        return None
-
-    candidates = list(base.glob(
-        f"labels_tail_base_pt{pt100}_sl{sl100}_hmax*_exmax{int(exmax)}.*"
-    ))
-
-    if not candidates:
-        return None
-
-    def _hmax_of(p: Path):
-        try:
-            part = p.stem.split("_hmax", 1)[1]
-            return int(part.split("_exmax", 1)[0])
-        except Exception:
-            return -1
-
-    candidates = sorted(candidates, key=_hmax_of, reverse=True)
-    return candidates[0]
-
-
-# ----------------------------
-# Tail derivation (tau_H aware)
-# ----------------------------
-def _derive_p_tail_from_primitives(df: pd.DataFrame, ex: int, default_h: int):
-    required = ["TauSLDays", "TauTPDays", "TauRecoverAfterSLDays"]
-    for c in required:
-        if c not in df.columns:
-            return None, {"ok": False, "reason": f"missing {c}"}
-
-    tau_sl = pd.to_numeric(df["TauSLDays"], errors="coerce")
-    tau_tp = pd.to_numeric(df["TauTPDays"], errors="coerce")
-    tau_rec = pd.to_numeric(df["TauRecoverAfterSLDays"], errors="coerce")
-
-    if "tau_H" in df.columns:
-        H_eff = pd.to_numeric(df["tau_H"], errors="coerce").fillna(default_h).astype(int)
-    else:
-        H_eff = pd.Series(default_h, index=df.index)
-
-    sl_ok = tau_sl.notna() & (tau_sl <= H_eff)
-    tp_before_sl = tau_tp.notna() & tau_sl.notna() & (tau_tp <= H_eff) & (tau_tp <= tau_sl)
-    recovered = tau_rec.notna() & (tau_rec <= ex)
-
-    p_tail_eff = (sl_ok & (~tp_before_sl) & recovered).astype(int)
-
-    return p_tail_eff, {
-        "ok": True,
-        "tail_eff_rate": float(p_tail_eff.mean()) if len(p_tail_eff) else 0.0,
-    }
-
-
-# ----------------------------
-# Utility / gating / ranking
-# ----------------------------
-def build_utility(df: pd.DataFrame, lambda_tail: float) -> pd.Series:
-    ret = coerce_num(df, "ret_score", 0.0)
-    p_tail = coerce_num(df, "p_tail", 0.0)
-    return ret - lambda_tail * p_tail
-
-
-def gate_filter(df: pd.DataFrame, mode: str, tail_threshold: float, utility_quantile: float):
-    if df.empty:
-        return df
-
-    if mode == "none":
-        return df
-
-    if mode == "tail":
-        return df[df["p_tail"] <= tail_threshold]
-
-    if mode == "utility":
-        thr = df.groupby("Date")["utility"].transform(lambda s: s.quantile(utility_quantile))
-        return df[df["utility"] >= thr]
-
-    if mode == "tail_utility":
-        d = df[df["p_tail"] <= tail_threshold]
-        if d.empty:
-            return d
-        thr = d.groupby("Date")["utility"].transform(lambda s: s.quantile(utility_quantile))
-        return d[d["utility"] >= thr]
-
-    raise ValueError("Invalid gate mode")
-
-
-def rank_topk_per_day(df: pd.DataFrame, rank_by: str, topk: int):
-    if df.empty:
-        return df
-
-    metric = df[rank_by]
-    d = df.copy()
-    d["_metric"] = metric
-    d = d.sort_values(["Date", "_metric"], ascending=[True, False])
-
-    return (
-        d.groupby("Date", group_keys=False)
-        .head(topk)
-        .drop(columns="_metric")
-    )
-
-
-# ----------------------------
-# MAIN
-# ----------------------------
-def main():
-    ap = argparse.ArgumentParser()
-
-    ap.add_argument("--profit-target", type=float, required=True)
-    ap.add_argument("--max-days", type=int, required=True)
-    ap.add_argument("--stop-level", type=float, required=True)
-    ap.add_argument("--max-extend-days", type=int, required=True)
-
-    ap.add_argument("--mode", required=True)
-    ap.add_argument("--tail-threshold", type=float, required=True)
-    ap.add_argument("--utility-quantile", type=float, required=True)
-    ap.add_argument("--rank-by", required=True)
-    ap.add_argument("--lambda-tail", type=float, required=True)
-
-    ap.add_argument("--topk", type=int, default=1)
-    ap.add_argument("--ps-min", type=float, default=0.0)
-    ap.add_argument("--badexit-max", type=float, default=1.0)
-
-    ap.add_argument("--tag", required=True)
-    ap.add_argument("--suffix", required=True)
+    ap.add_argument("--tag", required=True, type=str)
+    ap.add_argument("--suffix", required=True, type=str)
 
     ap.add_argument("--exclude-tickers", default="")
     ap.add_argument("--features-path", default="")
 
+    # ✅ workflow compat (run_grid_workflow.sh / gate-grid.yml)
+    ap.add_argument("--out-dir", default="data/signals", type=str)
+    ap.add_argument(
+        "--require-files",
+        default="",
+        type=str,
+        help="comma-separated list of files that must exist; fail-fast if missing",
+    )
+
     args = ap.parse_args()
 
-    out_dir = Path("data/signals")
+    # ---- require-files (fail fast)
+    req = str(getattr(args, "require_files", "") or "").strip()
+    if req:
+        missing: list[str] = []
+        for p in [x.strip() for x in req.split(",") if x.strip()]:
+            if not Path(p).exists():
+                missing.append(p)
+        if missing:
+            print(f"[ERROR] missing required files: {missing}")
+            raise SystemExit(2)
+
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
-    meta_path = out_dir / f"picks_meta_{args.tag}_gate_{args.suffix}.json"
-
-    # load features
+    # features_scored load
     if args.features_path:
-        feats = pd.read_parquet(args.features_path)
+        fp = Path(args.features_path)
+        feats = read_table(fp, fp.with_suffix(".csv")).copy()
     else:
-        feats = read_table(
-            Path("data/features/features_scored.parquet"),
-            Path("data/features/features_scored.csv"),
-        )
+        feats = read_table(FEATURES_DIR / "features_scored.parquet", FEATURES_DIR / "features_scored.csv").copy()
 
-    feats = ensure_date_ticker_columns(feats)
+    if "Date" not in feats.columns or "Ticker" not in feats.columns:
+        raise ValueError("features_scored must contain Date,Ticker")
+
     feats["Date"] = norm_date(feats["Date"])
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
+    feats = feats.dropna(subset=["Date", "Ticker"]).copy()
 
-    feats["p_success"] = coerce_num(feats, "p_success")
-    feats["p_tail"] = coerce_num(feats, "p_tail")
-    feats["ret_score"] = coerce_num(feats, "ret_score")
-    feats["p_badexit"] = coerce_num(feats, "p_badexit")
+    # exclude tickers
+    excl = set([x.upper().strip() for x in parse_csv_list(args.exclude_tickers)])
+    if excl:
+        feats = feats.loc[~feats["Ticker"].isin(excl)].copy()
 
-    feats = feats[feats["p_success"] >= args.ps_min]
-    feats = feats[feats["p_badexit"] <= args.badexit_max]
-
-    # --- derive p_tail if primitives exist
-    tail_base = _try_find_tail_base_file(
-        args.profit_target,
-        args.stop_level,
-        args.max_extend_days,
+    cfg = GateConfig(
+        mode=str(args.mode),
+        tail_threshold=float(args.tail_threshold),
+        utility_quantile=float(args.utility_quantile),
+        rank_by=str(args.rank_by),
+        lambda_tail=float(args.lambda_tail),
+        topk=int(args.topk),
+        ps_min=float(args.ps_min),
+        badexit_max=float(args.badexit_max),
     )
 
-    tail_info = {"used": False}
+    # 필수 컬럼 최소 체크 (없으면 0으로 처리되는 형태는 score_features에서 이미 보장하긴 함)
+    for c in ["p_success", "p_tail", "p_badexit", "ret_score"]:
+        if c not in feats.columns:
+            feats[c] = 0.0
 
-    if tail_base:
-        base = read_table(tail_base, tail_base)
-        base = ensure_date_ticker_columns(base)
-        base["Date"] = norm_date(base["Date"])
-        base["Ticker"] = base["Ticker"].astype(str).str.upper().str.strip()
+    feats["p_success"] = pd.to_numeric(feats["p_success"], errors="coerce").fillna(0.0).astype(float)
+    feats["p_tail"] = pd.to_numeric(feats["p_tail"], errors="coerce").fillna(0.0).astype(float)
+    feats["p_badexit"] = pd.to_numeric(feats["p_badexit"], errors="coerce").fillna(0.0).astype(float)
+    feats["ret_score"] = pd.to_numeric(feats["ret_score"], errors="coerce").fillna(0.0).astype(float)
 
-        merged = feats.merge(
-            base,
-            on=["Date", "Ticker"],
-            how="left",
-        )
+    # gating filters
+    df = feats.copy()
 
-        p_tail_eff, audit = _derive_p_tail_from_primitives(
-            merged,
-            args.max_extend_days,
-            args.max_days,
-        )
+    # p_success min
+    df = df.loc[df["p_success"] >= float(cfg.ps_min)].copy()
 
-        if p_tail_eff is not None:
-            merged["p_tail"] = p_tail_eff
-            feats = merged
-            tail_info = audit
+    # p_badexit max
+    df = df.loc[df["p_badexit"] <= float(cfg.badexit_max)].copy()
 
-    feats["utility"] = build_utility(feats, args.lambda_tail)
+    # tail threshold condition depending on mode
+    if cfg.mode in ("tail", "tail_utility"):
+        df = df.loc[df["p_tail"] <= float(cfg.tail_threshold)].copy()
 
-    gated = gate_filter(
-        feats,
-        args.mode,
-        args.tail_threshold,
-        args.utility_quantile,
-    )
+    # utility condition depending on mode
+    if cfg.mode in ("utility", "tail_utility"):
+        df["utility"] = compute_utility(df, lam=float(cfg.lambda_tail))
+        # keep top quantile per day AFTER ranking metric is computed
+    else:
+        df["utility"] = compute_utility(df, lam=float(cfg.lambda_tail))
 
-    picks = rank_topk_per_day(gated, args.rank_by, args.topk)
+    if df.empty:
+        # still write empty picks file for downstream consistency
+        picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
+        pd.DataFrame(columns=["Date", "Ticker"]).to_csv(picks_path, index=False)
+        print(f"[DONE] wrote empty picks: {picks_path}")
+        return
 
+    # rank metric
+    if cfg.rank_by == "utility":
+        score_col = "utility"
+    elif cfg.rank_by == "ret_score":
+        score_col = "ret_score"
+    else:
+        score_col = "p_success"
+
+    df[score_col] = pd.to_numeric(df[score_col], errors="coerce").fillna(0.0).astype(float)
+
+    # per-day quantile filter (utility mode only)
+    if cfg.mode in ("utility", "tail_utility"):
+        uq = float(cfg.utility_quantile)
+
+        def _keep_quantile(g: pd.DataFrame) -> pd.DataFrame:
+            if len(g) <= 1:
+                return g
+            thr = float(np.quantile(g[score_col].to_numpy(dtype=float), uq))
+            return g.loc[g[score_col] >= thr]
+
+        df = df.groupby("Date", group_keys=False).apply(_keep_quantile).reset_index(drop=True)
+
+    # topk per day
+    df = df.sort_values(["Date", score_col], ascending=[True, False])
+    picks = df.groupby("Date", group_keys=False).head(int(cfg.topk))[["Date", "Ticker"]].copy()
+
+    picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
     picks.to_csv(picks_path, index=False)
-
-    meta = {
-        "rows_final": int(len(picks)),
-        "tail_info": tail_info,
-        "mode": args.mode,
-        "rank_by": args.rank_by,
-    }
-
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    print(f"[DONE] {picks_path} rows={len(picks)}")
+    print(f"[DONE] wrote picks: {picks_path} rows={len(picks)}")
 
 
 if __name__ == "__main__":
