@@ -158,36 +158,9 @@ def _strip_h_from_tag(tag: str) -> str:
     """
     ex) pt10_h40_sl10_ex30 -> pt10_sl10_ex30
     """
-    # remove patterns like _h40 or -h40 etc. (we only use _hNN here)
     core = re.sub(r"_h\d+", "", str(tag))
     core = core.replace("__", "_").strip("_")
     return core
-
-
-def _resolve_model_paths_for_h(base_path: str, stem_prefix: str, core_tag: str, h: int) -> tuple[str, str] | None:
-    """
-    Model naming rule (NEW):
-      app/<stem_prefix>_<core_tag>_h{H}.pkl
-    Example:
-      stem_prefix="model"      -> app/model_pt10_sl10_ex30_h30.pkl
-      stem_prefix="scaler"     -> app/scaler_pt10_sl10_ex30_h30.pkl
-      stem_prefix="tail_model" -> app/tail_model_pt10_sl10_ex30_h30.pkl
-      stem_prefix="tail_scaler"-> app/tail_scaler_pt10_sl10_ex30_h30.pkl
-
-    base_path is used only to locate the directory (usually app/xxx.pkl).
-    """
-    p = Path(base_path)
-    d = p.parent
-    m = d / f"{stem_prefix}_{core_tag}_h{int(h)}.pkl"
-    return str(m), str(m)
-
-
-def _exists(path: str) -> bool:
-    return Path(path).exists()
-
-
-def _load_model_and_scaler(model_path: Path, scaler_path: Path):
-    return joblib.load(str(model_path)), joblib.load(str(scaler_path))
 
 
 def _predict_proba_1(model, X: np.ndarray) -> np.ndarray:
@@ -205,6 +178,21 @@ def _predict_proba_1(model, X: np.ndarray) -> np.ndarray:
         y = model.predict(X)
         y = np.asarray(y, dtype=float)
         return np.clip(y, 0.0, 1.0)
+
+
+def _resolve_tau_paths(tag: str, base_model: str, base_scaler: str) -> tuple[Path, Path, str]:
+    """
+    ✅ tau는 tag 파일을 최우선으로 쓴다.
+      1) app/tau_model_{tag}.pkl / app/tau_scaler_{tag}.pkl
+      2) args --tau-model/--tau-scaler (base)
+    """
+    tag = (tag or "").strip()
+    if tag:
+        cand_m = Path("app") / f"tau_model_{tag}.pkl"
+        cand_s = Path("app") / f"tau_scaler_{tag}.pkl"
+        if cand_m.exists() and cand_s.exists():
+            return cand_m, cand_s, "tagged(app/tau_*_{tag}.pkl)"
+    return Path(base_model), Path(base_scaler), "base(--tau-model/--tau-scaler)"
 
 
 def main() -> None:
@@ -249,7 +237,7 @@ def main() -> None:
         help="comma-separated override. default=report(train_badexit_report.json) -> SSOT -> ps-features",
     )
 
-    # tau (single model)
+    # tau (tagged 우선)
     ap.add_argument("--tau-model", default="app/tau_model.pkl", type=str)
     ap.add_argument("--tau-scaler", default="app/tau_scaler.pkl", type=str)
     ap.add_argument(
@@ -300,10 +288,9 @@ def main() -> None:
     ps_cols = [c for c in ps_cols if c]
 
     # -------------------------
-    # tau_class / tau_H (single model; must run first)
+    # tau_class / tau_H (tagged 우선)
     # -------------------------
-    tau_model_path = Path(args.tau_model)
-    tau_scaler_path = Path(args.tau_scaler)
+    tau_model_path, tau_scaler_path, tau_src = _resolve_tau_paths(args.tag, args.tau_model, args.tau_scaler)
 
     if tau_model_path.exists() and tau_scaler_path.exists():
         tau_model = joblib.load(str(tau_model_path))
@@ -347,8 +334,8 @@ def main() -> None:
     else:
         feats["tau_class"] = -1
         feats["tau_pmax"] = 0.0
-        # tau 비활성 폴백은 중앙 H (40)
         feats["tau_H"] = int(hmap[1]) if (hmap and len(hmap) >= 2) else 40
+        tau_cols_src = "disabled(missing tau model/scaler)"
 
     # -------------------------
     # helper: per-H inference
@@ -368,11 +355,9 @@ def main() -> None:
         if not enabled:
             return pd.Series([default_value] * len(feats), index=feats.index, dtype=float), {"enabled": False}
 
-        # prepare X once (same features for all H models)
         feats_x = ensure_features_exist(feats, feat_cols, warn_prefix=f"[{col_out}:{feat_cols_src}]")
         X = feats_x[feat_cols].to_numpy(dtype=float)
 
-        # detect available H models
         base_dir = Path(base_model_path).parent
         models: dict[int, tuple[Path, Path]] = {}
         for h in sorted(set(hmap)):
@@ -382,7 +367,6 @@ def main() -> None:
                 models[int(h)] = (m_path, s_path)
 
         if not models:
-            # fallback to old single model/scaler if exists
             bm = Path(base_model_path)
             bs = Path(base_scaler_path)
             if bm.exists() and bs.exists():
@@ -397,13 +381,13 @@ def main() -> None:
                     "scaler": str(bs),
                     "core_tag": core_tag,
                 }
+            print(f"[WARN] no models found for {col_out} (core_tag={core_tag}) -> fill {default_value}")
             return pd.Series([default_value] * len(feats), index=feats.index, dtype=float), {
                 "enabled": True,
                 "mode": "missing_models",
                 "core_tag": core_tag,
             }
 
-        # group indices by tau_H
         tauH = pd.to_numeric(feats["tau_H"], errors="coerce").fillna(int(hmap[1]) if len(hmap) >= 2 else 40).astype(int)
         out = np.full(len(feats), default_value, dtype=float)
 
@@ -423,12 +407,10 @@ def main() -> None:
             Xs = scaler.transform(X[idx])
             out[idx] = _predict_proba_1(model, Xs)
 
-        # any tau_H not covered by found models -> fallback to nearest available
         covered = set(models.keys())
         missing_idx = np.where(~np.isin(tauH.to_numpy(), list(covered)))[0]
         if missing_idx.size > 0:
             avail = sorted(covered)
-            # pick nearest by absolute diff
             for i in missing_idx:
                 th = int(tauH.iloc[i])
                 nearest = min(avail, key=lambda x: abs(int(x) - th))
@@ -477,7 +459,8 @@ def main() -> None:
             tail_cols_src = "fallback(ps_cols)"
     tail_cols = [c for c in tail_cols if c]
 
-    tail_enabled = Path(args.tail_model).parent.exists()  # directory exists
+    # enabled는 "디렉토리"가 아니라 "뭔가 하나라도 존재할 가능성" 기준으로
+    tail_enabled = True
     tail_series, tail_audit = _score_by_h(
         col_out="p_tail",
         model_stem="tail_model",
@@ -509,7 +492,7 @@ def main() -> None:
             bad_cols_src = "fallback(ps_cols)"
     bad_cols = [c for c in bad_cols if c]
 
-    bad_enabled = Path(args.badexit_model).parent.exists()
+    bad_enabled = True
     bad_series, bad_audit = _score_by_h(
         col_out="p_badexit",
         model_stem="badexit_model",
@@ -542,8 +525,11 @@ def main() -> None:
     print("[INFO] scoring summary")
     print("tag:", args.tag)
     print("core_tag:", core_tag)
-    print("tau enabled:", bool(Path(args.tau_model).exists() and Path(args.tau_scaler).exists()))
+
+    print("tau model/scaler src:", tau_src, "|", str(tau_model_path), "/", str(tau_scaler_path))
+    print("tau cols source:", tau_cols_src)
     print("tau_h_map:", hmap)
+
     print("p_success cols source:", ps_cols_src, "cols:", ps_cols)
     print("p_success audit:", ps_audit)
     print("p_tail audit:", tail_audit)
