@@ -97,7 +97,12 @@ jobs:
       MAX_LEVERAGE_PCT: "1.00"
       CAP_COMPARE: "false"
       TP1_HOLD_CAP_SINGLE: "none"
-
+      # ---- regime filter (gate)
+      REGIME_MODE: "combo"          # off|basic|trend|dd|combo
+      REGIME_DD_MAX: "0.20"         # e.g. 0.20 => -20%
+      REGIME_RET20_MIN: "0.00"      # e.g. 0.00
+      REGIME_ATR_MAX: "1.30"        # e.g. 1.30
+      REGIME_LEVERAGE_MULT: "3.0"   # 3x universe
       # base folder (run_grid_workflow.sh 내부에서 TAU_SPLIT로 split 폴더 자동 분리)
       OUT_DIR: "data/signals"
       EXCLUDE_TICKERS: "SPY,^VIX"
