@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # scripts/score_features.py
 from __future__ import annotations
 
@@ -121,6 +122,11 @@ def load_tau_feature_cols(tag: str) -> list[str] | None:
     return _load_feature_cols_from_report(META_DIR / f"train_tau_report_{tag}.json")
 
 
+# ✅ NEW: badexit feature cols (report)
+def load_badexit_feature_cols() -> list[str] | None:
+    return _load_feature_cols_from_report(META_DIR / "train_badexit_report.json")
+
+
 def parse_tau_h_map(s: str) -> list[int]:
     parts = [p.strip() for p in (s or "").split(",") if p.strip()]
     if not parts:
@@ -171,7 +177,7 @@ def resolve_model_paths(base_model: str, base_scaler: str, tag: str) -> tuple[st
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Score features_model with p_success, p_tail, and tau_class/tau_H -> save features_scored."
+        description="Score features_model with p_success, p_tail, p_badexit, and tau_class/tau_H -> save features_scored."
     )
     ap.add_argument("--tag", required=True, type=str, help="e.g. pt10_h40_sl10_ex30")
 
@@ -199,6 +205,16 @@ def main() -> None:
         default="",
         type=str,
         help="comma-separated override. default=report(train_tail_report_{tag}) -> SSOT -> ps-features",
+    )
+
+    # ✅ NEW: p_badexit
+    ap.add_argument("--badexit-model", default="app/badexit_model.pkl", type=str)
+    ap.add_argument("--badexit-scaler", default="app/badexit_scaler.pkl", type=str)
+    ap.add_argument(
+        "--badexit-features",
+        default="",
+        type=str,
+        help="comma-separated override. default=report(train_badexit_report.json) -> SSOT -> ps-features",
     )
 
     # tau
@@ -297,6 +313,37 @@ def main() -> None:
         feats["p_tail"] = 0.0
 
     # -------------------------
+    # ✅ NEW: p_badexit (optional; report -> SSOT -> ps_cols)
+    # -------------------------
+    bad_model_path = Path(args.badexit_model)
+    bad_scaler_path = Path(args.badexit_scaler)
+    if bad_model_path.exists() and bad_scaler_path.exists():
+        bad_model = joblib.load(bad_model_path)
+        bad_scaler = joblib.load(bad_scaler_path)
+
+        if args.badexit_features.strip():
+            bad_cols = parse_csv_cols(args.badexit_features)
+            bad_cols_src = "--badexit-features"
+        else:
+            bad_cols = load_badexit_feature_cols()
+            if bad_cols:
+                bad_cols_src = "report(train_badexit_report.json)"
+            elif ssot_cols:
+                bad_cols = ssot_cols
+                bad_cols_src = "SSOT(data/meta/feature_cols.json)"
+            else:
+                bad_cols = ps_cols
+                bad_cols_src = "fallback(ps_cols)"
+
+        bad_cols = [c for c in bad_cols if c]
+        feats_bad = ensure_features_exist(feats, bad_cols, warn_prefix=f"[p_badexit:{bad_cols_src}]")
+        X_b = feats_bad[bad_cols].to_numpy(dtype=float)
+        X_b_s = bad_scaler.transform(X_b)
+        feats["p_badexit"] = bad_model.predict_proba(X_b_s)[:, 1].astype(float)
+    else:
+        feats["p_badexit"] = 0.0
+
+    # -------------------------
     # tau_class / tau_H (optional; report -> SSOT -> ps_cols)
     # -------------------------
     tau_model_path = Path(args.tau_model)
@@ -372,6 +419,7 @@ def main() -> None:
     print("p_success model/scaler:", ps_model_path, "/", ps_scaler_path)
     print("p_success cols source:", ps_cols_src, "cols:", ps_cols)
     print("p_tail enabled:", bool(tail_model_path.exists() and tail_scaler_path.exists()))
+    print("p_badexit enabled:", bool(bad_model_path.exists() and bad_scaler_path.exists()))
     print("tau enabled:", bool(tau_model_path.exists() and tau_scaler_path.exists()))
     print("tau_h_map:", hmap)
     print("=" * 60)
