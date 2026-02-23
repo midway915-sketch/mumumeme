@@ -32,7 +32,7 @@ FEATURES_MODEL_CSV = FEAT_DIR / "features_model.csv"
 
 
 # ------------------------------------------------------------
-# SSOT feature cols resolution (forced 18 cols, consistent with feature_spec)
+# SSOT feature cols resolution (forced 18 cols)
 # ------------------------------------------------------------
 def _validate_18_cols(cols: list[str], src: str) -> None:
     if len(cols) != 18:
@@ -40,9 +40,7 @@ def _validate_18_cols(cols: list[str], src: str) -> None:
     need = ["RelStrength"]
     miss = [c for c in need if c not in cols]
     if miss:
-        raise RuntimeError(
-            f"SSOT feature cols must include required features {need}. Missing={miss}. src={src}"
-        )
+        raise RuntimeError(f"SSOT feature cols must include {need}. Missing={miss}. src={src}")
 
 
 def resolve_feature_cols_forced(args_feature_cols: str) -> tuple[list[str], str]:
@@ -83,6 +81,7 @@ def read_prices() -> pd.DataFrame:
     df = df.copy()
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -120,9 +119,15 @@ def read_features_model() -> tuple[pd.DataFrame, str]:
 
 
 # ------------------------------------------------------------
-# Tail label primitives (DCA avg_price based)
+# DCA helper (avg price)
 # ------------------------------------------------------------
 def _dca_desired_multiplier(close_px: float, avg_px: float) -> float:
+    """
+    Engine-aligned simplified DCA rule:
+      - if close <= avg: full buy
+      - elif close <= avg*1.05: half buy
+      - else: 0
+    """
     if not np.isfinite(close_px) or close_px <= 0:
         return 0.0
     if not np.isfinite(avg_px) or avg_px <= 0:
@@ -134,7 +139,165 @@ def _dca_desired_multiplier(close_px: float, avg_px: float) -> float:
     return 0.0
 
 
-def compute_tail_primitives_dca_for_ticker(
+# ------------------------------------------------------------
+# (A) legacy p_tail label (for training tail_model) - avg 기반
+# ------------------------------------------------------------
+def compute_p_tail_label_dca(
+    g: pd.DataFrame,
+    profit_target: float,
+    max_days: int,
+    stop_level: float,
+    max_extend_days: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Legacy tail label (kept for train_tail_model compatibility):
+      - If SL hit first within H, and then TP is reached within extension window => p_tail=1 else 0
+    Also returns tail_pmax: max (close/avg -1) within (H+EX) window (diagnostic)
+
+    ✅ avg_price(DCA) based:
+      - entry day buy + DCA within H slots (unit=1/H normalized)
+      - SL/TP check uses intraday High/Low vs current avg thresholds
+      - same-day SL&TP => STOP first (conservative)
+    """
+    g = g.sort_values("Date").reset_index(drop=True)
+    close = pd.to_numeric(g["Close"], errors="coerce").to_numpy(dtype=float)
+    high = pd.to_numeric(g["High"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(g["Low"], errors="coerce").to_numpy(dtype=float)
+
+    n = len(g)
+    y_tail = np.zeros(n, dtype=int)
+    y_pmax = np.full(n, np.nan, dtype=float)
+
+    H = int(max(1, max_days))
+    EX = int(max(0, max_extend_days))
+    unit = 1.0 / float(H)
+
+    pt_mult = 1.0 + float(profit_target)
+    sl_mult = 1.0 + float(stop_level)
+
+    for i in range(n):
+        entry_px = close[i]
+        if not np.isfinite(entry_px) or entry_px <= 0:
+            continue
+
+        invested = unit
+        shares = unit / entry_px
+
+        end_main = min(n - 1, i + H)
+        end_ext = min(n - 1, i + H + EX)
+
+        tp_hit: int | None = None
+        sl_hit: int | None = None
+
+        # main scan
+        for day in range(i + 1, end_main + 1):
+            avg = invested / shares if (shares > 0 and invested > 0) else np.nan
+            if not np.isfinite(avg) or avg <= 0:
+                break
+
+            tp_px = avg * pt_mult
+            sl_px = avg * sl_mult
+
+            hit_stop = np.isfinite(low[day]) and low[day] <= sl_px
+            hit_profit = np.isfinite(high[day]) and high[day] >= tp_px
+
+            if hit_stop and hit_profit:
+                sl_hit = day
+                break
+            if hit_stop:
+                sl_hit = day
+                break
+            if hit_profit:
+                tp_hit = day
+                break
+
+            # DCA buy
+            slot_k = (day - i) + 1
+            if slot_k <= H:
+                cpx = close[day]
+                if np.isfinite(cpx) and cpx > 0:
+                    mult = _dca_desired_multiplier(cpx, avg)
+                    invest = unit * mult
+                    if invest > 0:
+                        invested += invest
+                        shares += invest / cpx
+
+        # tail_pmax over ext window
+        invested2 = unit
+        shares2 = unit / entry_px
+        best = -np.inf
+        for day in range(i + 1, end_ext + 1):
+            avg2 = invested2 / shares2 if (shares2 > 0 and invested2 > 0) else np.nan
+            if np.isfinite(avg2) and avg2 > 0 and np.isfinite(close[day]) and close[day] > 0:
+                best = max(best, float((close[day] / avg2) - 1.0))
+
+            slot_k = (day - i) + 1
+            if slot_k <= H:
+                cpx = close[day]
+                if np.isfinite(cpx) and cpx > 0 and np.isfinite(avg2) and avg2 > 0:
+                    mult = _dca_desired_multiplier(cpx, avg2)
+                    invest = unit * mult
+                    if invest > 0:
+                        invested2 += invest
+                        shares2 += invest / cpx
+
+        if np.isfinite(best):
+            y_pmax[i] = float(best)
+
+        # decide tail
+        if tp_hit is None and sl_hit is None:
+            y_tail[i] = 0
+        elif tp_hit is not None and (sl_hit is None or tp_hit <= sl_hit):
+            y_tail[i] = 0
+        else:
+            # SL first -> recovery to TP within extension
+            recovered = False
+
+            # rebuild avg state through sl_hit
+            invested3 = unit
+            shares3 = unit / entry_px
+            for day in range(i + 1, (sl_hit or end_main) + 1):
+                avg3 = invested3 / shares3 if (shares3 > 0 and invested3 > 0) else np.nan
+                slot_k = (day - i) + 1
+                if slot_k <= H and np.isfinite(avg3) and avg3 > 0:
+                    cpx = close[day]
+                    if np.isfinite(cpx) and cpx > 0:
+                        mult = _dca_desired_multiplier(cpx, avg3)
+                        invest = unit * mult
+                        if invest > 0:
+                            invested3 += invest
+                            shares3 += invest / cpx
+
+            start = (sl_hit + 1) if sl_hit is not None else (end_main + 1)
+            if start <= end_ext:
+                for day in range(start, end_ext + 1):
+                    avg3 = invested3 / shares3 if (shares3 > 0 and invested3 > 0) else np.nan
+                    if not (np.isfinite(avg3) and avg3 > 0):
+                        break
+                    tp_px = avg3 * pt_mult
+                    if np.isfinite(high[day]) and high[day] >= tp_px:
+                        recovered = True
+                        break
+
+                    slot_k = (day - i) + 1
+                    if slot_k <= H:
+                        cpx = close[day]
+                        if np.isfinite(cpx) and cpx > 0:
+                            mult = _dca_desired_multiplier(cpx, avg3)
+                            invest = unit * mult
+                            if invest > 0:
+                                invested3 += invest
+                                shares3 += invest / cpx
+
+            y_tail[i] = 1 if recovered else 0
+
+    return y_tail, y_pmax
+
+
+# ------------------------------------------------------------
+# (B) tail primitives (for gate derivation) - avg 기반
+# ------------------------------------------------------------
+def compute_tail_primitives_dca(
     g: pd.DataFrame,
     profit_target: float,
     hmax: int,
@@ -142,20 +305,13 @@ def compute_tail_primitives_dca_for_ticker(
     exmax: int,
 ) -> pd.DataFrame:
     """
-    ✅ 평단(DCA) 기반 tail 원천 라벨
-
-    원천 컬럼:
-      TauSLDays               : Hmax 내 SL 최초 터치까지 일수(1..Hmax), 없으면 NaN
-      TauTPDays               : Hmax 내 TP 최초 터치까지 일수(1..Hmax), 없으면 NaN
-      TauRecoverAfterSLDays   : SL 이후(다음날부터) TP 회복 최초까지 일수(1..EXmax), 없으면 NaN
-      TailPmaxEXmax           : (진입~Hmax+EXmax) 구간에서 close 기준 (close/avg - 1)의 최대값(진단용)
-
-    주의:
-      - DCA는 entry day 포함 Hmax 슬롯 동안만 수행 (unit=1/Hmax, normalized capital)
-      - SL/TP 판정은 intraday High/Low가 '직전 평단' 임계치 터치 여부로 판단 (동시 터치 시 STOP 우선)
-      - SL이 먼저인 케이스에서 "회복"은 SL 다음날부터 EXmax 구간에서 TP 터치로 정의
+    Primitives for downstream p_tail(H,EX) derivation:
+      TauSLDays               : first SL hit day within Hmax (1..Hmax)
+      TauTPDays               : first TP hit day within Hmax (1..Hmax)
+      TauRecoverAfterSLDays   : after SL (from next day), first TP hit within EXmax (1..EXmax)
+      TailPmaxEXmax           : max(close/avg -1) in window [1..Hmax+EXmax]
     """
-    g = g.sort_values("Date").reset_index(drop=True).copy()
+    g = g.sort_values("Date").reset_index(drop=True)
     close = pd.to_numeric(g["Close"], errors="coerce").to_numpy(dtype=float)
     high = pd.to_numeric(g["High"], errors="coerce").to_numpy(dtype=float)
     low = pd.to_numeric(g["Low"], errors="coerce").to_numpy(dtype=float)
@@ -163,6 +319,7 @@ def compute_tail_primitives_dca_for_ticker(
     n = len(g)
     H = int(max(1, hmax))
     EX = int(max(0, exmax))
+    unit = 1.0 / float(H)
 
     pt_mult = 1.0 + float(profit_target)
     sl_mult = 1.0 + float(stop_level)
@@ -172,37 +329,31 @@ def compute_tail_primitives_dca_for_ticker(
     tau_rec = np.full(n, np.nan, dtype=float)
     pmax = np.full(n, np.nan, dtype=float)
 
-    unit = 1.0 / float(H)
-
     for i in range(n):
         entry_px = close[i]
         if not np.isfinite(entry_px) or entry_px <= 0:
             continue
 
-        invested = 0.0
-        shares = 0.0
+        invested = unit
+        shares = unit / entry_px
 
-        # entry buy
-        shares += unit / entry_px
-        invested += unit
+        last_main = min(n - 1, i + H)
+        last_ext = min(n - 1, i + H + EX)
 
         sl_day: int | None = None
         tp_day: int | None = None
 
-        last_main = min(n - 1, i + H)          # inclusive
-        last_ext = min(n - 1, i + H + EX)      # inclusive
-
-        # main window scan (i+1..i+H)
+        # main scan
         for day in range(i + 1, last_main + 1):
-            avg = (invested / shares) if (shares > 0 and invested > 0) else np.nan
+            avg = invested / shares if (shares > 0 and invested > 0) else np.nan
             if not np.isfinite(avg) or avg <= 0:
                 break
 
             tp_px = avg * pt_mult
             sl_px = avg * sl_mult
 
-            hit_stop = np.isfinite(low[day]) and (low[day] <= sl_px)
-            hit_profit = np.isfinite(high[day]) and (high[day] >= tp_px)
+            hit_stop = np.isfinite(low[day]) and low[day] <= sl_px
+            hit_profit = np.isfinite(high[day]) and high[day] >= tp_px
 
             if hit_stop and hit_profit:
                 sl_day = day
@@ -214,7 +365,7 @@ def compute_tail_primitives_dca_for_ticker(
                 tp_day = day
                 break
 
-            # DCA buy (slot # = day-i+1)
+            # DCA buy
             slot_k = (day - i) + 1
             if slot_k <= H:
                 cpx = close[day]
@@ -222,25 +373,23 @@ def compute_tail_primitives_dca_for_ticker(
                     mult = _dca_desired_multiplier(cpx, avg)
                     invest = unit * mult
                     if invest > 0:
-                        shares += invest / cpx
                         invested += invest
+                        shares += invest / cpx
 
         if sl_day is not None:
             tau_sl[i] = float(sl_day - i)
         if tp_day is not None:
             tau_tp[i] = float(tp_day - i)
 
-        # compute TailPmaxEXmax: max close/avg -1 over [i+1..i+H+EX], with avg evolving until H then fixed
-        # We'll re-simulate avg path day by day and track max
+        # pmax over ext window
         invested2 = unit
         shares2 = unit / entry_px
         best = -np.inf
         for day in range(i + 1, last_ext + 1):
-            avg2 = (invested2 / shares2) if (shares2 > 0 and invested2 > 0) else np.nan
+            avg2 = invested2 / shares2 if (shares2 > 0 and invested2 > 0) else np.nan
             if np.isfinite(avg2) and avg2 > 0 and np.isfinite(close[day]) and close[day] > 0:
                 best = max(best, float((close[day] / avg2) - 1.0))
 
-            # DCA only within H slots
             slot_k = (day - i) + 1
             if slot_k <= H:
                 cpx = close[day]
@@ -248,36 +397,32 @@ def compute_tail_primitives_dca_for_ticker(
                     mult = _dca_desired_multiplier(cpx, avg2)
                     invest = unit * mult
                     if invest > 0:
-                        shares2 += invest / cpx
                         invested2 += invest
+                        shares2 += invest / cpx
 
         if np.isfinite(best):
             pmax[i] = float(best)
 
-        # recovery after SL: only when SL occurred first (or TP not within H before SL)
-        if sl_day is not None:
-            # If TP happened within H at/before SL, we treat as NOT tail path (no recovery label needed)
-            if tp_day is not None and tp_day <= sl_day:
-                continue
-
-            # simulate avg up to sl_day (so recovery uses correct avg trajectory)
+        # recovery after SL (only if SL exists and TP not before/equal SL in main)
+        if sl_day is not None and not (tp_day is not None and tp_day <= sl_day):
+            # rebuild avg state through sl_day
             invested3 = unit
             shares3 = unit / entry_px
             for day in range(i + 1, sl_day + 1):
-                avg3 = (invested3 / shares3) if (shares3 > 0 and invested3 > 0) else np.nan
+                avg3 = invested3 / shares3 if (shares3 > 0 and invested3 > 0) else np.nan
                 slot_k = (day - i) + 1
-                if slot_k <= H:
+                if slot_k <= H and np.isfinite(avg3) and avg3 > 0:
                     cpx = close[day]
-                    if np.isfinite(cpx) and cpx > 0 and np.isfinite(avg3) and avg3 > 0:
+                    if np.isfinite(cpx) and cpx > 0:
                         mult = _dca_desired_multiplier(cpx, avg3)
                         invest = unit * mult
                         if invest > 0:
-                            shares3 += invest / cpx
                             invested3 += invest
+                            shares3 += invest / cpx
 
-            # recovery scan from sl_day+1 .. last_ext
+            # scan sl_day+1 .. last_ext
             for day in range(sl_day + 1, last_ext + 1):
-                avg3 = (invested3 / shares3) if (shares3 > 0 and invested3 > 0) else np.nan
+                avg3 = invested3 / shares3 if (shares3 > 0 and invested3 > 0) else np.nan
                 if not (np.isfinite(avg3) and avg3 > 0):
                     break
                 tp_px = avg3 * pt_mult
@@ -285,7 +430,6 @@ def compute_tail_primitives_dca_for_ticker(
                     tau_rec[i] = float(day - sl_day)
                     break
 
-                # continue DCA until H slots end
                 slot_k = (day - i) + 1
                 if slot_k <= H:
                     cpx = close[day]
@@ -293,8 +437,8 @@ def compute_tail_primitives_dca_for_ticker(
                         mult = _dca_desired_multiplier(cpx, avg3)
                         invest = unit * mult
                         if invest > 0:
-                            shares3 += invest / cpx
                             invested3 += invest
+                            shares3 += invest / cpx
 
     out = pd.DataFrame(
         {
@@ -310,19 +454,28 @@ def compute_tail_primitives_dca_for_ticker(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build tail label primitives (DCA avg_price based) aligned to features_model only.")
+    ap = argparse.ArgumentParser(description="Build tail labels (legacy) + tail primitives (for gate derivation).")
+
     ap.add_argument("--profit-target", type=float, required=True)
-    ap.add_argument("--hmax", type=int, required=True, help="max holding days for primitive scan (e.g. 50)")
+    ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
-    ap.add_argument("--exmax", type=int, required=True, help="max extension days for recovery scan (e.g. 30)")
+    ap.add_argument("--max-extend-days", type=int, required=True)
+
+    # primitives window (optional; default: hmax=max(max-days, 50), exmax=max-extend-days)
+    ap.add_argument("--hmax", type=int, default=0)
+    ap.add_argument("--exmax", type=int, default=0)
 
     ap.add_argument("--feature-cols", type=str, default="", help="(DISALLOWED) override; kept for compatibility")
     args = ap.parse_args()
 
     pt = float(args.profit_target)
-    Hmax = int(args.hmax)
+    H = int(args.max_days)
     sl = float(args.stop_level)
-    Exmax = int(args.exmax)
+    ex = int(args.max_extend_days)
+
+    # primitives range
+    Hmax = int(args.hmax) if int(args.hmax) > 0 else int(max(H, 50))
+    Exmax = int(args.exmax) if int(args.exmax) > 0 else int(ex)
 
     cols, src = resolve_feature_cols_forced(args.feature_cols)
     print(f"[INFO] SSOT feature cols source={src} cols={cols}")
@@ -333,72 +486,145 @@ def main() -> None:
 
     pt100 = int(round(pt * 100))
     sl100 = int(round(abs(sl) * 100))
-    tag = f"pt{pt100}_sl{sl100}_hmax{Hmax}_exmax{Exmax}"
-
-    out_parq = LABEL_DIR / f"labels_tail_base_{tag}.parquet"
-    out_csv = LABEL_DIR / f"labels_tail_base_{tag}.csv"
-    meta_json = LABEL_DIR / f"labels_tail_base_{tag}_meta.json"
+    tag = f"pt{pt100}_h{H}_sl{sl100}_ex{ex}"
+    base_tag = f"pt{pt100}_sl{sl100}_hmax{Hmax}_exmax{Exmax}"
 
     LABEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    prim_list: list[pd.DataFrame] = []
-    for tkr, g in prices.groupby("Ticker", sort=False):
-        prim_list.append(
-            compute_tail_primitives_dca_for_ticker(
+    # -------------------------
+    # (1) legacy labels_tail_{tag} (for training tail_model)
+    # -------------------------
+    out_parq = LABEL_DIR / f"labels_tail_{tag}.parquet"
+    out_csv = LABEL_DIR / f"labels_tail_{tag}.csv"
+    meta_json = LABEL_DIR / f"labels_tail_{tag}_meta.json"
+
+    if (not out_parq.exists()) and (not out_csv.exists()):
+        y_list = []
+        pmax_list = []
+        key_list = []
+
+        for tkr, g in prices.groupby("Ticker", sort=False):
+            y_tail, y_pmax = compute_p_tail_label_dca(
                 g,
                 profit_target=pt,
-                hmax=Hmax,
+                max_days=H,
                 stop_level=sl,
-                exmax=Exmax,
+                max_extend_days=ex,
             )
-        )
+            dts = pd.to_datetime(g["Date"], errors="coerce").dt.tz_localize(None).to_numpy()
+            tkrs = np.array([tkr] * len(g))
+            key_list.append(pd.DataFrame({"Date": dts, "Ticker": tkrs}))
+            y_list.append(pd.Series(y_tail))
+            pmax_list.append(pd.Series(y_pmax))
 
-    prim = pd.concat(prim_list, ignore_index=True) if prim_list else pd.DataFrame()
-    if prim.empty:
-        raise RuntimeError("No tail primitives produced. Check prices input.")
+        keys = pd.concat(key_list, ignore_index=True)
+        y_tail_all = pd.concat(y_list, ignore_index=True).to_numpy(dtype=int)
+        y_pmax_all = pd.concat(pmax_list, ignore_index=True).to_numpy(dtype=float)
 
-    prim["Date"] = pd.to_datetime(prim["Date"], errors="coerce").dt.tz_localize(None)
-    prim["Ticker"] = prim["Ticker"].astype(str).str.upper().str.strip()
-    prim = prim.dropna(subset=["Date", "Ticker"]).reset_index(drop=True)
+        labels = keys.copy()
+        labels["p_tail"] = y_tail_all
+        labels["tail_pmax"] = y_pmax_all
 
-    # ✅ Align to features_model keys only
-    merged = feats[["Date", "Ticker"]].merge(prim, on=["Date", "Ticker"], how="inner")
-    if merged.empty:
-        raise RuntimeError(
-            "No overlap between features_model and computed tail primitives. "
-            "Check universe tickers & date ranges."
-        )
+        labels["Date"] = pd.to_datetime(labels["Date"], errors="coerce").dt.tz_localize(None)
+        labels["Ticker"] = labels["Ticker"].astype(str).str.upper().str.strip()
+        labels = labels.dropna(subset=["Date", "Ticker"]).reset_index(drop=True)
 
-    out = merged[
-        ["Date", "Ticker", "TauSLDays", "TauTPDays", "TauRecoverAfterSLDays", "TailPmaxEXmax"]
-    ].copy()
-    out = out.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
+        merged = feats[["Date", "Ticker"]].merge(labels, on=["Date", "Ticker"], how="inner")
+        if merged.empty:
+            raise RuntimeError("No overlap between features_model and computed tail labels.")
 
-    try:
-        out.to_parquet(out_parq, index=False)
-        print(f"[DONE] wrote parquet: {out_parq} rows={len(out)}")
-    except Exception as e:
-        print(f"[WARN] parquet save failed ({e}) -> writing csv only")
+        out = merged[["Date", "Ticker", "p_tail", "tail_pmax"]].copy()
+        out = out.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
 
-    out.to_csv(out_csv, index=False)
-    print(f"[DONE] wrote csv: {out_csv} rows={len(out)}")
+        try:
+            out.to_parquet(out_parq, index=False)
+            print(f"[DONE] wrote parquet: {out_parq} rows={len(out)}")
+        except Exception as e:
+            print(f"[WARN] parquet save failed ({e}) -> writing csv only")
 
-    meta = {
-        "tag": tag,
-        "profit_target": pt,
-        "hmax": Hmax,
-        "stop_level": sl,
-        "exmax": Exmax,
-        "built_at_utc": datetime.now(timezone.utc).isoformat(),
-        "ssot_feature_cols_source": src,
-        "ssot_feature_cols": cols,
-        "features_source_used": feats_src,
-        "label_cols": ["TauSLDays", "TauTPDays", "TauRecoverAfterSLDays", "TailPmaxEXmax"],
-        "notes": "DCA(avg_price) primitives. Build p_tail(H,EX) downstream from these taus.",
-    }
-    with open(meta_json, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    print(f"[DONE] wrote meta: {meta_json}")
+        out.to_csv(out_csv, index=False)
+        print(f"[DONE] wrote csv: {out_csv} rows={len(out)}")
+
+        meta = {
+            "tag": tag,
+            "profit_target": pt,
+            "max_days": H,
+            "stop_level": sl,
+            "max_extend_days": ex,
+            "built_at_utc": datetime.now(timezone.utc).isoformat(),
+            "ssot_feature_cols_source": src,
+            "ssot_feature_cols": cols,
+            "features_source_used": feats_src,
+            "label_cols": ["p_tail", "tail_pmax"],
+            "notes": "legacy tail labels for training. avg_price(DCA) based.",
+        }
+        meta_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[DONE] wrote meta: {meta_json}")
+    else:
+        print(f"[INFO] labels_tail_{tag} exists -> reuse")
+
+    # -------------------------
+    # (2) primitives labels_tail_base_{base_tag} (for gate derivation)
+    # -------------------------
+    base_parq = LABEL_DIR / f"labels_tail_base_{base_tag}.parquet"
+    base_csv = LABEL_DIR / f"labels_tail_base_{base_tag}.csv"
+    base_meta = LABEL_DIR / f"labels_tail_base_{base_tag}_meta.json"
+
+    if (not base_parq.exists()) and (not base_csv.exists()):
+        prim_list: list[pd.DataFrame] = []
+        for tkr, g in prices.groupby("Ticker", sort=False):
+            prim_list.append(
+                compute_tail_primitives_dca(
+                    g,
+                    profit_target=pt,
+                    hmax=Hmax,
+                    stop_level=sl,
+                    exmax=Exmax,
+                )
+            )
+        prim = pd.concat(prim_list, ignore_index=True) if prim_list else pd.DataFrame()
+        if prim.empty:
+            raise RuntimeError("No tail primitives produced. Check prices input.")
+
+        prim["Date"] = pd.to_datetime(prim["Date"], errors="coerce").dt.tz_localize(None)
+        prim["Ticker"] = prim["Ticker"].astype(str).str.upper().str.strip()
+        prim = prim.dropna(subset=["Date", "Ticker"]).reset_index(drop=True)
+
+        merged = feats[["Date", "Ticker"]].merge(prim, on=["Date", "Ticker"], how="inner")
+        if merged.empty:
+            raise RuntimeError("No overlap between features_model and computed tail primitives.")
+
+        outb = merged[
+            ["Date", "Ticker", "TauSLDays", "TauTPDays", "TauRecoverAfterSLDays", "TailPmaxEXmax"]
+        ].copy()
+        outb = outb.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last").reset_index(drop=True)
+
+        try:
+            outb.to_parquet(base_parq, index=False)
+            print(f"[DONE] wrote parquet: {base_parq} rows={len(outb)}")
+        except Exception as e:
+            print(f"[WARN] parquet save failed ({e}) -> writing csv only")
+
+        outb.to_csv(base_csv, index=False)
+        print(f"[DONE] wrote csv: {base_csv} rows={len(outb)}")
+
+        meta = {
+            "tag": base_tag,
+            "profit_target": pt,
+            "hmax": Hmax,
+            "stop_level": sl,
+            "exmax": Exmax,
+            "built_at_utc": datetime.now(timezone.utc).isoformat(),
+            "ssot_feature_cols_source": src,
+            "ssot_feature_cols": cols,
+            "features_source_used": feats_src,
+            "label_cols": ["TauSLDays", "TauTPDays", "TauRecoverAfterSLDays", "TailPmaxEXmax"],
+            "notes": "tail primitives for downstream p_tail(H=tau_H, EX) derivation. avg_price(DCA) based.",
+        }
+        base_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[DONE] wrote meta: {base_meta}")
+    else:
+        print(f"[INFO] labels_tail_base_{base_tag} exists -> reuse")
 
 
 if __name__ == "__main__":
