@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# scripts/run_walkforward_halfyear.sh
 set -euo pipefail
 
 # This script runs ONE walkforward half-year slice.
@@ -33,11 +34,9 @@ set -euo pipefail
 : "${BADEXIT_MAXES:?}"
 : "${MAX_LEVERAGE_PCT:?}"
 
-# ✅ optional-but-allowed-empty
+# ✅ optional (빈값/미설정이어도 OK)
 EXCLUDE_TICKERS="${EXCLUDE_TICKERS:-}"
-export EXCLUDE_TICKERS
 REQUIRE_FILES="${REQUIRE_FILES:-}"
-export REQUIRE_FILES
 
 # optional envs (regime + tau/dca)
 REGIME_MODE="${REGIME_MODE:-off}"
@@ -62,9 +61,10 @@ echo "[WF] TEST  $TEST_START -> $TEST_END"
 echo "[WF] CUT_DATE=$CUT_DATE"
 echo "[WF] LABEL_KEY=$LABEL_KEY"
 echo "[WF] OUT_DIR=$OUT_DIR"
-echo "[WF] EXCLUDE_TICKERS=${EXCLUDE_TICKERS:-<empty>}"
 echo "[WF] TAU_SPLIT=${TAU_SPLIT:-<none>} USE_TAU_H=$USE_TAU_H ENABLE_DCA=$ENABLE_DCA"
 echo "[WF] REGIME_MODE=$REGIME_MODE DD_MAX=$REGIME_DD_MAX RET20_MIN=$REGIME_RET20_MIN ATR_MAX=$REGIME_ATR_MAX LEV_MULT=$REGIME_LEVERAGE_MULT"
+echo "[WF] EXCLUDE_TICKERS=${EXCLUDE_TICKERS:-<empty>}"
+echo "[WF] REQUIRE_FILES=${REQUIRE_FILES:-<empty>}"
 
 # ---- Run your existing grid runner (already env-driven)
 chmod +x scripts/run_grid_workflow.sh
