@@ -6,18 +6,9 @@ scripts/predict_gate.py
 
 Gate picks generator.
 
-Supports two call styles (for pipeline compatibility):
-
-1) Workflow style (recommended)
-   - Provide: --out-dir (and optionally --require-files)
-   - Output paths derived as:
-       picks_{tag}_gate_{suffix}.csv
-       picks_meta_{tag}_gate_{suffix}.json
-
-2) Explicit style (legacy / ad-hoc)
-   - Provide: --out-csv (and optionally --meta-json)
-
-Either way, the content is identical.
+✅ NEW (B):
+- If tau_H exists and tail primitives (labels_tail_base_*.parquet/csv) are available,
+  derive p_tail_effective using H=tau_H and EX=max_extend_days, and use it for gating/utility.
 """
 
 import argparse
@@ -66,7 +57,6 @@ def ensure_required_files_exist(require_files: List[Path]) -> None:
 # Column normalization
 # ----------------------------
 def ensure_date_ticker_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure 'Date' and 'Ticker' exist as columns."""
     out = df.copy()
 
     if "Date" not in out.columns:
@@ -119,7 +109,6 @@ def apply_exclude_tickers(df: pd.DataFrame, exclude_csv: str) -> pd.DataFrame:
 # Features source selection
 # ----------------------------
 def pick_features_source(require_files: List[Path]) -> Tuple[Path, Path]:
-    """Prefer features_scored if present in require_files."""
     for p in require_files:
         name = p.name
         if "features_scored" in name and (name.endswith(".parquet") or name.endswith(".csv")):
@@ -128,6 +117,92 @@ def pick_features_source(require_files: List[Path]) -> Tuple[Path, Path]:
             return p.with_suffix(".parquet"), p
 
     return Path("data/features/features_scored.parquet"), Path("data/features/features_scored.csv")
+
+
+# ----------------------------
+# Tail primitives discovery + derivation
+# ----------------------------
+def _try_find_tail_base_file(pt: float, sl: float, exmax: int) -> tuple[Path | None, str]:
+    """
+    Find newest/most-covering labels_tail_base_ file for given pt/sl/exmax.
+    Pattern: data/labels/labels_tail_base_pt{pt100}_sl{sl100}_hmax*_exmax{exmax}.parquet|csv
+    Chooses the largest hmax available.
+    """
+    pt100 = int(round(float(pt) * 100))
+    sl100 = int(round(abs(float(sl)) * 100))
+    base = Path("data/labels")
+    if not base.exists():
+        return None, "data/labels missing"
+
+    # glob parquet first
+    pats = [
+        base / f"labels_tail_base_pt{pt100}_sl{sl100}_hmax*_exmax{int(exmax)}.parquet",
+        base / f"labels_tail_base_pt{pt100}_sl{sl100}_hmax*_exmax{int(exmax)}.csv",
+    ]
+
+    candidates: list[Path] = []
+    for pat in pats:
+        candidates.extend(sorted(base.glob(pat.name)))
+
+    if not candidates:
+        return None, "no tail_base candidates"
+
+    # pick with largest hmax in filename
+    def _hmax_of(p: Path) -> int:
+        s = p.stem  # no suffix
+        # ...hmax{H}_exmax{EX}
+        try:
+            part = s.split("_hmax", 1)[1]
+            h_str = part.split("_exmax", 1)[0]
+            return int(float(h_str))
+        except Exception:
+            return -1
+
+    candidates = sorted(candidates, key=_hmax_of, reverse=True)
+    return candidates[0], f"auto:{candidates[0].name}"
+
+
+def _derive_p_tail_from_primitives(df: pd.DataFrame, ex: int, default_h: int) -> tuple[pd.Series, dict]:
+    """
+    Derive p_tail_effective (0/1) using:
+      H_eff = tau_H if exists else default_h
+      sl_ok = TauSLDays <= H_eff
+      tp_before_sl = (TauTPDays <= H_eff) and (TauTPDays <= TauSLDays)
+      recovered = TauRecoverAfterSLDays <= EX
+      p_tail = 1 if sl_ok and (not tp_before_sl) and recovered else 0
+    """
+    d = df.copy()
+
+    # required columns check
+    need = ["TauSLDays", "TauTPDays", "TauRecoverAfterSLDays"]
+    have = [c for c in need if c in d.columns]
+    if len(have) != len(need):
+        return pd.Series([np.nan] * len(d), index=d.index), {"ok": False, "reason": f"missing primitives: {set(need)-set(have)}"}
+
+    H_eff = None
+    if "tau_H" in d.columns:
+        H_eff = pd.to_numeric(d["tau_H"], errors="coerce").fillna(default_h).astype(int)
+    else:
+        H_eff = pd.Series([int(default_h)] * len(d), index=d.index, dtype=int)
+
+    tau_sl = pd.to_numeric(d["TauSLDays"], errors="coerce")
+    tau_tp = pd.to_numeric(d["TauTPDays"], errors="coerce")
+    tau_rec = pd.to_numeric(d["TauRecoverAfterSLDays"], errors="coerce")
+
+    sl_ok = tau_sl.notna() & (tau_sl <= H_eff)
+    tp_before_sl = tau_tp.notna() & (tau_tp <= H_eff) & tau_sl.notna() & (tau_tp <= tau_sl)
+    recovered = tau_rec.notna() & (tau_rec <= int(ex))
+
+    p_tail_eff = (sl_ok & (~tp_before_sl) & recovered).astype(int)
+
+    audit = {
+        "ok": True,
+        "default_h": int(default_h),
+        "ex": int(ex),
+        "rows_with_tauH": int(d["tau_H"].notna().sum()) if "tau_H" in d.columns else 0,
+        "tail_eff_rate": float(p_tail_eff.mean()) if len(p_tail_eff) else 0.0,
+    }
+    return p_tail_eff, audit
 
 
 # ----------------------------
@@ -220,7 +295,6 @@ def main() -> None:
     ap.add_argument("--topk", type=int, default=1)
     ap.add_argument("--ps-min", type=float, default=0.0)
 
-    # ✅ NEW: badexit filter (0~1). default 1.0 means "no filter"
     ap.add_argument("--badexit-max", type=float, default=1.0, help="keep rows with p_badexit <= this (default 1.0)")
 
     ap.add_argument("--tag", type=str, required=True)
@@ -279,23 +353,76 @@ def main() -> None:
     feats["ret_score"] = coerce_num(feats, "ret_score", 0.0)
     feats["p_badexit"] = coerce_num(feats, "p_badexit", 0.0)
 
-    # counts (for meta/debug)
+    # tau_H (optional)
+    if "tau_H" in feats.columns:
+        feats["tau_H"] = pd.to_numeric(feats["tau_H"], errors="coerce").fillna(float(args.max_days)).astype(int)
+
     rows_loaded = int(len(feats))
 
     feats = apply_exclude_tickers(feats, args.exclude_tickers)
     rows_after_exclude = int(len(feats))
+
+    # -------------------------
+    # ✅ NEW: derive p_tail from primitives using tau_H
+    # -------------------------
+    tail_base_path, tail_base_src = _try_find_tail_base_file(
+        pt=float(args.profit_target),
+        sl=float(args.stop_level),
+        exmax=int(args.max_extend_days),
+    )
+    tail_derivation = {"ok": False, "reason": "not attempted"}
+    p_tail_source = "model_or_default"
+
+    if tail_base_path is not None and tail_base_path.exists():
+        # load base
+        if tail_base_path.suffix.lower() == ".parquet":
+            base_df = pd.read_parquet(tail_base_path)
+        else:
+            base_df = pd.read_csv(tail_base_path)
+
+        base_df = ensure_date_ticker_columns(base_df)
+        base_df["Date"] = norm_date(base_df["Date"])
+        base_df["Ticker"] = base_df["Ticker"].astype(str).str.upper().str.strip()
+        base_df = base_df.dropna(subset=["Date", "Ticker"]).reset_index(drop=True)
+
+        # merge
+        m = feats.merge(
+            base_df[["Date", "Ticker", "TauSLDays", "TauTPDays", "TauRecoverAfterSLDays", "TailPmaxEXmax"]],
+            on=["Date", "Ticker"],
+            how="left",
+            validate="many_to_one",
+        )
+
+        # derive
+        p_tail_eff, audit = _derive_p_tail_from_primitives(
+            m,
+            ex=int(args.max_extend_days),
+            default_h=int(args.max_days),
+        )
+        tail_derivation = {"base_src": tail_base_src, "base_path": str(tail_base_path), **audit}
+
+        if audit.get("ok", False):
+            m["p_tail"] = pd.to_numeric(p_tail_eff, errors="coerce").fillna(0).astype(int)
+            feats = m
+            p_tail_source = "derived(tau_H+tail_base)"
+        else:
+            feats = m
+            p_tail_source = "model_or_default+base_merge_failed"
+    else:
+        tail_derivation = {"ok": False, "reason": "tail_base not found", "base_src": tail_base_src}
+        p_tail_source = "model_or_default"
 
     # 1) p_success min
     ps_min = float(args.ps_min)
     feats = feats[feats["p_success"] >= ps_min].copy()
     rows_after_psmin = int(len(feats))
 
-    # 2) p_badexit max (first-pass filter)
+    # 2) p_badexit max
     badexit_max = float(args.badexit_max)
     feats = feats[feats["p_badexit"] <= badexit_max].copy()
     rows_after_badexit = int(len(feats))
 
-    # 3) utility + (tail/utility gate)
+    # 3) utility + gate
     feats["utility"] = build_utility(feats, float(args.lambda_tail))
 
     gated = gate_filter(
@@ -310,7 +437,20 @@ def main() -> None:
 
     keep_cols = [
         c
-        for c in ["Date", "Ticker", "p_success", "p_tail", "p_badexit", "ret_score", "utility"]
+        for c in [
+            "Date",
+            "Ticker",
+            "p_success",
+            "p_tail",
+            "p_badexit",
+            "ret_score",
+            "utility",
+            "tau_H",
+            "TauSLDays",
+            "TauTPDays",
+            "TauRecoverAfterSLDays",
+            "TailPmaxEXmax",
+        ]
         if c in picks.columns
     ]
     picks_out = picks[keep_cols].copy()
@@ -335,6 +475,10 @@ def main() -> None:
         "exclude_tickers": args.exclude_tickers,
         "features_src": features_src,
         "require_files": [str(p) for p in require_files],
+
+        # ✅ tail source
+        "p_tail_source": p_tail_source,
+        "tail_derivation": tail_derivation,
 
         # ✅ row audit trail
         "rows_loaded": rows_loaded,
