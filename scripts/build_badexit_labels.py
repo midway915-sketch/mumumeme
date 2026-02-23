@@ -12,7 +12,6 @@ if str(_REPO_ROOT) not in sys.path:
 import argparse
 import re
 from pathlib import Path
-
 import pandas as pd
 
 from scripts.feature_spec import get_feature_cols
@@ -100,21 +99,18 @@ def _parse_trades_file(path: Path) -> pd.DataFrame:
 # main
 # ----------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build BadExit labels (workflow-compatible).")
+    ap = argparse.ArgumentParser(description="Build BadExit labels (tag-safe).")
 
-    # ✅ 다른 라벨들과 동일한 인터페이스
     ap.add_argument("--profit-target", type=float, required=True)
     ap.add_argument("--max-days", type=int, required=True)
     ap.add_argument("--stop-level", type=float, required=True)
     ap.add_argument("--max-extend-days", type=int, required=True)
 
     ap.add_argument("--signals-dir", type=str, default=str(SIGNALS_DIR))
-    ap.add_argument("--pattern", type=str, default="sim_engine_trades_*.parquet")
     ap.add_argument("--also-read-csv", action="store_true")
 
     args = ap.parse_args()
 
-    # ---- EX_TAG 통일 (tail과 동일 규칙)
     pt100 = int(round(args.profit_target * 100))
     sl100 = int(round(abs(args.stop_level) * 100))
     EX_TAG = f"pt{pt100}_h{args.max_days}_sl{sl100}_ex{args.max_extend_days}"
@@ -144,14 +140,20 @@ def main() -> None:
     if missing:
         raise ValueError(f"features_model missing SSOT cols: {missing}")
 
-    # ---- ingest trades
+    # ---- 정확히 해당 EX_TAG trades만 ingest
     signals_dir = Path(args.signals_dir)
-    paths = sorted(signals_dir.glob(args.pattern))
+    if not signals_dir.exists():
+        raise FileNotFoundError(f"signals_dir not found: {signals_dir}")
+
+    pattern = f"sim_engine_trades_{EX_TAG}*.parquet"
+    paths = sorted(signals_dir.glob(pattern))
+
     if args.also_read_csv:
-        paths += sorted(signals_dir.glob(re.sub(r"\.parquet$", ".csv", args.pattern)))
+        pattern_csv = f"sim_engine_trades_{EX_TAG}*.csv"
+        paths += sorted(signals_dir.glob(pattern_csv))
 
     if not paths:
-        raise FileNotFoundError(f"No trades files found: {signals_dir}/{args.pattern}")
+        raise FileNotFoundError(f"No trades files found for tag={EX_TAG} in {signals_dir}")
 
     parts = []
     for p in paths:
@@ -182,9 +184,8 @@ def main() -> None:
     merged.to_csv(out_csv, index=False)
 
     print(f"[DONE] wrote: {out_parq} rows={len(merged)}")
-    if len(merged):
-        print(f"[INFO] BadExit rate={merged['BadExit'].mean():.4f}")
-        print(f"[INFO] EX_TAG={EX_TAG}")
+    print(f"[INFO] BadExit rate={merged['BadExit'].mean():.4f}")
+    print(f"[INFO] EX_TAG={EX_TAG}")
 
 
 if __name__ == "__main__":
