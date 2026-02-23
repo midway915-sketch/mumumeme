@@ -113,7 +113,10 @@ jobs:
       BADEXIT_MAXES: "1.00"
       MAX_LEVERAGE_PCT: "1.0"
       EXCLUDE_TICKERS: ""
-      REQUIRE_FILES: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl,app/tail_model.pkl,app/tail_scaler.pkl"
+            # required files for predict_gate fail-fast (comma CSV)
+      REQUIRE_FILES:
+        required: false
+        default: ""
 
       # ---- regime filter 기본값
       REGIME_MODE: "off"
