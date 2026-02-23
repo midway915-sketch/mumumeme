@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# scripts/run_grid_workflow.sh
 set -euo pipefail
 
 PRED="scripts/predict_gate.py"
@@ -37,21 +38,17 @@ echo "[INFO] TAU_SPLIT=${TAU_SPLIT:-<none>}"
 : "${BADEXIT_MAXES:?}"
 : "${MAX_LEVERAGE_PCT:?}"
 
-# REQUIRE_FILES optional (empty allowed)
-REQUIRE_FILES="${REQUIRE_FILES:-}"
-export REQUIRE_FILES
+# ✅ optional (빈값/미설정이어도 OK)
 EXCLUDE_TICKERS="${EXCLUDE_TICKERS:-}"
-export EXCLUDE_TICKERS
+REQUIRE_FILES="${REQUIRE_FILES:-}"
 
-# ✅ NEW (ENV-driven in predict_gate.py): Regime filter env (optional; defaults are safe)
-REGIME_FILTER="${REGIME_FILTER:-false}"     # true|false
-REGIME_MODE="${REGIME_MODE:-combo}"         # dd|trend|basic|combo
-REGIME_LEVERAGE="${REGIME_LEVERAGE:-3.0}"   # UPRO=3
-REGIME_MAX_DD="${REGIME_MAX_DD:-0.25}"      # levered-equivalent max drawdown
-REGIME_MAX_ATR="${REGIME_MAX_ATR:-0.10}"    # levered-equivalent max ATR_ratio
-REGIME_MIN_RET20="${REGIME_MIN_RET20:--0.02}" # levered-equivalent min 20d return
-export REGIME_FILTER REGIME_MODE REGIME_LEVERAGE REGIME_MAX_DD REGIME_MAX_ATR REGIME_MIN_RET20
-echo "[INFO] REGIME_FILTER=$REGIME_FILTER MODE=$REGIME_MODE LEV=$REGIME_LEVERAGE MAX_DD=$REGIME_MAX_DD MAX_ATR=$REGIME_MAX_ATR MIN_RET20=$REGIME_MIN_RET20"
+# ✅ NEW: Regime filter env (optional; defaults are safe)
+REGIME_MODE="${REGIME_MODE:-off}"                   # off|basic|trend|dd|combo
+REGIME_DD_MAX="${REGIME_DD_MAX:-0.20}"              # levered 기준
+REGIME_RET20_MIN="${REGIME_RET20_MIN:-0.00}"
+REGIME_ATR_MAX="${REGIME_ATR_MAX:-1.30}"            # levered 기준
+REGIME_LEVERAGE_MULT="${REGIME_LEVERAGE_MULT:-3.0}" # 3x universe 고려
+echo "[INFO] REGIME_MODE=$REGIME_MODE DD_MAX=$REGIME_DD_MAX RET20_MIN=$REGIME_RET20_MIN ATR_MAX=$REGIME_ATR_MAX LEV_MULT=$REGIME_LEVERAGE_MULT"
 
 # re-eval thresholds (engine args)
 REVAL_PS_STRONG="${REVAL_PS_STRONG:-0.70}"
@@ -103,7 +100,7 @@ echo "[INFO] CAP_COMPARE=$CAP_COMPARE"
 echo "[INFO] TP1_HOLD_CAP_SINGLE=$TP1_HOLD_CAP_SINGLE"
 echo "[INFO] TP1_HOLD_CAP_MODES=$TP1_HOLD_CAP_MODES"
 
-# ✅ Tau/DCA 옵션
+# ✅ NEW: Tau/DCA 옵션 (엔진이 지원할 때만 켜서 전달)
 USE_TAU_H="${USE_TAU_H:-false}"
 USE_TAU_H="$(echo "$USE_TAU_H" | tr '[:upper:]' '[:lower:]' | xargs)"
 if [[ "$USE_TAU_H" != "true" && "$USE_TAU_H" != "false" ]]; then
@@ -168,21 +165,17 @@ picks_hash() {
   python - <<PY
 import hashlib, pandas as pd
 from pathlib import Path
-
 p = Path("$file")
 if not p.exists():
     print("")
     raise SystemExit(0)
-
 df = pd.read_csv(p)
 if "Date" in df.columns:
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None).astype(str)
 if "Ticker" in df.columns:
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-
 cols = [c for c in ["Date","Ticker"] if c in df.columns]
 df = df[cols].dropna().sort_values(cols).reset_index(drop=True)
-
 payload = df.to_csv(index=False).encode("utf-8")
 print(hashlib.sha1(payload).hexdigest())
 PY
@@ -202,6 +195,8 @@ echo "[INFO] TOPK_CONFIGS=$TOPK_CONFIGS"
 echo "[INFO] TRAIL_STOPS=$TRAIL_STOPS TP1_FRAC=$TP1_FRAC ENABLE_TRAILING=$ENABLE_TRAILING"
 echo "[INFO] PS_MINS=$PS_MINS BADEXIT_MAXES=$BADEXIT_MAXES MAX_LEVERAGE_PCT=$MAX_LEVERAGE_PCT"
 echo "[INFO] TP1_TRAIL_UNLIMITED=$TP1_TRAIL_UNLIMITED"
+echo "[INFO] EXCLUDE_TICKERS=${EXCLUDE_TICKERS:-<empty>}"
+echo "[INFO] REQUIRE_FILES=${REQUIRE_FILES:-<empty>}"
 
 DEFAULT_TMAX="$(first_csv_item "$P_TAIL_THRESHOLDS")"
 DEFAULT_UQ="$(first_csv_item "$UTILITY_QUANTILES")"
@@ -210,9 +205,6 @@ if [ -z "$DEFAULT_TMAX" ] || [ -z "$DEFAULT_UQ" ] || [ -z "$DEFAULT_BE" ]; then
   echo "[ERROR] P_TAIL_THRESHOLDS / UTILITY_QUANTILES / BADEXIT_MAXES must be non-empty CSV."
   exit 1
 fi
-echo "[INFO] DEFAULT_TMAX(for unused dim)=$DEFAULT_TMAX"
-echo "[INFO] DEFAULT_UQ(for unused dim)=$DEFAULT_UQ"
-echo "[INFO] DEFAULT_BE(for unused dim)=$DEFAULT_BE"
 
 HASH_DIR="$OUT_DIR/_picks_hash"
 mkdir -p "$HASH_DIR"
@@ -273,7 +265,6 @@ PY
                 echo "[RUN] mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin badexit_max=$be topk=$K weights=$W trail=$trail base_suffix=$base_suffix"
                 echo "=============================="
 
-                # ---- PREDICT (regime args removed; ENV is already exported above)
                 python "$PRED" \
                   --profit-target "$PROFIT_TARGET" \
                   --max-days "$MAX_DAYS" \
@@ -291,7 +282,12 @@ PY
                   --suffix "$base_suffix" \
                   --exclude-tickers "$EXCLUDE_TICKERS" \
                   --out-dir "$OUT_DIR" \
-                  --require-files "$REQUIRE_FILES"
+                  --require-files "$REQUIRE_FILES" \
+                  --regime-mode "$REGIME_MODE" \
+                  --regime-dd-max "$REGIME_DD_MAX" \
+                  --regime-ret20-min "$REGIME_RET20_MIN" \
+                  --regime-atr-max "$REGIME_ATR_MAX" \
+                  --regime-leverage-mult "$REGIME_LEVERAGE_MULT"
 
                 picks_path="$OUT_DIR/picks_${TAG}_gate_${base_suffix}.csv"
                 if [ ! -f "$picks_path" ]; then
@@ -313,7 +309,6 @@ PY
                   continue
                 fi
 
-                # ---- DEDUPE (log only)
                 if [ "$DEDUP_PICKS" = "true" ]; then
                   h="$(picks_hash "$picks_path")"
                   if is_hash_seen "$h"; then
@@ -323,7 +318,6 @@ PY
                   fi
                 fi
 
-                # ---- SIMULATE + SUMMARIZE (cap modes)
                 while read -r cap_mode; do
                   cap_mode="$(echo "$cap_mode" | tr '[:upper:]' '[:lower:]' | xargs)"
                   [ -z "$cap_mode" ] && continue
@@ -333,17 +327,12 @@ PY
                   fi
 
                   cap_suffix="${base_suffix}_cap${cap_mode}"
-
-                  echo "------------------------------"
                   echo "[SIM] cap_mode=$cap_mode cap_suffix=$cap_suffix"
-                  echo "------------------------------"
 
                   SIM_EXTRA_ARGS=()
-
                   if [ "$USE_TAU_H" = "true" ]; then
                     SIM_EXTRA_ARGS+=( --use-tau-h "true" )
                   fi
-
                   if [ "$ENABLE_DCA" = "true" ]; then
                     SIM_EXTRA_ARGS+=( --enable-dca "true" )
                     [ -n "$DCA_MAX_ADDS" ] && SIM_EXTRA_ARGS+=( --dca-max-adds "$DCA_MAX_ADDS" )
