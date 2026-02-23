@@ -39,6 +39,14 @@ echo "[INFO] TAU_SPLIT=${TAU_SPLIT:-<none>}"
 : "${EXCLUDE_TICKERS:?}"
 : "${REQUIRE_FILES:?}"
 
+# ✅ NEW: Regime filter env (optional; defaults are safe)
+REGIME_MODE="${REGIME_MODE:-off}"                # off|basic|trend|dd|combo
+REGIME_DD_MAX="${REGIME_DD_MAX:-0.20}"           # e.g. 0.20 => -20% (levered 기준)
+REGIME_RET20_MIN="${REGIME_RET20_MIN:-0.00}"     # e.g. 0.00
+REGIME_ATR_MAX="${REGIME_ATR_MAX:-1.30}"         # e.g. 1.30 (levered 기준)
+REGIME_LEVERAGE_MULT="${REGIME_LEVERAGE_MULT:-3.0}" # 3x universe 고려
+echo "[INFO] REGIME_MODE=$REGIME_MODE DD_MAX=$REGIME_DD_MAX RET20_MIN=$REGIME_RET20_MIN ATR_MAX=$REGIME_ATR_MAX LEV_MULT=$REGIME_LEVERAGE_MULT"
+
 # re-eval thresholds (engine args)
 REVAL_PS_STRONG="${REVAL_PS_STRONG:-0.70}"
 REVAL_PT_STRONG="${REVAL_PT_STRONG:-0.20}"
@@ -277,7 +285,12 @@ PY
                   --suffix "$base_suffix" \
                   --exclude-tickers "$EXCLUDE_TICKERS" \
                   --out-dir "$OUT_DIR" \
-                  --require-files "$REQUIRE_FILES"
+                  --require-files "$REQUIRE_FILES" \
+                  --regime-mode "$REGIME_MODE" \
+                  --regime-dd-max "$REGIME_DD_MAX" \
+                  --regime-ret20-min "$REGIME_RET20_MIN" \
+                  --regime-atr-max "$REGIME_ATR_MAX" \
+                  --regime-leverage-mult "$REGIME_LEVERAGE_MULT"
 
                 picks_path="$OUT_DIR/picks_${TAG}_gate_${base_suffix}.csv"
                 if [ ! -f "$picks_path" ]; then
