@@ -184,19 +184,19 @@ jobs:
           cat /tmp/matrix.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-  run:
-    needs: make-matrix
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
+        run:
+          needs: make-matrix
+          runs-on: ubuntu-latest
+          strategy:
+            fail-fast: false
+            matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
+          steps:
+            - uses: actions/checkout@v4
+      
+            - uses: actions/setup-python@v5
+              with:
+                python-version: "3.11"
+      
       - name: Install deps
         run: |
           python -m pip install -U pip
