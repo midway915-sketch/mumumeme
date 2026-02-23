@@ -42,6 +42,9 @@ echo "[INFO] TAU_SPLIT=${TAU_SPLIT:-<none>}"
 EXCLUDE_TICKERS="${EXCLUDE_TICKERS:-}"
 REQUIRE_FILES="${REQUIRE_FILES:-}"
 
+DATE_FROM="${WF_DATE_FROM:-}"
+DATE_TO="${WF_DATE_TO:-}"
+
 # ✅ NEW: Regime filter env (optional; defaults are safe)
 REGIME_MODE="${REGIME_MODE:-off}"                   # off|basic|trend|dd|combo
 REGIME_DD_MAX="${REGIME_DD_MAX:-0.20}"              # levered 기준
@@ -287,7 +290,9 @@ PY
                   --regime-dd-max "$REGIME_DD_MAX" \
                   --regime-ret20-min "$REGIME_RET20_MIN" \
                   --regime-atr-max "$REGIME_ATR_MAX" \
-                  --regime-leverage-mult "$REGIME_LEVERAGE_MULT"
+                  --regime-leverage-mult "$REGIME_LEVERAGE_MULT" \
+                  ${DATE_FROM:+--date-from "$DATE_FROM"} \
+                  ${DATE_TO:+--date-to "$DATE_TO"}
 
                 picks_path="$OUT_DIR/picks_${TAG}_gate_${base_suffix}.csv"
                 if [ ! -f "$picks_path" ]; then
