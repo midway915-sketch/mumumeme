@@ -5,12 +5,20 @@ PRED="scripts/predict_gate.py"
 SIM="scripts/simulate_single_position_engine.py"
 SUM="scripts/summarize_sim_trades.py"
 
-OUT_DIR="${OUT_DIR:-data/signals}"
+# ✅ split별 signals 폴더로 분리 (예: data/signals/taucur, data/signals/tauq255025)
+TAU_SPLIT="${TAU_SPLIT:-}"
+BASE_OUT_DIR="${OUT_DIR:-data/signals}"
+if [ -n "$TAU_SPLIT" ]; then
+  OUT_DIR="${BASE_OUT_DIR}/${TAU_SPLIT}"
+else
+  OUT_DIR="${BASE_OUT_DIR}"
+fi
 mkdir -p "$OUT_DIR"
 
 TAG="${LABEL_KEY:-run}"
 echo "[INFO] TAG=$TAG"
 echo "[INFO] OUT_DIR=$OUT_DIR"
+echo "[INFO] TAU_SPLIT=${TAU_SPLIT:-<none>}"
 
 # Required envs
 : "${PROFIT_TARGET:?}"
@@ -26,7 +34,7 @@ echo "[INFO] OUT_DIR=$OUT_DIR"
 : "${ENABLE_TRAILING:?}"
 : "${TOPK_CONFIGS:?}"
 : "${PS_MINS:?}"
-: "${BADEXIT_MAXES:?}"          # ✅ NEW
+: "${BADEXIT_MAXES:?}"
 : "${MAX_LEVERAGE_PCT:?}"
 : "${EXCLUDE_TICKERS:?}"
 : "${REQUIRE_FILES:?}"
@@ -203,7 +211,7 @@ while read -r mode; do
     while read -r uq; do
       while read -r rank_by; do
         while read -r psmin; do
-          while read -r be; do   # ✅ NEW: badexit_max loop
+          while read -r be; do
             while read -r topk_line; do
               K="${topk_line%%|*}"
               W="${topk_line#*|}"
@@ -213,14 +221,14 @@ while read -r mode; do
                 uq_s="$(suffix_float "$uq")"
                 lam_s="$(suffix_float "$LAMBDA_TAIL")"
                 ps_s="$(suffix_float "$psmin")"
-                be_s="$(suffix_float "$be")"     # ✅ NEW
+                be_s="$(suffix_float "$be")"
                 tr_s="$(suffix_float "$trail")"
                 tp_pct="$(python - <<PY
 f=float("$TP1_FRAC")
 print(int(round(f*100)))
 PY
 )"
-                tu_s="tu1"  # ✅ 옵션B 제거 -> 항상 tu1
+                tu_s="tu1"
 
                 base_suffix="${mode}_${tu_s}_t${t_s}_q${uq_s}_r${rank_by}_lam${lam_s}_ps${ps_s}_be${be_s}_k${K}_w$(echo "$W" | tr ',' '_')_tp${tp_pct}_tr${tr_s}"
 
@@ -241,7 +249,7 @@ PY
                   --lambda-tail "$LAMBDA_TAIL" \
                   --topk "$K" \
                   --ps-min "$psmin" \
-                  --badexit-max "$be" \        # ✅ NEW
+                  --badexit-max "$be" \
                   --tag "$TAG" \
                   --suffix "$base_suffix" \
                   --exclude-tickers "$EXCLUDE_TICKERS" \
@@ -331,7 +339,7 @@ PY
 
               done < <(split_csv "$TRAIL_STOPS")
             done < <(split_scsv "$TOPK_CONFIGS")
-          done < <(split_csv "$BADEXIT_MAXES"))
+          done < <(split_csv "$BADEXIT_MAXES")
         done < <(split_csv "$PS_MINS")
       done < <(split_csv "$RANK_METRICS")
     done < <(split_csv "$UQ_LIST")
