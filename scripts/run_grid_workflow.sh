@@ -36,9 +36,12 @@ echo "[INFO] TAU_SPLIT=${TAU_SPLIT:-<none>}"
 : "${PS_MINS:?}"
 : "${BADEXIT_MAXES:?}"
 : "${MAX_LEVERAGE_PCT:?}"
-: "${REQUIRE_FILES:?}"
 
+# REQUIRE_FILES optional (empty allowed)
+REQUIRE_FILES="${REQUIRE_FILES:-}"
+export REQUIRE_FILES
 EXCLUDE_TICKERS="${EXCLUDE_TICKERS:-}"
+export EXCLUDE_TICKERS
 
 # ✅ NEW (ENV-driven in predict_gate.py): Regime filter env (optional; defaults are safe)
 REGIME_FILTER="${REGIME_FILTER:-false}"     # true|false
