@@ -1,0 +1,31 @@
+name: raw-data
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_name:
+        description: "artifact name to upload (e.g. raw-data)"
+        required: true
+        default: "raw-data"
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sanity check raw files exist
+        shell: bash
+        run: |
+          ls -la data/raw || true
+          if [ ! -f "data/raw/prices.parquet" ] && [ ! -f "data/raw/prices.csv" ]; then
+            echo "[ERROR] Missing data/raw/prices.parquet (or prices.csv)"
+            exit 2
+          fi
+
+      - name: Upload raw data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: data/raw
+          if-no-files-found: error
