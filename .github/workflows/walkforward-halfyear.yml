@@ -45,19 +45,33 @@ jobs:
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # fetch_prices.py에 필요
           pip install -U yfinance pandas pyarrow
+
+      - name: Build universe.csv (if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          if [ ! -f data/universe.csv ]; then
+            echo "[INFO] data/universe.csv missing -> generating via scripts/universe.py"
+            python scripts/universe.py
+          fi
+          ls -la data | sed -n '1,200p'
+          test -f data/universe.csv
 
       - name: Fetch raw prices (Yahoo)
         env:
-          # fetch_prices.py가 MAX_YEARS env를 읽도록 너가 이미 수정해둔 버전 기준
+          # fetch_prices.py가 MAX_YEARS env를 읽도록 너가 수정해둔 버전 기준
           MAX_YEARS: "16"
         run: |
+          set -euo pipefail
           mkdir -p data/raw
           python scripts/fetch_prices.py --include-extra
           ls -la data/raw
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
-      - name: Upload raw-data artifact
+      - name: Upload artifact raw-data
         uses: actions/upload-artifact@v4
         with:
           name: raw-data
