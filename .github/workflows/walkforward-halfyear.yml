@@ -31,7 +31,125 @@ on:
         required: true
         default: "-0.10"
 
+
 jobs:
+  raw-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -U yfinance pandas pyarrow
+
+      - name: Fetch raw prices (Yahoo)
+        env:
+          MAX_YEARS: "16"   # 필요하면 조정 (예: 16년)
+        run: |
+          mkdir -p data/raw
+          python scripts/fetch_prices.py --include-extra
+          ls -la data/raw
+
+      - name: Upload raw-data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+          if-no-files-found: error
+
+  make-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Generate half-year matrix JSON
+        id: gen
+        shell: bash
+        run: |
+          python - <<'PY' > /tmp/matrix.json
+          import json, re
+          from datetime import date, timedelta
+
+          wf_start = "${{ inputs.wf_start }}".strip()
+          wf_end   = "${{ inputs.wf_end }}".strip()
+          train_years = int("${{ inputs.train_years }}")
+
+          m = re.fullmatch(r"(\d{4})H([12])", wf_start)
+          n = re.fullmatch(r"(\d{4})H([12])", wf_end)
+          if not m or not n:
+            raise SystemExit("wf_start/wf_end must be like 2018H1")
+
+          sy, sh = int(m.group(1)), int(m.group(2))
+          ey, eh = int(n.group(1)), int(n.group(2))
+
+          def half_start(y,h): return date(y,1,1) if h==1 else date(y,7,1)
+          def half_end(y,h):   return date(y,6,30) if h==1 else date(y,12,31)
+
+          items=[]
+          y,h=sy,sh
+          while True:
+            period=f"{y}H{h}"
+            test_start=half_start(y,h); test_end=half_end(y,h)
+            vy,vh=(y-1,2) if h==1 else (y,1)
+            valid_start=half_start(vy,vh); valid_end=half_end(vy,vh)
+            train_end=valid_start - timedelta(days=1)
+            train_start=date(train_end.year-train_years+1, train_end.month, train_end.day)
+            cut_date=valid_end
+            items.append({
+              "period":period,
+              "TRAIN_START":train_start.isoformat(),
+              "TRAIN_END":train_end.isoformat(),
+              "VALID_START":valid_start.isoformat(),
+              "VALID_END":valid_end.isoformat(),
+              "TEST_START":test_start.isoformat(),
+              "TEST_END":test_end.isoformat(),
+              "CUT_DATE":cut_date.isoformat(),
+            })
+            if y==ey and h==eh: break
+            if h==1: h=2
+            else: y+=1; h=1
+
+          print(json.dumps({"include":items}, ensure_ascii=False))
+          PY
+
+          echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/matrix.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+  run:
+    needs: [raw-data, make-matrix]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Download raw-data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+
+      - name: Verify raw-data present
+        run: |
+          ls -la data/raw
+          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
   make-matrix:
     runs-on: ubuntu-latest
     outputs:
