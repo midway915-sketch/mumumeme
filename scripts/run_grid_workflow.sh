@@ -39,14 +39,14 @@ echo "[INFO] TAU_SPLIT=${TAU_SPLIT:-<none>}"
 : "${EXCLUDE_TICKERS:?}"
 : "${REQUIRE_FILES:?}"
 
-# ✅ NEW: re-eval thresholds (engine args)
+# re-eval thresholds (engine args)
 REVAL_PS_STRONG="${REVAL_PS_STRONG:-0.70}"
 REVAL_PT_STRONG="${REVAL_PT_STRONG:-0.20}"
 REVAL_PS_PASS="${REVAL_PS_PASS:-0.60}"
 REVAL_PT_PASS="${REVAL_PT_PASS:-0.35}"
 echo "[INFO] REVAL_PS_STRONG=$REVAL_PS_STRONG REVAL_PT_STRONG=$REVAL_PT_STRONG REVAL_PS_PASS=$REVAL_PS_PASS REVAL_PT_PASS=$REVAL_PT_PASS"
 
-# ✅ dedupe on/off (default: true)
+# dedupe on/off (default: true)
 DEDUP_PICKS="${DEDUP_PICKS:-true}"
 DEDUP_PICKS="$(echo "$DEDUP_PICKS" | tr '[:upper:]' '[:lower:]' | xargs)"
 if [[ "$DEDUP_PICKS" != "true" && "$DEDUP_PICKS" != "false" ]]; then
@@ -55,7 +55,7 @@ if [[ "$DEDUP_PICKS" != "true" && "$DEDUP_PICKS" != "false" ]]; then
 fi
 echo "[INFO] DEDUP_PICKS=$DEDUP_PICKS"
 
-# ✅ MAX_EXTEND_DAYS는 "있으면 사용", 없으면 H//2 자동계산
+# MAX_EXTEND_DAYS는 "있으면 사용", 없으면 H//2 자동계산
 if [ -z "${MAX_EXTEND_DAYS:-}" ]; then
   MAX_EXTEND_DAYS="$(python - <<PY
 H=int("${MAX_DAYS}")
@@ -66,10 +66,10 @@ PY
 fi
 echo "[INFO] MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS (auto: H//2 when not provided)"
 
-# ✅ 옵션B 제거: tp1-trail-unlimited는 true만 사용
+# 옵션B 제거: tp1-trail-unlimited는 true만 사용
 TP1_TRAIL_UNLIMITED="true"
 
-# ✅ cap 모드 제어
+# cap 모드 제어
 CAP_COMPARE="${CAP_COMPARE:-false}"
 CAP_COMPARE="$(echo "$CAP_COMPARE" | tr '[:upper:]' '[:lower:]' | xargs)"
 if [[ "$CAP_COMPARE" != "true" && "$CAP_COMPARE" != "false" ]]; then
