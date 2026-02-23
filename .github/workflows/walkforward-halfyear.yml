@@ -227,3 +227,44 @@ jobs:
           name: walkforward_${{ matrix.period }}
           path: data/signals/walkforward/${{ matrix.period }}
           if-no-files-found: warn
+
+  aggregate:
+    needs: [run]   # run(반기 매트릭스) 다 끝난 뒤에 집계
+    runs-on: ubuntu-latest
+    if: always()   # 일부 반기 실패해도 가능한 범위에서 집계는 돌려줌
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (aggregate)
+        run: |
+          python -m pip install -U pip
+          pip install -U pandas pyarrow
+
+      - name: Download all walkforward artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: data/signals/walkforward
+          pattern: walkforward_*
+          merge-multiple: true
+
+      - name: Show downloaded folders
+        run: |
+          ls -la data/signals/walkforward | sed -n '1,200p'
+          find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
+
+      - name: Aggregate half-year results
+        run: |
+          python scripts/aggregate_walkforward_halfyear.py \
+            --root data/signals/walkforward \
+            --out data/signals/walkforward/_summary_walkforward.csv
+
+      - name: Upload aggregated summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward_summary
+          path: data/signals/walkforward/_summary_walkforward.csv
+          if-no-files-found: error
