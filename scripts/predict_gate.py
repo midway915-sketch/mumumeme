@@ -33,14 +33,10 @@ def read_table(parq: Path, csv: Path) -> pd.DataFrame:
 
 
 def _load_features(features_path: str) -> pd.DataFrame:
-    # if explicit features_path given, use it; else fallback to features_scored
     if features_path:
         p = Path(features_path)
         if p.exists():
-            if p.suffix.lower() == ".parquet":
-                df = pd.read_parquet(p)
-            else:
-                df = pd.read_csv(p)
+            df = pd.read_parquet(p) if p.suffix.lower() == ".parquet" else pd.read_csv(p)
         else:
             raise FileNotFoundError(f"--features-path not found: {p}")
     else:
@@ -64,10 +60,7 @@ def _load_models():
     if not model_p.exists() or not scaler_p.exists():
         raise FileNotFoundError(f"Missing model/scaler: {model_p} {scaler_p}")
     import joblib
-
-    model = joblib.load(model_p)
-    scaler = joblib.load(scaler_p)
-    return model, scaler
+    return joblib.load(model_p), joblib.load(scaler_p)
 
 
 def _load_tail_models():
@@ -76,10 +69,7 @@ def _load_tail_models():
     if not model_p.exists() or not scaler_p.exists():
         raise FileNotFoundError(f"Missing tail model/scaler: {model_p} {scaler_p}")
     import joblib
-
-    model = joblib.load(model_p)
-    scaler = joblib.load(scaler_p)
-    return model, scaler
+    return joblib.load(model_p), joblib.load(scaler_p)
 
 
 def _has_valid_numeric_col(df: pd.DataFrame, col: str) -> bool:
@@ -90,7 +80,6 @@ def _has_valid_numeric_col(df: pd.DataFrame, col: str) -> bool:
 
 
 def _get_feature_cols(df: pd.DataFrame) -> list[str]:
-    # try to use meta feature_cols if present
     meta = DATA_DIR / "meta" / "feature_cols.json"
     if meta.exists():
         try:
@@ -105,22 +94,12 @@ def _get_feature_cols(df: pd.DataFrame) -> list[str]:
         except Exception:
             pass
 
-    # fallback: numeric columns except known keys/probs
     drop = {
-        "Date",
-        "Ticker",
-        "p_success",
-        "p_tail",
-        "p_badexit",
-        "tau_H",
-        "tau_class",
-        "tau_pmax",
-        "ret_score",
-        "utility",
-        "utility_raw",
-        "tail_pen",
-        "utility_qpass",
-        "score",
+        "Date","Ticker",
+        "p_success","p_tail","p_badexit",
+        "tau_H","tau_class","tau_pmax",
+        "ret_score","utility","utility_raw",
+        "tail_pen","utility_qpass","score",
     }
     cols = [c for c in df.columns if c not in drop]
     out: list[str] = []
@@ -152,17 +131,6 @@ def _apply_regime_filter(
     atr_max: float,
     leverage_mult: float,
 ) -> tuple[pd.DataFrame, dict]:
-    """
-    Regime filter uses market-level columns if present:
-      - Market_Drawdown  (typically <=0, e.g. -0.12)
-      - Market_ret_20    (20d return)
-      - Market_ATR_ratio (vol proxy)
-
-    Universe is 3x levered => compare "levered equivalent" by multiplying market metrics.
-      - drawdown: require (-Market_Drawdown * leverage_mult) <= dd_max  <=> Market_Drawdown >= -dd_max/leverage_mult
-      - ret20    : require (Market_ret_20 * leverage_mult) >= ret20_min <=> Market_ret_20 >= ret20_min/leverage_mult
-      - atr      : require (Market_ATR_ratio * leverage_mult) <= atr_max <=> Market_ATR_ratio <= atr_max/leverage_mult
-    """
     m = (mode or "off").strip().lower()
     if m == "off":
         return df, {"enabled": False, "mode": "off"}
@@ -184,7 +152,6 @@ def _apply_regime_filter(
     need_atr = "Market_ATR_ratio"
 
     lev = float(leverage_mult) if np.isfinite(leverage_mult) and leverage_mult > 0 else 1.0
-
     dd_thr = -float(dd_max) / lev
     ret_thr = float(ret20_min) / lev
     atr_thr = float(atr_max) / lev
@@ -248,24 +215,21 @@ def main():
     ap.add_argument("--exclude-tickers", default="")
     ap.add_argument("--features-path", default="")
 
-    # workflow compat (run_grid_workflow.sh)
     ap.add_argument("--out-dir", default="data/signals", help="output directory for picks/meta")
-    ap.add_argument(
-        "--require-files",
-        default="",
-        help="comma-separated file paths that must exist; missing -> exit code 2",
-    )
+    ap.add_argument("--require-files", default="", help="comma-separated file paths that must exist; missing -> exit code 2")
 
-    # ✅ regime filter args
     ap.add_argument("--regime-mode", default="off", choices=["off", "basic", "trend", "dd", "combo"])
     ap.add_argument("--regime-dd-max", default=0.20, type=float)
     ap.add_argument("--regime-ret20-min", default=0.00, type=float)
     ap.add_argument("--regime-atr-max", default=1.30, type=float)
     ap.add_argument("--regime-leverage-mult", default=3.0, type=float)
 
+    # ✅ NEW: WF date filter
+    ap.add_argument("--date-from", default="", type=str, help="optional inclusive date filter YYYY-MM-DD")
+    ap.add_argument("--date-to", default="", type=str, help="optional inclusive date filter YYYY-MM-DD")
+
     args = ap.parse_args()
 
-    # ---- fail-fast required files (CI safety)
     req = [x.strip() for x in str(args.require_files or "").split(",") if x.strip()]
     if req:
         missing = [p for p in req if not Path(p).exists()]
@@ -273,19 +237,23 @@ def main():
             print(f"[ERROR] Missing required files: {missing}")
             sys.exit(2)
 
-    if int(args.topk) < 1:
-        raise ValueError("--topk must be >= 1")
-
     feats = _load_features(args.features_path)
 
-    # ------------------------------------------------------------------
-    # ✅ NEW: if features already contain scored probabilities, DO NOT
-    #         require app/model.pkl etc. (WF-lite friendly)
-    # ------------------------------------------------------------------
+    # ✅ apply date range early
+    if str(args.date_from).strip():
+        d0 = pd.to_datetime(args.date_from, errors="coerce")
+        if pd.isna(d0):
+            raise ValueError(f"--date-from invalid: {args.date_from}")
+        feats = feats[feats["Date"] >= d0].copy()
+    if str(args.date_to).strip():
+        d1 = pd.to_datetime(args.date_to, errors="coerce")
+        if pd.isna(d1):
+            raise ValueError(f"--date-to invalid: {args.date_to}")
+        feats = feats[feats["Date"] <= d1].copy()
+
     use_scored_ps = _has_valid_numeric_col(feats, "p_success")
     use_scored_pt = _has_valid_numeric_col(feats, "p_tail")
 
-    # model probs (p_success)
     if use_scored_ps:
         feats2 = feats.copy()
         feats2["p_success"] = pd.to_numeric(feats2["p_success"], errors="coerce").fillna(0.0).astype(float)
@@ -297,35 +265,23 @@ def main():
         X = feats2[feat_cols].to_numpy(dtype=float)
         Xs = scaler.transform(X)
         proba = model.predict_proba(Xs)
-        if proba.shape[1] >= 2:
-            p_success = proba[:, 1]
-        else:
-            p_success = proba[:, 0]
-        feats2["p_success"] = p_success.astype(float)
+        feats2["p_success"] = (proba[:, 1] if proba.shape[1] >= 2 else proba[:, 0]).astype(float)
         scored_mode_ps = "model_predict"
 
-    # tail probs (p_tail)
     if use_scored_pt:
         feats2["p_tail"] = pd.to_numeric(feats2.get("p_tail"), errors="coerce").fillna(0.0).astype(float)
         scored_mode_pt = "use_features_col"
     else:
-        # need features matrix for tail model; ensure we have X
         if "feat_cols" not in locals():
             feat_cols = _get_feature_cols(feats2)
             feats2 = _coerce_numeric(feats2, feat_cols)
         X = feats2[feat_cols].to_numpy(dtype=float)
-
         tail_model, tail_scaler = _load_tail_models()
         Xt = tail_scaler.transform(X)
         tproba = tail_model.predict_proba(Xt)
-        if tproba.shape[1] >= 2:
-            p_tail = tproba[:, 1]
-        else:
-            p_tail = tproba[:, 0]
-        feats2["p_tail"] = p_tail.astype(float)
+        feats2["p_tail"] = (tproba[:, 1] if tproba.shape[1] >= 2 else tproba[:, 0]).astype(float)
         scored_mode_pt = "model_predict"
 
-    # basic filters
     if args.exclude_tickers:
         ex = [x.strip().upper() for x in args.exclude_tickers.split(",") if x.strip()]
         if ex:
@@ -333,7 +289,6 @@ def main():
 
     feats2 = feats2[feats2["p_success"] >= float(args.ps_min)].copy()
 
-    # regime filter (after ps_min)
     feats2, regime_audit = _apply_regime_filter(
         feats2,
         mode=str(args.regime_mode),
@@ -343,18 +298,21 @@ def main():
         leverage_mult=float(args.regime_leverage_mult),
     )
 
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
+    debug_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.debug.json"
+
     if feats2.empty:
-        out_dir = Path(args.out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
-        debug_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.debug.json"
         pd.DataFrame(columns=["Date", "Ticker"]).to_csv(picks_path, index=False)
         debug_path.write_text(
             json.dumps(
                 {
                     "empty": True,
-                    "reason": "filters",
+                    "reason": "filters_or_date_range",
                     "ps_min": float(args.ps_min),
+                    "date_from": args.date_from,
+                    "date_to": args.date_to,
                     "regime": regime_audit,
                     "p_success_source": scored_mode_ps,
                     "p_tail_source": scored_mode_pt,
@@ -367,7 +325,6 @@ def main():
         print(f"[WARN] empty picks -> wrote {picks_path}")
         return
 
-    # compute score by mode
     mode = args.mode
     tmax = float(args.tail_threshold)
     uq = float(args.utility_quantile)
@@ -404,7 +361,6 @@ def main():
             feats2["ret_score"] = feats2["utility_raw"]
         feats2["score"] = feats2["ret_score"].fillna(-np.inf)
 
-    # optional badexit filter (if column exists in features)
     if args.badexit_max is not None and "p_badexit" in feats2.columns:
         feats2["p_badexit"] = pd.to_numeric(feats2["p_badexit"], errors="coerce").fillna(0.0).astype(float)
         feats2 = feats2[feats2["p_badexit"] <= float(args.badexit_max)].copy()
@@ -416,11 +372,6 @@ def main():
         .head(int(args.topk))[["Date", "Ticker", "score", "p_success", "p_tail"]]
         .copy()
     )
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    picks_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.csv"
-    debug_path = out_dir / f"picks_{args.tag}_gate_{args.suffix}.debug.json"
 
     picks[["Date", "Ticker"]].to_csv(picks_path, index=False)
 
@@ -443,6 +394,8 @@ def main():
         "regime": regime_audit,
         "p_success_source": scored_mode_ps,
         "p_tail_source": scored_mode_pt,
+        "date_from": args.date_from,
+        "date_to": args.date_to,
     }
     debug_path.write_text(json.dumps(dbg, ensure_ascii=False, indent=2), encoding="utf-8")
 
