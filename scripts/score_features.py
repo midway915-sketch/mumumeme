@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import joblib
@@ -122,7 +123,6 @@ def load_tau_feature_cols(tag: str) -> list[str] | None:
     return _load_feature_cols_from_report(META_DIR / f"train_tau_report_{tag}.json")
 
 
-# ✅ NEW: badexit feature cols (report)
 def load_badexit_feature_cols() -> list[str] | None:
     return _load_feature_cols_from_report(META_DIR / "train_badexit_report.json")
 
@@ -130,7 +130,6 @@ def load_badexit_feature_cols() -> list[str] | None:
 def parse_tau_h_map(s: str) -> list[int]:
     parts = [p.strip() for p in (s or "").split(",") if p.strip()]
     if not parts:
-        # ✅ 기본은 30/40/50 (비교 실험 공통 고정)
         return [30, 40, 50]
     out: list[int] = []
     for p in parts:
@@ -155,24 +154,57 @@ def parse_csv_cols(s: str) -> list[str]:
     return [c.strip() for c in (s or "").split(",") if c.strip()]
 
 
-def resolve_model_paths(base_model: str, base_scaler: str, tag: str) -> tuple[str, str]:
+def _strip_h_from_tag(tag: str) -> str:
     """
-    tag가 있으면:
-      app/model_{tag}.pkl / app/scaler_{tag}.pkl 우선
-    없으면:
-      주어진 base_model/base_scaler 그대로
-    단, tag 파일이 없으면 base로 폴백
+    ex) pt10_h40_sl10_ex30 -> pt10_sl10_ex30
     """
-    bm = Path(base_model)
-    bs = Path(base_scaler)
+    # remove patterns like _h40 or -h40 etc. (we only use _hNN here)
+    core = re.sub(r"_h\d+", "", str(tag))
+    core = core.replace("__", "_").strip("_")
+    return core
 
-    if tag:
-        cand_m = bm.with_name(f"{bm.stem}_{tag}{bm.suffix}")
-        cand_s = bs.with_name(f"{bs.stem}_{tag}{bs.suffix}")
-        if cand_m.exists() and cand_s.exists():
-            return str(cand_m), str(cand_s)
 
-    return str(bm), str(bs)
+def _resolve_model_paths_for_h(base_path: str, stem_prefix: str, core_tag: str, h: int) -> tuple[str, str] | None:
+    """
+    Model naming rule (NEW):
+      app/<stem_prefix>_<core_tag>_h{H}.pkl
+    Example:
+      stem_prefix="model"      -> app/model_pt10_sl10_ex30_h30.pkl
+      stem_prefix="scaler"     -> app/scaler_pt10_sl10_ex30_h30.pkl
+      stem_prefix="tail_model" -> app/tail_model_pt10_sl10_ex30_h30.pkl
+      stem_prefix="tail_scaler"-> app/tail_scaler_pt10_sl10_ex30_h30.pkl
+
+    base_path is used only to locate the directory (usually app/xxx.pkl).
+    """
+    p = Path(base_path)
+    d = p.parent
+    m = d / f"{stem_prefix}_{core_tag}_h{int(h)}.pkl"
+    return str(m), str(m)
+
+
+def _exists(path: str) -> bool:
+    return Path(path).exists()
+
+
+def _load_model_and_scaler(model_path: Path, scaler_path: Path):
+    return joblib.load(str(model_path)), joblib.load(str(scaler_path))
+
+
+def _predict_proba_1(model, X: np.ndarray) -> np.ndarray:
+    # robust proba extraction
+    try:
+        p = model.predict_proba(X)[:, 1]
+        return np.asarray(p, dtype=float)
+    except Exception:
+        # fallback: if decision_function exists, squash
+        if hasattr(model, "decision_function"):
+            z = model.decision_function(X)
+            z = np.asarray(z, dtype=float)
+            return 1.0 / (1.0 + np.exp(-z))
+        # last resort: predict as class
+        y = model.predict(X)
+        y = np.asarray(y, dtype=float)
+        return np.clip(y, 0.0, 1.0)
 
 
 def main() -> None:
@@ -187,7 +219,7 @@ def main() -> None:
     ap.add_argument("--out-parq", default=str(FEATURE_DIR / "features_scored.parquet"), type=str)
     ap.add_argument("--out-csv", default=str(FEATURE_DIR / "features_scored.csv"), type=str)
 
-    # p_success
+    # p_success (base paths only used for directory; actual models are core_tag_h{H})
     ap.add_argument("--ps-model", default="app/model.pkl", type=str)
     ap.add_argument("--ps-scaler", default="app/scaler.pkl", type=str)
     ap.add_argument(
@@ -207,7 +239,7 @@ def main() -> None:
         help="comma-separated override. default=report(train_tail_report_{tag}) -> SSOT -> ps-features",
     )
 
-    # ✅ NEW: p_badexit
+    # p_badexit
     ap.add_argument("--badexit-model", default="app/badexit_model.pkl", type=str)
     ap.add_argument("--badexit-scaler", default="app/badexit_scaler.pkl", type=str)
     ap.add_argument(
@@ -217,7 +249,7 @@ def main() -> None:
         help="comma-separated override. default=report(train_badexit_report.json) -> SSOT -> ps-features",
     )
 
-    # tau
+    # tau (single model)
     ap.add_argument("--tau-model", default="app/tau_model.pkl", type=str)
     ap.add_argument("--tau-scaler", default="app/tau_scaler.pkl", type=str)
     ap.add_argument(
@@ -228,12 +260,14 @@ def main() -> None:
     )
     ap.add_argument(
         "--tau-h-map",
-        default="30,40,50",  # ✅ 비교 실험 공통: 30/40/50 고정
+        default="30,40,50",
         type=str,
         help="tau_class->H mapping. e.g. '30,40,50' means class0=30 class1=40 class2=50",
     )
 
     args = ap.parse_args()
+    core_tag = _strip_h_from_tag(args.tag)
+    hmap = parse_tau_h_map(args.tau_h_map)
 
     feats = read_table(Path(args.features_parq), Path(args.features_csv)).copy()
     print("[DEBUG] features_model cols(head):", list(feats.columns)[:30], " index.name:", feats.index.name)
@@ -248,19 +282,8 @@ def main() -> None:
     ssot_cols = _load_feature_cols_from_ssot()
 
     # -------------------------
-    # p_success (report -> SSOT -> DEFAULT)
+    # feature columns resolve (ps baseline)
     # -------------------------
-    ps_model_path, ps_scaler_path = resolve_model_paths(args.ps_model, args.ps_scaler, args.tag)
-    if not Path(ps_model_path).exists() or not Path(ps_scaler_path).exists():
-        raise FileNotFoundError(
-            f"Missing p_success model/scaler.\n"
-            f"-> tried: {ps_model_path} / {ps_scaler_path}\n"
-            f"-> (tag fallback) you may need to run train_model.py first."
-        )
-
-    ps_model = joblib.load(ps_model_path)
-    ps_scaler = joblib.load(ps_scaler_path)
-
     if args.ps_features.strip():
         ps_cols = parse_csv_cols(args.ps_features)
         ps_cols_src = "--ps-features"
@@ -274,85 +297,17 @@ def main() -> None:
         else:
             ps_cols = DEFAULT_FEATURES
             ps_cols_src = "DEFAULT_FEATURES"
-
     ps_cols = [c for c in ps_cols if c]
-    feats_ps = ensure_features_exist(feats, ps_cols, warn_prefix=f"[p_success:{ps_cols_src}]")
-    X_ps = feats_ps[ps_cols].to_numpy(dtype=float)
-    X_ps_s = ps_scaler.transform(X_ps)
-    feats["p_success"] = ps_model.predict_proba(X_ps_s)[:, 1].astype(float)
 
     # -------------------------
-    # p_tail (optional; report -> SSOT -> ps_cols)
-    # -------------------------
-    tail_model_path = Path(args.tail_model)
-    tail_scaler_path = Path(args.tail_scaler)
-    if tail_model_path.exists() and tail_scaler_path.exists():
-        tail_model = joblib.load(tail_model_path)
-        tail_scaler = joblib.load(tail_scaler_path)
-
-        if args.tail_features.strip():
-            tail_cols = parse_csv_cols(args.tail_features)
-            tail_cols_src = "--tail-features"
-        else:
-            tail_cols = load_tail_feature_cols(args.tag)
-            if tail_cols:
-                tail_cols_src = f"report(train_tail_report_{args.tag}.json)"
-            elif ssot_cols:
-                tail_cols = ssot_cols
-                tail_cols_src = "SSOT(data/meta/feature_cols.json)"
-            else:
-                tail_cols = ps_cols
-                tail_cols_src = "fallback(ps_cols)"
-
-        tail_cols = [c for c in tail_cols if c]
-        feats_tail = ensure_features_exist(feats, tail_cols, warn_prefix=f"[p_tail:{tail_cols_src}]")
-        X_t = feats_tail[tail_cols].to_numpy(dtype=float)
-        X_t_s = tail_scaler.transform(X_t)
-        feats["p_tail"] = tail_model.predict_proba(X_t_s)[:, 1].astype(float)
-    else:
-        feats["p_tail"] = 0.0
-
-    # -------------------------
-    # ✅ NEW: p_badexit (optional; report -> SSOT -> ps_cols)
-    # -------------------------
-    bad_model_path = Path(args.badexit_model)
-    bad_scaler_path = Path(args.badexit_scaler)
-    if bad_model_path.exists() and bad_scaler_path.exists():
-        bad_model = joblib.load(bad_model_path)
-        bad_scaler = joblib.load(bad_scaler_path)
-
-        if args.badexit_features.strip():
-            bad_cols = parse_csv_cols(args.badexit_features)
-            bad_cols_src = "--badexit-features"
-        else:
-            bad_cols = load_badexit_feature_cols()
-            if bad_cols:
-                bad_cols_src = "report(train_badexit_report.json)"
-            elif ssot_cols:
-                bad_cols = ssot_cols
-                bad_cols_src = "SSOT(data/meta/feature_cols.json)"
-            else:
-                bad_cols = ps_cols
-                bad_cols_src = "fallback(ps_cols)"
-
-        bad_cols = [c for c in bad_cols if c]
-        feats_bad = ensure_features_exist(feats, bad_cols, warn_prefix=f"[p_badexit:{bad_cols_src}]")
-        X_b = feats_bad[bad_cols].to_numpy(dtype=float)
-        X_b_s = bad_scaler.transform(X_b)
-        feats["p_badexit"] = bad_model.predict_proba(X_b_s)[:, 1].astype(float)
-    else:
-        feats["p_badexit"] = 0.0
-
-    # -------------------------
-    # tau_class / tau_H (optional; report -> SSOT -> ps_cols)
+    # tau_class / tau_H (single model; must run first)
     # -------------------------
     tau_model_path = Path(args.tau_model)
     tau_scaler_path = Path(args.tau_scaler)
-    hmap = parse_tau_h_map(args.tau_h_map)
 
     if tau_model_path.exists() and tau_scaler_path.exists():
-        tau_model = joblib.load(tau_model_path)
-        tau_scaler = joblib.load(tau_scaler_path)
+        tau_model = joblib.load(str(tau_model_path))
+        tau_scaler = joblib.load(str(tau_scaler_path))
 
         if args.tau_features.strip():
             tau_cols = parse_csv_cols(args.tau_features)
@@ -392,11 +347,181 @@ def main() -> None:
     else:
         feats["tau_class"] = -1
         feats["tau_pmax"] = 0.0
-        # ✅ tau 비활성 폴백은 '중앙 H'가 더 안전(비교 실험/운영 둘 다)
-        if hmap and len(hmap) >= 2:
-            feats["tau_H"] = int(hmap[1])  # 40
+        # tau 비활성 폴백은 중앙 H (40)
+        feats["tau_H"] = int(hmap[1]) if (hmap and len(hmap) >= 2) else 40
+
+    # -------------------------
+    # helper: per-H inference
+    # -------------------------
+    def _score_by_h(
+        *,
+        col_out: str,
+        model_stem: str,
+        scaler_stem: str,
+        base_model_path: str,
+        base_scaler_path: str,
+        feat_cols: list[str],
+        feat_cols_src: str,
+        enabled: bool,
+        default_value: float = 0.0,
+    ) -> tuple[pd.Series, dict]:
+        if not enabled:
+            return pd.Series([default_value] * len(feats), index=feats.index, dtype=float), {"enabled": False}
+
+        # prepare X once (same features for all H models)
+        feats_x = ensure_features_exist(feats, feat_cols, warn_prefix=f"[{col_out}:{feat_cols_src}]")
+        X = feats_x[feat_cols].to_numpy(dtype=float)
+
+        # detect available H models
+        base_dir = Path(base_model_path).parent
+        models: dict[int, tuple[Path, Path]] = {}
+        for h in sorted(set(hmap)):
+            m_path = base_dir / f"{model_stem}_{core_tag}_h{int(h)}.pkl"
+            s_path = base_dir / f"{scaler_stem}_{core_tag}_h{int(h)}.pkl"
+            if m_path.exists() and s_path.exists():
+                models[int(h)] = (m_path, s_path)
+
+        if not models:
+            # fallback to old single model/scaler if exists
+            bm = Path(base_model_path)
+            bs = Path(base_scaler_path)
+            if bm.exists() and bs.exists():
+                model = joblib.load(str(bm))
+                scaler = joblib.load(str(bs))
+                Xs = scaler.transform(X)
+                p = _predict_proba_1(model, Xs)
+                return pd.Series(p, index=feats.index, dtype=float), {
+                    "enabled": True,
+                    "mode": "single_fallback",
+                    "model": str(bm),
+                    "scaler": str(bs),
+                    "core_tag": core_tag,
+                }
+            return pd.Series([default_value] * len(feats), index=feats.index, dtype=float), {
+                "enabled": True,
+                "mode": "missing_models",
+                "core_tag": core_tag,
+            }
+
+        # group indices by tau_H
+        tauH = pd.to_numeric(feats["tau_H"], errors="coerce").fillna(int(hmap[1]) if len(hmap) >= 2 else 40).astype(int)
+        out = np.full(len(feats), default_value, dtype=float)
+
+        audit = {
+            "enabled": True,
+            "mode": "per_H",
+            "core_tag": core_tag,
+            "models_found": {str(k): {"model": str(v[0]), "scaler": str(v[1])} for k, v in models.items()},
+        }
+
+        for h, (m_path, s_path) in models.items():
+            idx = np.where(tauH.to_numpy() == int(h))[0]
+            if idx.size == 0:
+                continue
+            model = joblib.load(str(m_path))
+            scaler = joblib.load(str(s_path))
+            Xs = scaler.transform(X[idx])
+            out[idx] = _predict_proba_1(model, Xs)
+
+        # any tau_H not covered by found models -> fallback to nearest available
+        covered = set(models.keys())
+        missing_idx = np.where(~np.isin(tauH.to_numpy(), list(covered)))[0]
+        if missing_idx.size > 0:
+            avail = sorted(covered)
+            # pick nearest by absolute diff
+            for i in missing_idx:
+                th = int(tauH.iloc[i])
+                nearest = min(avail, key=lambda x: abs(int(x) - th))
+                m_path, s_path = models[int(nearest)]
+                model = joblib.load(str(m_path))
+                scaler = joblib.load(str(s_path))
+                Xs = scaler.transform(X[i : i + 1])
+                out[i] = float(_predict_proba_1(model, Xs)[0])
+            audit["fallback_for_missing_tauH"] = True
         else:
-            feats["tau_H"] = 40
+            audit["fallback_for_missing_tauH"] = False
+
+        return pd.Series(out, index=feats.index, dtype=float), audit
+
+    # -------------------------
+    # p_success (per tau_H)
+    # -------------------------
+    ps_series, ps_audit = _score_by_h(
+        col_out="p_success",
+        model_stem="model",
+        scaler_stem="scaler",
+        base_model_path=args.ps_model,
+        base_scaler_path=args.ps_scaler,
+        feat_cols=ps_cols,
+        feat_cols_src=ps_cols_src,
+        enabled=True,
+        default_value=0.0,
+    )
+    feats["p_success"] = ps_series.astype(float)
+
+    # -------------------------
+    # p_tail (per tau_H) optional
+    # -------------------------
+    if args.tail_features.strip():
+        tail_cols = parse_csv_cols(args.tail_features)
+        tail_cols_src = "--tail-features"
+    else:
+        tail_cols = load_tail_feature_cols(args.tag)
+        if tail_cols:
+            tail_cols_src = f"report(train_tail_report_{args.tag}.json)"
+        elif ssot_cols:
+            tail_cols = ssot_cols
+            tail_cols_src = "SSOT(data/meta/feature_cols.json)"
+        else:
+            tail_cols = ps_cols
+            tail_cols_src = "fallback(ps_cols)"
+    tail_cols = [c for c in tail_cols if c]
+
+    tail_enabled = Path(args.tail_model).parent.exists()  # directory exists
+    tail_series, tail_audit = _score_by_h(
+        col_out="p_tail",
+        model_stem="tail_model",
+        scaler_stem="tail_scaler",
+        base_model_path=args.tail_model,
+        base_scaler_path=args.tail_scaler,
+        feat_cols=tail_cols,
+        feat_cols_src=tail_cols_src,
+        enabled=tail_enabled,
+        default_value=0.0,
+    )
+    feats["p_tail"] = tail_series.astype(float)
+
+    # -------------------------
+    # p_badexit (per tau_H) optional
+    # -------------------------
+    if args.badexit_features.strip():
+        bad_cols = parse_csv_cols(args.badexit_features)
+        bad_cols_src = "--badexit-features"
+    else:
+        bad_cols = load_badexit_feature_cols()
+        if bad_cols:
+            bad_cols_src = "report(train_badexit_report.json)"
+        elif ssot_cols:
+            bad_cols = ssot_cols
+            bad_cols_src = "SSOT(data/meta/feature_cols.json)"
+        else:
+            bad_cols = ps_cols
+            bad_cols_src = "fallback(ps_cols)"
+    bad_cols = [c for c in bad_cols if c]
+
+    bad_enabled = Path(args.badexit_model).parent.exists()
+    bad_series, bad_audit = _score_by_h(
+        col_out="p_badexit",
+        model_stem="badexit_model",
+        scaler_stem="badexit_scaler",
+        base_model_path=args.badexit_model,
+        base_scaler_path=args.badexit_scaler,
+        feat_cols=bad_cols,
+        feat_cols_src=bad_cols_src,
+        enabled=bad_enabled,
+        default_value=0.0,
+    )
+    feats["p_badexit"] = bad_series.astype(float)
 
     # -------------------------
     # write outputs
@@ -416,12 +541,13 @@ def main() -> None:
     print("=" * 60)
     print("[INFO] scoring summary")
     print("tag:", args.tag)
-    print("p_success model/scaler:", ps_model_path, "/", ps_scaler_path)
-    print("p_success cols source:", ps_cols_src, "cols:", ps_cols)
-    print("p_tail enabled:", bool(tail_model_path.exists() and tail_scaler_path.exists()))
-    print("p_badexit enabled:", bool(bad_model_path.exists() and bad_scaler_path.exists()))
-    print("tau enabled:", bool(tau_model_path.exists() and tau_scaler_path.exists()))
+    print("core_tag:", core_tag)
+    print("tau enabled:", bool(Path(args.tau_model).exists() and Path(args.tau_scaler).exists()))
     print("tau_h_map:", hmap)
+    print("p_success cols source:", ps_cols_src, "cols:", ps_cols)
+    print("p_success audit:", ps_audit)
+    print("p_tail audit:", tail_audit)
+    print("p_badexit audit:", bad_audit)
     print("=" * 60)
 
 
