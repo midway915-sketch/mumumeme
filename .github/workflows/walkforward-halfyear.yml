@@ -22,19 +22,22 @@ jobs:
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
     steps:
-      - name: Generate matrix
+      - name: Generate half-year matrix JSON
         id: gen
+        shell: bash
         run: |
-          python - <<'PY' > matrix.json
+          python - <<'PY' > /tmp/matrix.json
           import json, re
           from datetime import date, timedelta
 
-          wf_start = "${{ inputs.wf_start }}"
-          wf_end   = "${{ inputs.wf_end }}"
+          wf_start = "${{ inputs.wf_start }}".strip()
+          wf_end   = "${{ inputs.wf_end }}".strip()
           train_years = int("${{ inputs.train_years }}")
 
           m = re.fullmatch(r"(\d{4})H([12])", wf_start)
           n = re.fullmatch(r"(\d{4})H([12])", wf_end)
+          if not m or not n:
+            raise SystemExit("wf_start/wf_end must be like 2018H1")
 
           sy, sh = int(m.group(1)), int(m.group(2))
           ey, eh = int(n.group(1)), int(n.group(2))
@@ -45,40 +48,43 @@ jobs:
           items=[]
           y,h=sy,sh
           while True:
-              period=f"{y}H{h}"
-              test_start=half_start(y,h)
-              test_end=half_end(y,h)
+            period=f"{y}H{h}"
+            test_start=half_start(y,h)
+            test_end=half_end(y,h)
 
-              vy,vh=(y-1,2) if h==1 else (y,1)
-              valid_start=half_start(vy,vh)
-              valid_end=half_end(vy,vh)
+            # valid = 직전 반기
+            vy,vh=(y-1,2) if h==1 else (y,1)
+            valid_start=half_start(vy,vh)
+            valid_end=half_end(vy,vh)
 
-              train_end = valid_start - timedelta(days=1)
-              train_start = date(train_end.year-train_years+1, train_end.month, train_end.day)
+            # train = valid_start 직전까지 train_years년
+            train_end = valid_start - timedelta(days=1)
+            train_start = date(train_end.year-train_years+1, train_end.month, train_end.day)
 
-              items.append({
-                  "period":period,
-                  "TRAIN_START":train_start.isoformat(),
-                  "TRAIN_END":train_end.isoformat(),
-                  "VALID_START":valid_start.isoformat(),
-                  "VALID_END":valid_end.isoformat(),
-                  "TEST_START":test_start.isoformat(),
-                  "TEST_END":test_end.isoformat(),
-                  "CUT_DATE":valid_end.isoformat()
-              })
+            items.append({
+              "period": period,
+              "TRAIN_START": train_start.isoformat(),
+              "TRAIN_END": train_end.isoformat(),
+              "VALID_START": valid_start.isoformat(),
+              "VALID_END": valid_end.isoformat(),
+              "TEST_START": test_start.isoformat(),
+              "TEST_END": test_end.isoformat(),
+              "CUT_DATE": valid_end.isoformat(),
+            })
 
-              if y==ey and h==eh:
-                  break
-              if h==1:
-                  h=2
-              else:
-                  y+=1; h=1
+            if (y==ey and h==eh):
+              break
+            if h == 1:
+              h = 2
+            else:
+              y += 1
+              h = 1
 
-          print(json.dumps({"include":items}))
+          print(json.dumps({"include": items}, ensure_ascii=False))
           PY
 
           echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
-          cat matrix.json >> "$GITHUB_OUTPUT"
+          cat /tmp/matrix.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
   run:
@@ -88,8 +94,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
 
-    # 🔥 여기서 grid 관련 값 전부 기본 env로 둔다
+    # ✅ inputs 25개 제한 피하려고, grid 파라미터는 여기서 기본값 env로 고정
     env:
+      # ---- grid 기본값 (너가 평소 gate-grid.yml에서 쓰는 값으로 바꿔도 됨)
       PROFIT_TARGET: "0.10"
       MAX_DAYS: "40"
       STOP_LEVEL: "-0.10"
@@ -108,18 +115,25 @@ jobs:
       EXCLUDE_TICKERS: ""
       REQUIRE_FILES: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl,app/tail_model.pkl,app/tail_scaler.pkl"
 
+      # ---- regime filter 기본값
       REGIME_MODE: "off"
       REGIME_DD_MAX: "0.20"
       REGIME_RET20_MIN: "0.00"
       REGIME_ATR_MAX: "1.30"
       REGIME_LEVERAGE_MULT: "3.0"
 
+      # ---- optional
       TAU_SPLIT: ""
       USE_TAU_H: "false"
       ENABLE_DCA: "false"
 
+      # ---- output base
+      OUT_DIR_BASE: "data/signals/walkforward"
+      WF_TAG_BASE: "wf"
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -129,7 +143,7 @@ jobs:
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Walkforward run
+      - name: Walkforward run (one half-year)
         env:
           WF_PERIOD: ${{ matrix.period }}
           TRAIN_START: ${{ matrix.TRAIN_START }}
@@ -139,7 +153,13 @@ jobs:
           TEST_START: ${{ matrix.TEST_START }}
           TEST_END: ${{ matrix.TEST_END }}
           CUT_DATE: ${{ matrix.CUT_DATE }}
-
         run: |
           chmod +x scripts/run_walkforward_halfyear.sh
           ./scripts/run_walkforward_halfyear.sh
+
+      - name: Upload artifacts (this half-year)
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward_${{ matrix.period }}
+          path: data/signals/walkforward/${{ matrix.period }}
+          if-no-files-found: warn
