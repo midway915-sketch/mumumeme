@@ -32,8 +32,10 @@ set -euo pipefail
 : "${PS_MINS:?}"
 : "${BADEXIT_MAXES:?}"
 : "${MAX_LEVERAGE_PCT:?}"
-: "${EXCLUDE_TICKERS:?}"
 : "${REQUIRE_FILES:?}"
+
+# ✅ optional-but-allowed-empty
+EXCLUDE_TICKERS="${EXCLUDE_TICKERS:-}"
 
 # optional envs (regime + tau/dca)
 REGIME_MODE="${REGIME_MODE:-off}"
@@ -58,18 +60,9 @@ echo "[WF] TEST  $TEST_START -> $TEST_END"
 echo "[WF] CUT_DATE=$CUT_DATE"
 echo "[WF] LABEL_KEY=$LABEL_KEY"
 echo "[WF] OUT_DIR=$OUT_DIR"
+echo "[WF] EXCLUDE_TICKERS=${EXCLUDE_TICKERS:-<empty>}"
 echo "[WF] TAU_SPLIT=${TAU_SPLIT:-<none>} USE_TAU_H=$USE_TAU_H ENABLE_DCA=$ENABLE_DCA"
 echo "[WF] REGIME_MODE=$REGIME_MODE DD_MAX=$REGIME_DD_MAX RET20_MIN=$REGIME_RET20_MIN ATR_MAX=$REGIME_ATR_MAX LEV_MULT=$REGIME_LEVERAGE_MULT"
-
-# ---- (optional) Training hooks
-# If you already have train scripts that accept env CUT_DATE / TRAIN_*/VALID_*,
-# put them here. For now, we keep it "WF-lite": assumes models/features already built for the repo,
-# and this run evaluates strategy outputs for this slice into its own OUT_DIR.
-
-# Example (ONLY if these scripts exist and you want to enable later):
-# if [ -f scripts/train_badexit_model.py ]; then
-#   python scripts/train_badexit_model.py --cut-date "$CUT_DATE" ...
-# fi
 
 # ---- Run your existing grid runner (already env-driven)
 chmod +x scripts/run_grid_workflow.sh
