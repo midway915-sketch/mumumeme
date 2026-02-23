@@ -3,7 +3,6 @@ name: walkforward-halfyear
 on:
   workflow_dispatch:
     inputs:
-      # (1) WF controls (3)
       wf_start:
         description: "first half-year (e.g. 2018H1)"
         required: true
@@ -16,68 +15,23 @@ on:
         description: "train window in years (e.g. 12)"
         required: true
         default: "12"
+      raw_artifact_name:
+        description: "artifact name that contains data/raw/prices.(parquet|csv)"
+        required: true
+        default: "raw-data"
+      regime_mode:
+        description: "off|basic|trend|dd|combo"
+        required: true
+        default: "off"
+      use_tau_h:
+        description: "true|false"
+        required: true
+        default: "false"
 
-      # (2) Core strategy controls (3)
-      PROFIT_TARGET:
-        description: "profit target (e.g. 0.10)"
-        required: true
-        default: "0.10"
-      MAX_DAYS:
-        description: "max holding days H (e.g. 40)"
-        required: true
-        default: "40"
-      STOP_LEVEL:
-        description: "stop level (e.g. -0.10)"
-        required: true
-        default: "-0.10"
+      # ----- keep the rest as your fixed defaults (NOT inputs)
+      # (여긴 너가 이미 쓰던 기본값으로 둬도 됨)
 
 jobs:
-  raw-data:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps (raw-data)
-        run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # fetch_prices.py에 필요
-          pip install -U yfinance pandas pyarrow
-
-      - name: Build universe.csv (if missing)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data
-          if [ ! -f data/universe.csv ]; then
-            echo "[INFO] data/universe.csv missing -> generating via scripts/universe.py"
-            python scripts/universe.py
-          fi
-          ls -la data | sed -n '1,200p'
-          test -f data/universe.csv
-
-      - name: Fetch raw prices (Yahoo)
-        env:
-          # fetch_prices.py가 MAX_YEARS env를 읽도록 너가 수정해둔 버전 기준
-          MAX_YEARS: "16"
-        run: |
-          set -euo pipefail
-          mkdir -p data/raw
-          python scripts/fetch_prices.py --include-extra
-          ls -la data/raw
-          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
-
-      - name: Upload artifact raw-data
-        uses: actions/upload-artifact@v4
-        with:
-          name: raw-data
-          path: data/raw
-          if-no-files-found: error
-
   make-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -138,7 +92,7 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
   run:
-    needs: [raw-data, make-matrix]
+    needs: make-matrix
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -155,20 +109,20 @@ jobs:
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      # ✅ 핵심: raw-data 아티팩트 자동 다운로드 -> data/raw 로 배치
       - name: Download raw-data artifact
         uses: actions/download-artifact@v4
         with:
-          name: raw-data
+          name: ${{ inputs.raw_artifact_name }}
           path: data/raw
 
-      - name: Verify raw-data present
+      - name: Verify raw prices exist
         run: |
-          ls -la data/raw
+          ls -la data/raw | sed -n '1,200p'
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
       - name: Walkforward run (one half-year)
         env:
-          # ---- matrix slice
           WF_PERIOD: ${{ matrix.period }}
           TRAIN_START: ${{ matrix.TRAIN_START }}
           TRAIN_END: ${{ matrix.TRAIN_END }}
@@ -178,12 +132,10 @@ jobs:
           TEST_END: ${{ matrix.TEST_END }}
           CUT_DATE: ${{ matrix.CUT_DATE }}
 
-          # ---- 6 inputs (wf 3 + core 3)
-          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
-          MAX_DAYS: ${{ inputs.MAX_DAYS }}
-          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
-
-          # ---- grid defaults (workflow에서 고정)
+          # defaults (너 기존 값으로 고정)
+          PROFIT_TARGET: "0.10"
+          MAX_DAYS: "40"
+          STOP_LEVEL: "-0.10"
           P_TAIL_THRESHOLDS: "0.10,0.20,0.30"
           UTILITY_QUANTILES: "0.60,0.75,0.90"
           RANK_METRICS: "utility"
@@ -197,23 +149,19 @@ jobs:
           BADEXIT_MAXES: "1.00"
           MAX_LEVERAGE_PCT: "1.0"
 
-          # ---- set -u 터지는 애들: 무조건 세팅(빈 문자열 OK)
           EXCLUDE_TICKERS: ""
           REQUIRE_FILES: ""
 
-          # ---- optional regime defaults (원하면 여기만 바꿔서 실험)
-          REGIME_MODE: "off"
+          REGIME_MODE: ${{ inputs.regime_mode }}
           REGIME_DD_MAX: "0.20"
           REGIME_RET20_MIN: "0.00"
           REGIME_ATR_MAX: "1.30"
           REGIME_LEVERAGE_MULT: "3.0"
 
-          # ---- optional toggles (기본 off)
           TAU_SPLIT: ""
-          USE_TAU_H: "false"
+          USE_TAU_H: ${{ inputs.use_tau_h }}
           ENABLE_DCA: "false"
 
-          # ---- output partitioning
           OUT_DIR_BASE: data/signals/walkforward
           WF_TAG_BASE: wf
 
