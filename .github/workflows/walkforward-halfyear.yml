@@ -41,7 +41,9 @@ jobs:
         id: gen
         shell: bash
         run: |
-          python - <<'PY'
+          set -euo pipefail
+
+          python - <<'PY' > /tmp/matrix.json
           import json, re
           from datetime import date, timedelta
 
@@ -104,7 +106,7 @@ jobs:
               h = 1
 
           print(json.dumps({"include": items}, ensure_ascii=False))
-          PY > /tmp/matrix.json
+          PY
 
           echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
           cat /tmp/matrix.json >> "$GITHUB_OUTPUT"
