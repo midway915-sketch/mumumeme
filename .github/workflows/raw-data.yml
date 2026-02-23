@@ -3,29 +3,43 @@ name: raw-data
 on:
   workflow_dispatch:
     inputs:
-      artifact_name:
-        description: "artifact name to upload (e.g. raw-data)"
+      raw_data_url:
+        description: "URL to prices.parquet or prices.csv"
         required: true
-        default: "raw-data"
+      raw_data_format:
+        description: "parquet or csv"
+        required: true
+        default: "parquet"
 
 jobs:
-  upload:
+  build-raw:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Sanity check raw files exist
+      - name: Prepare folders
+        run: |
+          mkdir -p data/raw
+
+      - name: Download raw prices
         shell: bash
         run: |
-          ls -la data/raw || true
-          if [ ! -f "data/raw/prices.parquet" ] && [ ! -f "data/raw/prices.csv" ]; then
-            echo "[ERROR] Missing data/raw/prices.parquet (or prices.csv)"
-            exit 2
+          set -euo pipefail
+          url="${{ inputs.raw_data_url }}"
+          fmt="$(echo "${{ inputs.raw_data_format }}" | tr '[:upper:]' '[:lower:]' | xargs)"
+          if [[ "$fmt" != "parquet" && "$fmt" != "csv" ]]; then
+            echo "[ERROR] raw_data_format must be parquet|csv"
+            exit 1
           fi
 
-      - name: Upload raw data artifact
+          out="data/raw/prices.${fmt}"
+          echo "[INFO] downloading -> $out"
+          curl -L --fail --retry 3 --retry-delay 2 -o "$out" "$url"
+          ls -la data/raw
+
+      - name: Upload artifact raw-data
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.artifact_name }}
+          name: raw-data
           path: data/raw
           if-no-files-found: error
