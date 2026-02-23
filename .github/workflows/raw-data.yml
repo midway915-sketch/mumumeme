@@ -26,16 +26,9 @@ jobs:
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # yfinance 필요 (requirements에 없을 수도 있어서 안전빵)
-          python - <<'PY'
-          import importlib, sys
-          for pkg in ["yfinance", "pandas"]:
-              try:
-                  importlib.import_module(pkg)
-              except Exception:
-                  sys.exit(1)
-          PY || pip install yfinance pandas pyarrow
 
+          # raw-data workflow needs these at minimum
+          pip install -U yfinance pandas pyarrow
       - name: Prepare folders
         run: |
           mkdir -p data/raw
