@@ -114,9 +114,7 @@ jobs:
       MAX_LEVERAGE_PCT: "1.0"
       EXCLUDE_TICKERS: ""
             # required files for predict_gate fail-fast (comma CSV)
-      REQUIRE_FILES:
-        required: false
-        default: ""
+      REQUIRE_FILES: ""
 
       # ---- regime filter 기본값
       REGIME_MODE: "off"
