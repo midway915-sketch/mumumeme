@@ -82,6 +82,13 @@ def _load_tail_models():
     return model, scaler
 
 
+def _has_valid_numeric_col(df: pd.DataFrame, col: str) -> bool:
+    if col not in df.columns:
+        return False
+    s = pd.to_numeric(df[col], errors="coerce")
+    return np.isfinite(s).any()
+
+
 def _get_feature_cols(df: pd.DataFrame) -> list[str]:
     # try to use meta feature_cols if present
     meta = DATA_DIR / "meta" / "feature_cols.json"
@@ -99,9 +106,24 @@ def _get_feature_cols(df: pd.DataFrame) -> list[str]:
             pass
 
     # fallback: numeric columns except known keys/probs
-    drop = {"Date", "Ticker", "p_success", "p_tail", "tau_H", "tau_class", "ret_score", "utility", "p_badexit"}
+    drop = {
+        "Date",
+        "Ticker",
+        "p_success",
+        "p_tail",
+        "p_badexit",
+        "tau_H",
+        "tau_class",
+        "tau_pmax",
+        "ret_score",
+        "utility",
+        "utility_raw",
+        "tail_pen",
+        "utility_qpass",
+        "score",
+    }
     cols = [c for c in df.columns if c not in drop]
-    out = []
+    out: list[str] = []
     for c in cols:
         if pd.api.types.is_numeric_dtype(df[c]):
             out.append(c)
@@ -137,9 +159,9 @@ def _apply_regime_filter(
       - Market_ATR_ratio (vol proxy)
 
     Universe is 3x levered => compare "levered equivalent" by multiplying market metrics.
-      - drawdown: require (-Market_Drawdown * lev) <= dd_max  <=> Market_Drawdown >= -dd_max/lev
-      - ret20    : require (Market_ret_20 * lev) >= ret20_min <=> Market_ret_20 >= ret20_min/lev
-      - atr      : require (Market_ATR_ratio * lev) <= atr_max <=> Market_ATR_ratio <= atr_max/lev
+      - drawdown: require (-Market_Drawdown * leverage_mult) <= dd_max  <=> Market_Drawdown >= -dd_max/leverage_mult
+      - ret20    : require (Market_ret_20 * leverage_mult) >= ret20_min <=> Market_ret_20 >= ret20_min/leverage_mult
+      - atr      : require (Market_ATR_ratio * leverage_mult) <= atr_max <=> Market_ATR_ratio <= atr_max/leverage_mult
     """
     m = (mode or "off").strip().lower()
     if m == "off":
@@ -172,7 +194,6 @@ def _apply_regime_filter(
     def has_col(c: str) -> bool:
         return c in out.columns and pd.api.types.is_numeric_dtype(out[c])
 
-    # dd
     if m in ("dd", "basic", "combo"):
         if has_col(need_dd):
             audit["used_cols"].append(need_dd)
@@ -180,7 +201,6 @@ def _apply_regime_filter(
         else:
             audit.setdefault("warnings", []).append(f"missing {need_dd} -> dd filter skipped")
 
-    # trend (ret20)
     if m in ("trend", "combo"):
         if has_col(need_ret):
             audit["used_cols"].append(need_ret)
@@ -188,7 +208,6 @@ def _apply_regime_filter(
         else:
             audit.setdefault("warnings", []).append(f"missing {need_ret} -> trend filter skipped")
 
-    # atr
     if m in ("basic", "combo"):
         if has_col(need_atr):
             audit["used_cols"].append(need_atr)
@@ -237,7 +256,7 @@ def main():
         help="comma-separated file paths that must exist; missing -> exit code 2",
     )
 
-    # ✅ NEW: regime filter args (driven by env from workflow)
+    # ✅ regime filter args
     ap.add_argument("--regime-mode", default="off", choices=["off", "basic", "trend", "dd", "combo"])
     ap.add_argument("--regime-dd-max", default=0.20, type=float)
     ap.add_argument("--regime-ret20-min", default=0.00, type=float)
@@ -259,23 +278,52 @@ def main():
 
     feats = _load_features(args.features_path)
 
-    # model probs (p_success)
-    model, scaler = _load_models()
-    feat_cols = _get_feature_cols(feats)
-    feats2 = _coerce_numeric(feats, feat_cols)
+    # ------------------------------------------------------------------
+    # ✅ NEW: if features already contain scored probabilities, DO NOT
+    #         require app/model.pkl etc. (WF-lite friendly)
+    # ------------------------------------------------------------------
+    use_scored_ps = _has_valid_numeric_col(feats, "p_success")
+    use_scored_pt = _has_valid_numeric_col(feats, "p_tail")
 
-    X = feats2[feat_cols].to_numpy(dtype=float)
-    Xs = scaler.transform(X)
-    proba = model.predict_proba(Xs)
-    p_success = proba[:, 1] if (proba.ndim == 2 and proba.shape[1] >= 2) else proba[:, 0]
-    feats2["p_success"] = p_success
+    # model probs (p_success)
+    if use_scored_ps:
+        feats2 = feats.copy()
+        feats2["p_success"] = pd.to_numeric(feats2["p_success"], errors="coerce").fillna(0.0).astype(float)
+        scored_mode_ps = "use_features_col"
+    else:
+        model, scaler = _load_models()
+        feat_cols = _get_feature_cols(feats)
+        feats2 = _coerce_numeric(feats, feat_cols)
+        X = feats2[feat_cols].to_numpy(dtype=float)
+        Xs = scaler.transform(X)
+        proba = model.predict_proba(Xs)
+        if proba.shape[1] >= 2:
+            p_success = proba[:, 1]
+        else:
+            p_success = proba[:, 0]
+        feats2["p_success"] = p_success.astype(float)
+        scored_mode_ps = "model_predict"
 
     # tail probs (p_tail)
-    tail_model, tail_scaler = _load_tail_models()
-    Xt = tail_scaler.transform(X)
-    tproba = tail_model.predict_proba(Xt)
-    p_tail = tproba[:, 1] if (tproba.ndim == 2 and tproba.shape[1] >= 2) else tproba[:, 0]
-    feats2["p_tail"] = p_tail
+    if use_scored_pt:
+        feats2["p_tail"] = pd.to_numeric(feats2.get("p_tail"), errors="coerce").fillna(0.0).astype(float)
+        scored_mode_pt = "use_features_col"
+    else:
+        # need features matrix for tail model; ensure we have X
+        if "feat_cols" not in locals():
+            feat_cols = _get_feature_cols(feats2)
+            feats2 = _coerce_numeric(feats2, feat_cols)
+        X = feats2[feat_cols].to_numpy(dtype=float)
+
+        tail_model, tail_scaler = _load_tail_models()
+        Xt = tail_scaler.transform(X)
+        tproba = tail_model.predict_proba(Xt)
+        if tproba.shape[1] >= 2:
+            p_tail = tproba[:, 1]
+        else:
+            p_tail = tproba[:, 0]
+        feats2["p_tail"] = p_tail.astype(float)
+        scored_mode_pt = "model_predict"
 
     # basic filters
     if args.exclude_tickers:
@@ -285,7 +333,7 @@ def main():
 
     feats2 = feats2[feats2["p_success"] >= float(args.ps_min)].copy()
 
-    # ✅ regime filter (after ps_min)
+    # regime filter (after ps_min)
     feats2, regime_audit = _apply_regime_filter(
         feats2,
         mode=str(args.regime_mode),
@@ -303,7 +351,14 @@ def main():
         pd.DataFrame(columns=["Date", "Ticker"]).to_csv(picks_path, index=False)
         debug_path.write_text(
             json.dumps(
-                {"empty": True, "reason": "filters", "ps_min": float(args.ps_min), "regime": regime_audit},
+                {
+                    "empty": True,
+                    "reason": "filters",
+                    "ps_min": float(args.ps_min),
+                    "regime": regime_audit,
+                    "p_success_source": scored_mode_ps,
+                    "p_tail_source": scored_mode_pt,
+                },
                 indent=2,
                 ensure_ascii=False,
             ),
@@ -349,8 +404,9 @@ def main():
             feats2["ret_score"] = feats2["utility_raw"]
         feats2["score"] = feats2["ret_score"].fillna(-np.inf)
 
-    # optional badexit filter (if column exists)
+    # optional badexit filter (if column exists in features)
     if args.badexit_max is not None and "p_badexit" in feats2.columns:
+        feats2["p_badexit"] = pd.to_numeric(feats2["p_badexit"], errors="coerce").fillna(0.0).astype(float)
         feats2 = feats2[feats2["p_badexit"] <= float(args.badexit_max)].copy()
 
     feats2 = feats2.sort_values(["Date", "score"], ascending=[True, False]).reset_index(drop=True)
@@ -385,6 +441,8 @@ def main():
         "n_rows_features": int(len(feats2)),
         "n_rows_picks": int(len(picks)),
         "regime": regime_audit,
+        "p_success_source": scored_mode_ps,
+        "p_tail_source": scored_mode_pt,
     }
     debug_path.write_text(json.dumps(dbg, ensure_ascii=False, indent=2), encoding="utf-8")
 
