@@ -35,7 +35,10 @@ set -euo pipefail
 
 # ✅ optional-but-allowed-empty
 EXCLUDE_TICKERS="${EXCLUDE_TICKERS:-}"
+export EXCLUDE_TICKERS
 REQUIRE_FILES="${REQUIRE_FILES:-}"
+export REQUIRE_FILES
+
 # optional envs (regime + tau/dca)
 REGIME_MODE="${REGIME_MODE:-off}"
 REGIME_DD_MAX="${REGIME_DD_MAX:-0.20}"
