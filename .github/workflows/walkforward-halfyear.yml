@@ -1,0 +1,299 @@
+name: walkforward-halfyear
+
+on:
+  workflow_dispatch:
+    inputs:
+      wf_start:
+        description: "first half-year (e.g. 2015H1)"
+        required: true
+        default: "2018H1"
+      wf_end:
+        description: "last half-year (e.g. 2025H2)"
+        required: true
+        default: "2025H2"
+      train_years:
+        description: "train window in years (e.g. 12)"
+        required: true
+        default: "12"
+
+      # ----- your existing grid envs (put your usual defaults here)
+      PROFIT_TARGET:
+        required: true
+        default: "0.10"
+      MAX_DAYS:
+        required: true
+        default: "40"
+      STOP_LEVEL:
+        required: true
+        default: "-0.10"
+
+      P_TAIL_THRESHOLDS:
+        required: true
+        default: "0.10,0.20,0.30"
+      UTILITY_QUANTILES:
+        required: true
+        default: "0.60,0.75,0.90"
+      RANK_METRICS:
+        required: true
+        default: "utility"
+      LAMBDA_TAIL:
+        required: true
+        default: "1.0"
+      GATE_MODES:
+        required: true
+        default: "tail_utility"
+      TRAIL_STOPS:
+        required: true
+        default: "0.10"
+      TP1_FRAC:
+        required: true
+        default: "0.50"
+      ENABLE_TRAILING:
+        required: true
+        default: "true"
+      TOPK_CONFIGS:
+        required: true
+        default: "1|1.0"
+      PS_MINS:
+        required: true
+        default: "0.60"
+      BADEXIT_MAXES:
+        required: true
+        default: "1.00"
+
+      MAX_LEVERAGE_PCT:
+        required: true
+        default: "1.0"
+      EXCLUDE_TICKERS:
+        required: true
+        default: ""
+
+      # required files for predict_gate fail-fast (comma CSV)
+      REQUIRE_FILES:
+        required: true
+        default: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl,app/tail_model.pkl,app/tail_scaler.pkl"
+
+      # optional regime filter envs (you just added)
+      REGIME_MODE:
+        required: false
+        default: "off"
+      REGIME_DD_MAX:
+        required: false
+        default: "0.20"
+      REGIME_RET20_MIN:
+        required: false
+        default: "0.00"
+      REGIME_ATR_MAX:
+        required: false
+        default: "1.30"
+      REGIME_LEVERAGE_MULT:
+        required: false
+        default: "3.0"
+
+      # optional tau split folder name (e.g. taucur)
+      TAU_SPLIT:
+        required: false
+        default: ""
+
+      # optional toggles
+      USE_TAU_H:
+        required: false
+        default: "false"
+      ENABLE_DCA:
+        required: false
+        default: "false"
+
+jobs:
+  make-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Generate half-year matrix JSON
+        id: gen
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re
+          from datetime import date, timedelta
+
+          wf_start = "${{ inputs.wf_start }}".strip()
+          wf_end   = "${{ inputs.wf_end }}".strip()
+          train_years = int("${{ inputs.train_years }}")
+
+          m = re.fullmatch(r"(\d{4})H([12])", wf_start)
+          n = re.fullmatch(r"(\d{4})H([12])", wf_end)
+          if not m or not n:
+            raise SystemExit("wf_start/wf_end must be like 2018H1")
+
+          sy, sh = int(m.group(1)), int(m.group(2))
+          ey, eh = int(n.group(1)), int(n.group(2))
+
+          # iterate half-years inclusive
+          items = []
+          y, h = sy, sh
+          def half_start(y,h):
+            return date(y, 1, 1) if h==1 else date(y, 7, 1)
+          def half_end(y,h):
+            return date(y, 6, 30) if h==1 else date(y, 12, 31)
+
+          while True:
+            period = f"{y}H{h}"
+
+            test_start = half_start(y,h)
+            test_end   = half_end(y,h)
+
+            # valid = 직전 6개월 = 이전 반기
+            if h == 1:
+              vy, vh = y-1, 2
+            else:
+              vy, vh = y, 1
+            valid_start = half_start(vy,vh)
+            valid_end   = half_end(vy,vh)
+
+            # train: train_years년치(대략) = valid_start 이전으로 연 단위 컷
+            train_end = valid_start - timedelta(days=1)
+            train_start = date(train_end.year - train_years + 1, train_end.month, train_end.day)
+            # (정확한 “년” 기준이 필요하면 나중에 relativedelta로 바꿔도 됨)
+
+            # cut_date = valid_end (모델/스코어링에서 “여기까지는 과거”로 쓰기 쉬움)
+            cut_date = valid_end
+
+            items.append({
+              "period": period,
+              "TRAIN_START": train_start.isoformat(),
+              "TRAIN_END": train_end.isoformat(),
+              "VALID_START": valid_start.isoformat(),
+              "VALID_END": valid_end.isoformat(),
+              "TEST_START": test_start.isoformat(),
+              "TEST_END": test_end.isoformat(),
+              "CUT_DATE": cut_date.isoformat(),
+            })
+
+            if (y==ey and h==eh):
+              break
+            # next
+            if h == 1:
+              h = 2
+            else:
+              y += 1
+              h = 1
+
+          print(json.dumps({"include": items}, ensure_ascii=False))
+          PY
+
+          echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re
+          from datetime import date, timedelta
+          # re-run same generator (small duplication is fine inside GHA)
+          wf_start = "${{ inputs.wf_start }}".strip()
+          wf_end   = "${{ inputs.wf_end }}".strip()
+          train_years = int("${{ inputs.train_years }}")
+          m = re.fullmatch(r"(\d{4})H([12])", wf_start)
+          n = re.fullmatch(r"(\d{4})H([12])", wf_end)
+          sy, sh = int(m.group(1)), int(m.group(2))
+          ey, eh = int(n.group(1)), int(n.group(2))
+          def half_start(y,h): return date(y,1,1) if h==1 else date(y,7,1)
+          def half_end(y,h):   return date(y,6,30) if h==1 else date(y,12,31)
+          items=[]
+          y,h=sy,sh
+          while True:
+            period=f"{y}H{h}"
+            test_start=half_start(y,h); test_end=half_end(y,h)
+            vy,vh=(y-1,2) if h==1 else (y,1)
+            valid_start=half_start(vy,vh); valid_end=half_end(vy,vh)
+            train_end=valid_start - timedelta(days=1)
+            train_start=date(train_end.year-train_years+1, train_end.month, train_end.day)
+            cut_date=valid_end
+            items.append({
+              "period":period,
+              "TRAIN_START":train_start.isoformat(),
+              "TRAIN_END":train_end.isoformat(),
+              "VALID_START":valid_start.isoformat(),
+              "VALID_END":valid_end.isoformat(),
+              "TEST_START":test_start.isoformat(),
+              "TEST_END":test_end.isoformat(),
+              "CUT_DATE":cut_date.isoformat(),
+            })
+            if y==ey and h==eh: break
+            if h==1: h=2
+            else: y+=1; h=1
+          print(json.dumps({"include":items}, ensure_ascii=False))
+          PY
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+  run:
+    needs: make-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Walkforward run (one half-year)
+        env:
+          WF_PERIOD: ${{ matrix.period }}
+          TRAIN_START: ${{ matrix.TRAIN_START }}
+          TRAIN_END: ${{ matrix.TRAIN_END }}
+          VALID_START: ${{ matrix.VALID_START }}
+          VALID_END: ${{ matrix.VALID_END }}
+          TEST_START: ${{ matrix.TEST_START }}
+          TEST_END: ${{ matrix.TEST_END }}
+          CUT_DATE: ${{ matrix.CUT_DATE }}
+
+          # your existing envs
+          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
+          MAX_DAYS: ${{ inputs.MAX_DAYS }}
+          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
+          P_TAIL_THRESHOLDS: ${{ inputs.P_TAIL_THRESHOLDS }}
+          UTILITY_QUANTILES: ${{ inputs.UTILITY_QUANTILES }}
+          RANK_METRICS: ${{ inputs.RANK_METRICS }}
+          LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
+          GATE_MODES: ${{ inputs.GATE_MODES }}
+          TRAIL_STOPS: ${{ inputs.TRAIL_STOPS }}
+          TP1_FRAC: ${{ inputs.TP1_FRAC }}
+          ENABLE_TRAILING: ${{ inputs.ENABLE_TRAILING }}
+          TOPK_CONFIGS: ${{ inputs.TOPK_CONFIGS }}
+          PS_MINS: ${{ inputs.PS_MINS }}
+          BADEXIT_MAXES: ${{ inputs.BADEXIT_MAXES }}
+          MAX_LEVERAGE_PCT: ${{ inputs.MAX_LEVERAGE_PCT }}
+          EXCLUDE_TICKERS: ${{ inputs.EXCLUDE_TICKERS }}
+          REQUIRE_FILES: ${{ inputs.REQUIRE_FILES }}
+
+          # regime filter envs
+          REGIME_MODE: ${{ inputs.REGIME_MODE }}
+          REGIME_DD_MAX: ${{ inputs.REGIME_DD_MAX }}
+          REGIME_RET20_MIN: ${{ inputs.REGIME_RET20_MIN }}
+          REGIME_ATR_MAX: ${{ inputs.REGIME_ATR_MAX }}
+          REGIME_LEVERAGE_MULT: ${{ inputs.REGIME_LEVERAGE_MULT }}
+
+          # optional split/toggles
+          TAU_SPLIT: ${{ inputs.TAU_SPLIT }}
+          USE_TAU_H: ${{ inputs.USE_TAU_H }}
+          ENABLE_DCA: ${{ inputs.ENABLE_DCA }}
+
+          # output partitioning
+          OUT_DIR_BASE: data/signals/walkforward
+          WF_TAG_BASE: wf
+
+        run: |
+          chmod +x scripts/run_walkforward_halfyear.sh
+          ./scripts/run_walkforward_halfyear.sh
+
+      - name: Upload artifacts (this half-year)
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward_${{ matrix.period }}
+          path: data/signals/walkforward/${{ matrix.period }}
+          if-no-files-found: warn
