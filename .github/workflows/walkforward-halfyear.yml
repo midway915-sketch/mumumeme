@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       wf_start:
-        description: "first half-year (e.g. 2015H1)"
+        description: "first half-year (e.g. 2018H1)"
         required: true
         default: "2018H1"
       wf_end:
@@ -12,92 +12,9 @@ on:
         required: true
         default: "2025H2"
       train_years:
-        description: "train window in years (e.g. 12)"
+        description: "train window in years"
         required: true
         default: "12"
-
-      # ----- your existing grid envs
-      PROFIT_TARGET:
-        required: true
-        default: "0.10"
-      MAX_DAYS:
-        required: true
-        default: "40"
-      STOP_LEVEL:
-        required: true
-        default: "-0.10"
-
-      P_TAIL_THRESHOLDS:
-        required: true
-        default: "0.10,0.20,0.30"
-      UTILITY_QUANTILES:
-        required: true
-        default: "0.60,0.75,0.90"
-      RANK_METRICS:
-        required: true
-        default: "utility"
-      LAMBDA_TAIL:
-        required: true
-        default: "1.0"
-      GATE_MODES:
-        required: true
-        default: "tail_utility"
-      TRAIL_STOPS:
-        required: true
-        default: "0.10"
-      TP1_FRAC:
-        required: true
-        default: "0.50"
-      ENABLE_TRAILING:
-        required: true
-        default: "true"
-      TOPK_CONFIGS:
-        required: true
-        default: "1|1.0"
-      PS_MINS:
-        required: true
-        default: "0.60"
-      BADEXIT_MAXES:
-        required: true
-        default: "1.00"
-
-      MAX_LEVERAGE_PCT:
-        required: true
-        default: "1.0"
-      EXCLUDE_TICKERS:
-        required: true
-        default: ""
-
-      REQUIRE_FILES:
-        required: true
-        default: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl,app/tail_model.pkl,app/tail_scaler.pkl"
-
-      # regime filter envs
-      REGIME_MODE:
-        required: false
-        default: "off"
-      REGIME_DD_MAX:
-        required: false
-        default: "0.20"
-      REGIME_RET20_MIN:
-        required: false
-        default: "0.00"
-      REGIME_ATR_MAX:
-        required: false
-        default: "1.30"
-      REGIME_LEVERAGE_MULT:
-        required: false
-        default: "3.0"
-
-      TAU_SPLIT:
-        required: false
-        default: ""
-      USE_TAU_H:
-        required: false
-        default: "false"
-      ENABLE_DCA:
-        required: false
-        default: "false"
 
 jobs:
   make-matrix:
@@ -105,22 +22,19 @@ jobs:
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
     steps:
-      - name: Generate half-year matrix JSON
+      - name: Generate matrix
         id: gen
-        shell: bash
         run: |
-          MATRIX_JSON="$(python - <<'PY'
+          python - <<'PY' > matrix.json
           import json, re
           from datetime import date, timedelta
 
-          wf_start = "${{ inputs.wf_start }}".strip()
-          wf_end   = "${{ inputs.wf_end }}".strip()
+          wf_start = "${{ inputs.wf_start }}"
+          wf_end   = "${{ inputs.wf_end }}"
           train_years = int("${{ inputs.train_years }}")
 
           m = re.fullmatch(r"(\d{4})H([12])", wf_start)
           n = re.fullmatch(r"(\d{4})H([12])", wf_end)
-          if not m or not n:
-              raise SystemExit("wf_start/wf_end must be like 2018H1")
 
           sy, sh = int(m.group(1)), int(m.group(2))
           ey, eh = int(n.group(1)), int(n.group(2))
@@ -132,27 +46,25 @@ jobs:
           y,h=sy,sh
           while True:
               period=f"{y}H{h}"
-              test_start=half_start(y,h); test_end=half_end(y,h)
+              test_start=half_start(y,h)
+              test_end=half_end(y,h)
 
-              # valid = 직전 반기
               vy,vh=(y-1,2) if h==1 else (y,1)
-              valid_start=half_start(vy,vh); valid_end=half_end(vy,vh)
+              valid_start=half_start(vy,vh)
+              valid_end=half_end(vy,vh)
 
-              # train = valid_start 이전 train_years년치(대략)
               train_end = valid_start - timedelta(days=1)
-              train_start = date(train_end.year - train_years + 1, train_end.month, train_end.day)
-
-              cut_date = valid_end
+              train_start = date(train_end.year-train_years+1, train_end.month, train_end.day)
 
               items.append({
-                  "period": period,
-                  "TRAIN_START": train_start.isoformat(),
-                  "TRAIN_END": train_end.isoformat(),
-                  "VALID_START": valid_start.isoformat(),
-                  "VALID_END": valid_end.isoformat(),
-                  "TEST_START": test_start.isoformat(),
-                  "TEST_END": test_end.isoformat(),
-                  "CUT_DATE": cut_date.isoformat(),
+                  "period":period,
+                  "TRAIN_START":train_start.isoformat(),
+                  "TRAIN_END":train_end.isoformat(),
+                  "VALID_START":valid_start.isoformat(),
+                  "VALID_END":valid_end.isoformat(),
+                  "TEST_START":test_start.isoformat(),
+                  "TEST_END":test_end.isoformat(),
+                  "CUT_DATE":valid_end.isoformat()
               })
 
               if y==ey and h==eh:
@@ -162,12 +74,11 @@ jobs:
               else:
                   y+=1; h=1
 
-          print(json.dumps({"include": items}, ensure_ascii=False))
+          print(json.dumps({"include":items}))
           PY
-          )"
 
           echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$MATRIX_JSON" >> "$GITHUB_OUTPUT"
+          cat matrix.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
   run:
@@ -176,9 +87,39 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
+
+    # 🔥 여기서 grid 관련 값 전부 기본 env로 둔다
+    env:
+      PROFIT_TARGET: "0.10"
+      MAX_DAYS: "40"
+      STOP_LEVEL: "-0.10"
+      P_TAIL_THRESHOLDS: "0.10,0.20,0.30"
+      UTILITY_QUANTILES: "0.60,0.75,0.90"
+      RANK_METRICS: "utility"
+      LAMBDA_TAIL: "1.0"
+      GATE_MODES: "tail_utility"
+      TRAIL_STOPS: "0.10"
+      TP1_FRAC: "0.50"
+      ENABLE_TRAILING: "true"
+      TOPK_CONFIGS: "1|1.0"
+      PS_MINS: "0.60"
+      BADEXIT_MAXES: "1.00"
+      MAX_LEVERAGE_PCT: "1.0"
+      EXCLUDE_TICKERS: ""
+      REQUIRE_FILES: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl,app/tail_model.pkl,app/tail_scaler.pkl"
+
+      REGIME_MODE: "off"
+      REGIME_DD_MAX: "0.20"
+      REGIME_RET20_MIN: "0.00"
+      REGIME_ATR_MAX: "1.30"
+      REGIME_LEVERAGE_MULT: "3.0"
+
+      TAU_SPLIT: ""
+      USE_TAU_H: "false"
+      ENABLE_DCA: "false"
+
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -188,7 +129,7 @@ jobs:
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Walkforward run (one half-year)
+      - name: Walkforward run
         env:
           WF_PERIOD: ${{ matrix.period }}
           TRAIN_START: ${{ matrix.TRAIN_START }}
@@ -199,44 +140,6 @@ jobs:
           TEST_END: ${{ matrix.TEST_END }}
           CUT_DATE: ${{ matrix.CUT_DATE }}
 
-          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
-          MAX_DAYS: ${{ inputs.MAX_DAYS }}
-          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
-          P_TAIL_THRESHOLDS: ${{ inputs.P_TAIL_THRESHOLDS }}
-          UTILITY_QUANTILES: ${{ inputs.UTILITY_QUANTILES }}
-          RANK_METRICS: ${{ inputs.RANK_METRICS }}
-          LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
-          GATE_MODES: ${{ inputs.GATE_MODES }}
-          TRAIL_STOPS: ${{ inputs.TRAIL_STOPS }}
-          TP1_FRAC: ${{ inputs.TP1_FRAC }}
-          ENABLE_TRAILING: ${{ inputs.ENABLE_TRAILING }}
-          TOPK_CONFIGS: ${{ inputs.TOPK_CONFIGS }}
-          PS_MINS: ${{ inputs.PS_MINS }}
-          BADEXIT_MAXES: ${{ inputs.BADEXIT_MAXES }}
-          MAX_LEVERAGE_PCT: ${{ inputs.MAX_LEVERAGE_PCT }}
-          EXCLUDE_TICKERS: ${{ inputs.EXCLUDE_TICKERS }}
-          REQUIRE_FILES: ${{ inputs.REQUIRE_FILES }}
-
-          REGIME_MODE: ${{ inputs.REGIME_MODE }}
-          REGIME_DD_MAX: ${{ inputs.REGIME_DD_MAX }}
-          REGIME_RET20_MIN: ${{ inputs.REGIME_RET20_MIN }}
-          REGIME_ATR_MAX: ${{ inputs.REGIME_ATR_MAX }}
-          REGIME_LEVERAGE_MULT: ${{ inputs.REGIME_LEVERAGE_MULT }}
-
-          TAU_SPLIT: ${{ inputs.TAU_SPLIT }}
-          USE_TAU_H: ${{ inputs.USE_TAU_H }}
-          ENABLE_DCA: ${{ inputs.ENABLE_DCA }}
-
-          OUT_DIR_BASE: data/signals/walkforward
-          WF_TAG_BASE: wf
-
         run: |
           chmod +x scripts/run_walkforward_halfyear.sh
           ./scripts/run_walkforward_halfyear.sh
-
-      - name: Upload artifacts (this half-year)
-        uses: actions/upload-artifact@v4
-        with:
-          name: walkforward_${{ matrix.period }}
-          path: data/signals/walkforward/${{ matrix.period }}
-          if-no-files-found: warn
