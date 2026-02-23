@@ -32,7 +32,7 @@ set -euo pipefail
 : "${PS_MINS:?}"
 : "${BADEXIT_MAXES:?}"
 : "${MAX_LEVERAGE_PCT:?}"
-: "${REQUIRE_FILES:""}"
+: "${REQUIRE_FILES:?}"
 
 # ✅ optional-but-allowed-empty
 EXCLUDE_TICKERS="${EXCLUDE_TICKERS:-}"
