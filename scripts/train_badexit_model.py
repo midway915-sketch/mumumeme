@@ -36,8 +36,8 @@ LABEL_DIR = DATA_DIR / "labels"
 META_DIR = DATA_DIR / "meta"
 APP_DIR = Path("app")
 
-IN_PARQ = LABEL_DIR / "labels_badexit.parquet"
-IN_CSV = LABEL_DIR / "labels_badexit.csv"
+IN_PARQ = LABEL_DIR / "labels_badexit.parquet"  # legacy default
+IN_CSV = LABEL_DIR / "labels_badexit.csv"        # legacy default
 
 
 def _norm_date(s: pd.Series) -> pd.Series:
@@ -62,7 +62,11 @@ def _safe_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Train BadExit (p_badexit) model from labels_badexit.")
+    ap = argparse.ArgumentParser(description="Train BadExit (p_badexit) model from labels_badexit(_{tag}).")
+
+    # ✅ NEW: tag convenience (recommended)
+    # If --tag is set and you keep defaults, we will use tagged dataset/artifacts.
+    ap.add_argument("--tag", type=str, default="", help="e.g. pt10_h40_sl10_ex20")
     ap.add_argument("--in-parq", type=str, default=str(IN_PARQ))
     ap.add_argument("--in-csv", type=str, default=str(IN_CSV))
 
@@ -73,6 +77,21 @@ def main() -> None:
     ap.add_argument("--valid-frac", type=float, default=0.20, help="time-based split by date (last X frac = valid)")
     ap.add_argument("--min-rows", type=int, default=500, help="fail fast if too small dataset")
     args = ap.parse_args()
+
+    tag = (args.tag or "").strip()
+
+    # If tag is given and inputs are untouched defaults -> switch to tagged labels
+    if tag and (args.in_parq == str(IN_PARQ)) and (args.in_csv == str(IN_CSV)):
+        args.in_parq = str(LABEL_DIR / f"labels_badexit_{tag}.parquet")
+        args.in_csv = str(LABEL_DIR / f"labels_badexit_{tag}.csv")
+
+    # If tag is given and outputs are untouched defaults -> write tagged artifacts
+    if tag and (args.out_model == "app/badexit_model.pkl"):
+        args.out_model = f"app/badexit_model_{tag}.pkl"
+    if tag and (args.out_scaler == "app/badexit_scaler.pkl"):
+        args.out_scaler = f"app/badexit_scaler_{tag}.pkl"
+    if tag and (args.out_report == "data/meta/train_badexit_report.json"):
+        args.out_report = f"data/meta/train_badexit_report_{tag}.json"
 
     APP_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
@@ -150,6 +169,8 @@ def main() -> None:
     yhat_va = (p_va >= 0.5).astype(int)
 
     report = {
+        "tag": tag,
+        "built_at_utc": pd.Timestamp.utcnow().isoformat(),
         "dataset": {
             "rows_total": int(len(df)),
             "rows_train": int(len(train_df)),
@@ -191,6 +212,15 @@ def main() -> None:
 
     joblib.dump(clf, out_model)
     joblib.dump(scaler, out_scaler)
+
+    # ✅ Compatibility: also refresh untagged defaults used by older code
+    try:
+        joblib.dump(clf, Path("app/badexit_model.pkl"))
+        joblib.dump(scaler, Path("app/badexit_scaler.pkl"))
+        print("[INFO] also wrote compatibility copies: app/badexit_model.pkl / app/badexit_scaler.pkl")
+    except Exception as e:
+        print(f"[WARN] failed to write compatibility copies: {e}")
+
     out_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"[DONE] wrote model : {out_model}")
