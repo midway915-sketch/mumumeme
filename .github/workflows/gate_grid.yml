@@ -37,11 +37,17 @@ on:
         description: "tp1_frac quantiles"
         required: true
         default: "0.50,1.00"
-        
+
       lambda_tail:
         description: "utility tail penalty lambda (single float, e.g. 0.05)"
         required: true
         default: "0.20"
+
+      # ✅ NEW: p_badexit gate threshold list (like other gate params)
+      badexit_maxes:
+        description: "comma-separated p_badexit max cutoffs (e.g. 1.00,0.50,0.30)"
+        required: true
+        default: "1.00,0.50,0.30"
 
       rebuild_all:
         description: "true to rebuild prices/features/labels/models from scratch"
@@ -72,17 +78,20 @@ jobs:
       PS_MINS: ${{ github.event.inputs.ps_mins || '0.00,0.50,0.60,0.70' }}
       RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility,ret_score' }}
       LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.05' }}
-      
+
+      # ✅ NEW: pass badexit thresholds to grid script
+      BADEXIT_MAXES: ${{ github.event.inputs.badexit_maxes || '1.00,0.50,0.30' }}
+
       REVAL_PS_STRONG: ${{ github.event.inputs.reval_ps_strong || '0.70' }}
       REVAL_PT_STRONG: ${{ github.event.inputs.reval_pt_strong || '0.15' }}
       REVAL_PS_PASS: ${{ github.event.inputs.reval_ps_pass || '0.50' }}
       REVAL_PT_PASS: ${{ github.event.inputs.reval_pt_pass || '0.20' }}
-      
+
       REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'true' }}
 
       PRICE_START: "2008-01-01"
       PRICE_END: "2026-01-01"
-      MAX_YEARS: "21"   # 예: 15년 + 1년 워밍업 느낌 (원하는 값으로)
+      MAX_YEARS: "21"
 
       GATE_MODES: "none,tail,utility,tail_utility"
 
@@ -90,7 +99,6 @@ jobs:
       TP1_FRAC: ${{ github.event.inputs.tp1_frac || '1.00' }}
       TRAIL_STOPS: "0.10"
 
-      # ✅ TopK2 제거
       TOPK_CONFIGS: "1|1.0"
       MAX_LEVERAGE_PCT: "1.00"
       CAP_COMPARE: "false"
@@ -163,7 +171,6 @@ jobs:
             data/raw/prices.csv
             data/raw/prices_meta.json
           key: mumumeme-prices-v3-${{ runner.os }}-ys${{ env.MAX_YEARS }}-ps${{ env.PRICE_START }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
-          
           restore-keys: |
             mumumeme-prices-v3-${{ runner.os }}-ys${{ env.MAX_YEARS }}-ps${{ env.PRICE_START }}-
             mumumeme-prices-v3-${{ runner.os }}-
@@ -209,7 +216,6 @@ jobs:
             mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
             mumumeme-tail-v3-${{ runner.os }}-
 
-      # ✅ TAU: 두 분포 모두 캐시
       - name: Restore cache (TAU)
         uses: actions/cache@v4
         with:
@@ -231,6 +237,7 @@ jobs:
           echo "[INFO] PROFIT_TARGET=$PROFIT_TARGET MAX_DAYS=$MAX_DAYS STOP_LEVEL=$STOP_LEVEL MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS"
           echo "[INFO] LABEL_KEY=$LABEL_KEY"
           echo "[INFO] DEDUP_PICKS=$DEDUP_PICKS"
+          echo "[INFO] BADEXIT_MAXES=$BADEXIT_MAXES"
 
           if [ "${REBUILD_ALL}" = "true" ]; then
             rm -rf data/raw/* data/features/* data/labels/* app/* data/signals/* data/meta/* || true
@@ -292,6 +299,31 @@ jobs:
               --max-extend-days "${MAX_EXTEND_DAYS}"
           else
             echo "[INFO] tail model exists -> reuse"
+          fi
+
+          # ✅ (Optional) BadExit labels/model: run ONLY if scripts exist
+          if [ -f scripts/build_badexit_labels.py ]; then
+            if [ ! -f "data/labels/labels_badexit_${EX_TAG}.parquet" ] && [ ! -f "data/labels/labels_badexit_${EX_TAG}.csv" ]; then
+              python scripts/build_badexit_labels.py \
+                --profit-target "${PROFIT_TARGET}" \
+                --max-days "${MAX_DAYS}" \
+                --stop-level "${STOP_LEVEL}" \
+                --max-extend-days "${MAX_EXTEND_DAYS}"
+            else
+              echo "[INFO] labels_badexit exists -> reuse"
+            fi
+          else
+            echo "[INFO] scripts/build_badexit_labels.py missing -> skip badexit labels"
+          fi
+
+          if [ -f scripts/train_badexit_model.py ]; then
+            if [ ! -f app/badexit_model.pkl ] || [ ! -f app/badexit_scaler.pkl ]; then
+              python scripts/train_badexit_model.py
+            else
+              echo "[INFO] badexit model exists -> reuse"
+            fi
+          else
+            echo "[INFO] scripts/train_badexit_model.py missing -> skip badexit model"
           fi
 
           # ✅ Tau split tags
@@ -425,8 +457,8 @@ jobs:
             data/signals/picks_meta_*.json
             data/signals/sim_engine_trades_*.parquet
             data/signals/sim_engine_curve_*.parquet
-            data/signals/sim_engine_trades_*.csv     # ✅ add
-            data/signals/sim_engine_curve_*.csv 
+            data/signals/sim_engine_trades_*.csv
+            data/signals/sim_engine_curve_*.csv
             data/features/features_scored.csv
             data/features/features_scored.parquet
             data/features/features_scored_tau_cur.csv
