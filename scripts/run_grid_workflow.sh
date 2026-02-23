@@ -39,13 +39,15 @@ echo "[INFO] TAU_SPLIT=${TAU_SPLIT:-<none>}"
 : "${EXCLUDE_TICKERS:?}"
 : "${REQUIRE_FILES:?}"
 
-# ✅ NEW: Regime filter env (optional; defaults are safe)
-REGIME_MODE="${REGIME_MODE:-off}"                # off|basic|trend|dd|combo
-REGIME_DD_MAX="${REGIME_DD_MAX:-0.20}"           # e.g. 0.20 => -20% (levered 기준)
-REGIME_RET20_MIN="${REGIME_RET20_MIN:-0.00}"     # e.g. 0.00
-REGIME_ATR_MAX="${REGIME_ATR_MAX:-1.30}"         # e.g. 1.30 (levered 기준)
-REGIME_LEVERAGE_MULT="${REGIME_LEVERAGE_MULT:-3.0}" # 3x universe 고려
-echo "[INFO] REGIME_MODE=$REGIME_MODE DD_MAX=$REGIME_DD_MAX RET20_MIN=$REGIME_RET20_MIN ATR_MAX=$REGIME_ATR_MAX LEV_MULT=$REGIME_LEVERAGE_MULT"
+# ✅ NEW (ENV-driven in predict_gate.py): Regime filter env (optional; defaults are safe)
+REGIME_FILTER="${REGIME_FILTER:-false}"     # true|false
+REGIME_MODE="${REGIME_MODE:-combo}"         # dd|trend|basic|combo
+REGIME_LEVERAGE="${REGIME_LEVERAGE:-3.0}"   # UPRO=3
+REGIME_MAX_DD="${REGIME_MAX_DD:-0.25}"      # levered-equivalent max drawdown
+REGIME_MAX_ATR="${REGIME_MAX_ATR:-0.10}"    # levered-equivalent max ATR_ratio
+REGIME_MIN_RET20="${REGIME_MIN_RET20:--0.02}" # levered-equivalent min 20d return
+export REGIME_FILTER REGIME_MODE REGIME_LEVERAGE REGIME_MAX_DD REGIME_MAX_ATR REGIME_MIN_RET20
+echo "[INFO] REGIME_FILTER=$REGIME_FILTER MODE=$REGIME_MODE LEV=$REGIME_LEVERAGE MAX_DD=$REGIME_MAX_DD MAX_ATR=$REGIME_MAX_ATR MIN_RET20=$REGIME_MIN_RET20"
 
 # re-eval thresholds (engine args)
 REVAL_PS_STRONG="${REVAL_PS_STRONG:-0.70}"
@@ -97,7 +99,7 @@ echo "[INFO] CAP_COMPARE=$CAP_COMPARE"
 echo "[INFO] TP1_HOLD_CAP_SINGLE=$TP1_HOLD_CAP_SINGLE"
 echo "[INFO] TP1_HOLD_CAP_MODES=$TP1_HOLD_CAP_MODES"
 
-# ✅ NEW: Tau/DCA 옵션 (엔진이 지원할 때만 켜서 전달)
+# ✅ Tau/DCA 옵션
 USE_TAU_H="${USE_TAU_H:-false}"
 USE_TAU_H="$(echo "$USE_TAU_H" | tr '[:upper:]' '[:lower:]' | xargs)"
 if [[ "$USE_TAU_H" != "true" && "$USE_TAU_H" != "false" ]]; then
@@ -112,11 +114,11 @@ if [[ "$ENABLE_DCA" != "true" && "$ENABLE_DCA" != "false" ]]; then
   exit 1
 fi
 
-# DCA 조건(옵션): 엔진이 이 인자들을 지원할 때만 의미 있음
+# DCA 조건(옵션)
 DCA_MAX_ADDS="${DCA_MAX_ADDS:-}"
 DCA_GAP_DAYS="${DCA_GAP_DAYS:-}"
-DCA_TRIGGER="${DCA_TRIGGER:-}"   # 예: drawdown_5p, ret_le_m0p05 등(엔진 규칙에 맞게)
-DCA_ADD_FRAC="${DCA_ADD_FRAC:-}" # 예: 0.50 (추가매수 시 기존 대비 몇 배)
+DCA_TRIGGER="${DCA_TRIGGER:-}"
+DCA_ADD_FRAC="${DCA_ADD_FRAC:-}"
 
 echo "[INFO] USE_TAU_H=$USE_TAU_H ENABLE_DCA=$ENABLE_DCA DCA_MAX_ADDS=${DCA_MAX_ADDS:-<unset>} DCA_GAP_DAYS=${DCA_GAP_DAYS:-<unset>} DCA_TRIGGER=${DCA_TRIGGER:-<unset>} DCA_ADD_FRAC=${DCA_ADD_FRAC:-<unset>}"
 
@@ -267,7 +269,7 @@ PY
                 echo "[RUN] mode=$mode tail_max=$tmax u_q=$uq rank_by=$rank_by lambda=$LAMBDA_TAIL ps_min=$psmin badexit_max=$be topk=$K weights=$W trail=$trail base_suffix=$base_suffix"
                 echo "=============================="
 
-                # ---- PREDICT
+                # ---- PREDICT (regime args removed; ENV is already exported above)
                 python "$PRED" \
                   --profit-target "$PROFIT_TARGET" \
                   --max-days "$MAX_DAYS" \
@@ -285,12 +287,7 @@ PY
                   --suffix "$base_suffix" \
                   --exclude-tickers "$EXCLUDE_TICKERS" \
                   --out-dir "$OUT_DIR" \
-                  --require-files "$REQUIRE_FILES" \
-                  --regime-mode "$REGIME_MODE" \
-                  --regime-dd-max "$REGIME_DD_MAX" \
-                  --regime-ret20-min "$REGIME_RET20_MIN" \
-                  --regime-atr-max "$REGIME_ATR_MAX" \
-                  --regime-leverage-mult "$REGIME_LEVERAGE_MULT"
+                  --require-files "$REQUIRE_FILES"
 
                 picks_path="$OUT_DIR/picks_${TAG}_gate_${base_suffix}.csv"
                 if [ ! -f "$picks_path" ]; then
@@ -337,7 +334,6 @@ PY
                   echo "[SIM] cap_mode=$cap_mode cap_suffix=$cap_suffix"
                   echo "------------------------------"
 
-                  # ✅ NEW: 엔진 추가 옵션은 env 켰을 때만 전달 (엔진이 인자 지원할 때만 사용)
                   SIM_EXTRA_ARGS=()
 
                   if [ "$USE_TAU_H" = "true" ]; then
