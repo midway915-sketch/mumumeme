@@ -273,18 +273,24 @@ def main() -> None:
     feats["Ticker"] = feats["Ticker"].astype(str).str.upper().str.strip()
     feats = feats.dropna(subset=["Date", "Ticker"]).sort_values(["Date", "Ticker"]).reset_index(drop=True)
 
+    # numeric columns (missing -> defaults)
     feats["p_success"] = coerce_num(feats, "p_success", 0.0)
     feats["p_tail"] = coerce_num(feats, "p_tail", 0.0)
     feats["ret_score"] = coerce_num(feats, "ret_score", 0.0)
-    # ✅ NEW
     feats["p_badexit"] = coerce_num(feats, "p_badexit", 0.0)
 
+    # counts (for meta/debug)
+    rows_loaded = int(len(feats))
+
     feats = apply_exclude_tickers(feats, args.exclude_tickers)
+    rows_after_exclude = int(len(feats))
 
     # 1) p_success min
-    feats = feats[feats["p_success"] >= float(args.ps_min)].copy()
+    ps_min = float(args.ps_min)
+    feats = feats[feats["p_success"] >= ps_min].copy()
+    rows_after_psmin = int(len(feats))
 
-    # 2) ✅ NEW: p_badexit max (first-pass filter)
+    # 2) p_badexit max (first-pass filter)
     badexit_max = float(args.badexit_max)
     feats = feats[feats["p_badexit"] <= badexit_max].copy()
     rows_after_badexit = int(len(feats))
@@ -298,6 +304,7 @@ def main() -> None:
         tail_threshold=float(args.tail_threshold),
         utility_quantile=float(args.utility_quantile),
     )
+    rows_after_gate = int(len(gated))
 
     picks = rank_topk_per_day(gated, rank_by=args.rank_by, topk=int(args.topk))
 
@@ -317,25 +324,31 @@ def main() -> None:
         "mode": args.mode,
         "rank_by": args.rank_by,
         "topk": int(args.topk),
-        "ps_min": float(args.ps_min),
 
-        # ✅ NEW
+        "ps_min": float(ps_min),
         "badexit_max": float(badexit_max),
-        "rows_after_badexit": int(rows_after_badexit),
 
         "tail_threshold": float(args.tail_threshold),
         "utility_quantile": float(args.utility_quantile),
         "lambda_tail": float(args.lambda_tail),
+
         "exclude_tickers": args.exclude_tickers,
         "features_src": features_src,
-        "rows_in_features": int(len(feats)),  # NOTE: after ps_min + badexit filters
-        "rows_after_gate": int(len(gated)),
+        "require_files": [str(p) for p in require_files],
+
+        # ✅ row audit trail
+        "rows_loaded": rows_loaded,
+        "rows_after_exclude": rows_after_exclude,
+        "rows_after_psmin": rows_after_psmin,
+        "rows_after_badexit": rows_after_badexit,
+        "rows_after_gate": rows_after_gate,
         "rows_picks": int(len(picks_out)),
+
+        # params for traceability
         "profit_target": float(args.profit_target),
         "max_days": int(args.max_days),
         "stop_level": float(args.stop_level),
         "max_extend_days": int(args.max_extend_days),
-        "require_files": [str(p) for p in require_files],
     }
 
     meta_path.parent.mkdir(parents=True, exist_ok=True)
