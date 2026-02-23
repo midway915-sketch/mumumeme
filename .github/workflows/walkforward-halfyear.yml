@@ -16,7 +16,6 @@ on:
         required: true
         default: "12"
 
-      # ----- your existing grid envs (put your usual defaults here)
       PROFIT_TARGET:
         required: true
         default: "0.10"
@@ -68,12 +67,10 @@ on:
         required: true
         default: ""
 
-      # required files for predict_gate fail-fast (comma CSV)
       REQUIRE_FILES:
         required: true
         default: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl,app/tail_model.pkl,app/tail_scaler.pkl"
 
-      # optional regime filter envs (you just added)
       REGIME_MODE:
         required: false
         default: "off"
@@ -90,12 +87,10 @@ on:
         required: false
         default: "3.0"
 
-      # optional tau split folder name (e.g. taucur)
       TAU_SPLIT:
         required: false
         default: ""
 
-      # optional toggles
       USE_TAU_H:
         required: false
         default: "false"
@@ -113,7 +108,7 @@ jobs:
         id: gen
         shell: bash
         run: |
-          python - <<'PY' > /tmp/matrix.json
+          python - <<'PY' > matrix.json
           import json, re
           from datetime import date, timedelta
 
@@ -129,31 +124,23 @@ jobs:
           sy, sh = int(m.group(1)), int(m.group(2))
           ey, eh = int(n.group(1)), int(n.group(2))
 
-          def half_start(y, h):
-              return date(y, 1, 1) if h == 1 else date(y, 7, 1)
+          def half_start(y,h): return date(y,1,1) if h==1 else date(y,7,1)
+          def half_end(y,h):   return date(y,6,30) if h==1 else date(y,12,31)
 
-          def half_end(y, h):
-              return date(y, 6, 30) if h == 1 else date(y, 12, 31)
-
-          items = []
-          y, h = sy, sh
+          items=[]
+          y,h=sy,sh
           while True:
-              period = f"{y}H{h}"
+              period=f"{y}H{h}"
 
-              test_start = half_start(y, h)
-              test_end = half_end(y, h)
+              test_start=half_start(y,h); test_end=half_end(y,h)
 
               # valid = 직전 반기
-              if h == 1:
-                  vy, vh = y - 1, 2
-              else:
-                  vy, vh = y, 1
-              valid_start = half_start(vy, vh)
-              valid_end = half_end(vy, vh)
+              vy,vh = (y-1,2) if h==1 else (y,1)
+              valid_start=half_start(vy,vh); valid_end=half_end(vy,vh)
 
-              # train: valid_start 이전 train_years년치
+              # train = valid_start 직전까지 train_years년(대략) 롤링
               train_end = valid_start - timedelta(days=1)
-              train_start = date(train_end.year - train_years + 1, train_end.month, train_end.day)
+              train_start = date(train_end.year-train_years+1, train_end.month, train_end.day)
 
               cut_date = valid_end
 
@@ -168,93 +155,86 @@ jobs:
                   "CUT_DATE": cut_date.isoformat(),
               })
 
-              if y == ey and h == eh:
+              if y==ey and h==eh:
                   break
-
-              if h == 1:
-                  h = 2
+              if h==1:
+                  h=2
               else:
-                  y += 1
-                  h = 1
+                  y+=1; h=1
 
           print(json.dumps({"include": items}, ensure_ascii=False))
           PY
 
           echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
-          cat /tmp/matrix.json >> "$GITHUB_OUTPUT"
+          cat matrix.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-        run:
-          needs: make-matrix
-          runs-on: ubuntu-latest
-          strategy:
-            fail-fast: false
-            matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
-          steps:
-            - uses: actions/checkout@v4
-      
-            - uses: actions/setup-python@v5
-              with:
-                python-version: "3.11"
-      
-            - name: Install deps
-              run: |
-                python -m pip install -U pip
-                if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      
-            - name: Walkforward run (one half-year)
-              env:
-                WF_PERIOD: ${{ matrix.period }}
-                TRAIN_START: ${{ matrix.TRAIN_START }}
-                TRAIN_END: ${{ matrix.TRAIN_END }}
-                VALID_START: ${{ matrix.VALID_START }}
-                VALID_END: ${{ matrix.VALID_END }}
-                TEST_START: ${{ matrix.TEST_START }}
-                TEST_END: ${{ matrix.TEST_END }}
-                CUT_DATE: ${{ matrix.CUT_DATE }}
-      
-                # your existing envs
-                PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
-                MAX_DAYS: ${{ inputs.MAX_DAYS }}
-                STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
-                P_TAIL_THRESHOLDS: ${{ inputs.P_TAIL_THRESHOLDS }}
-                UTILITY_QUANTILES: ${{ inputs.UTILITY_QUANTILES }}
-                RANK_METRICS: ${{ inputs.RANK_METRICS }}
-                LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
-                GATE_MODES: ${{ inputs.GATE_MODES }}
-                TRAIL_STOPS: ${{ inputs.TRAIL_STOPS }}
-                TP1_FRAC: ${{ inputs.TP1_FRAC }}
-                ENABLE_TRAILING: ${{ inputs.ENABLE_TRAILING }}
-                TOPK_CONFIGS: ${{ inputs.TOPK_CONFIGS }}
-                PS_MINS: ${{ inputs.PS_MINS }}
-                BADEXIT_MAXES: ${{ inputs.BADEXIT_MAXES }}
-                MAX_LEVERAGE_PCT: ${{ inputs.MAX_LEVERAGE_PCT }}
-                EXCLUDE_TICKERS: ${{ inputs.EXCLUDE_TICKERS }}
-                REQUIRE_FILES: ${{ inputs.REQUIRE_FILES }}
-      
-                # regime filter envs
-                REGIME_MODE: ${{ inputs.REGIME_MODE }}
-                REGIME_DD_MAX: ${{ inputs.REGIME_DD_MAX }}
-                REGIME_RET20_MIN: ${{ inputs.REGIME_RET20_MIN }}
-                REGIME_ATR_MAX: ${{ inputs.REGIME_ATR_MAX }}
-                REGIME_LEVERAGE_MULT: ${{ inputs.REGIME_LEVERAGE_MULT }}
-      
-                # optional split/toggles
-                TAU_SPLIT: ${{ inputs.TAU_SPLIT }}
-                USE_TAU_H: ${{ inputs.USE_TAU_H }}
-                ENABLE_DCA: ${{ inputs.ENABLE_DCA }}
-      
-                # output partitioning (your script가 이 이름을 쓰는지 확인 필요)
-                OUT_DIR_BASE: data/signals/walkforward
-                WF_TAG_BASE: wf
-      
-              run: |
-                chmod +x scripts/run_walkforward_halfyear.sh
-                ./scripts/run_walkforward_halfyear.sh
-      
-            - name: Upload artifacts (this half-year)
-              uses: actions/upload-artifact@v4
-              with:
-                name: walkforward_${{ matrix.period }}
-                path: data/signals/walkforward/${{ matrix.period }}
-                if-no-files-found: warn
+  wf:
+    needs: make-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Walkforward run (one half-year)
+        env:
+          WF_PERIOD: ${{ matrix.period }}
+          TRAIN_START: ${{ matrix.TRAIN_START }}
+          TRAIN_END: ${{ matrix.TRAIN_END }}
+          VALID_START: ${{ matrix.VALID_START }}
+          VALID_END: ${{ matrix.VALID_END }}
+          TEST_START: ${{ matrix.TEST_START }}
+          TEST_END: ${{ matrix.TEST_END }}
+          CUT_DATE: ${{ matrix.CUT_DATE }}
+
+          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
+          MAX_DAYS: ${{ inputs.MAX_DAYS }}
+          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
+          P_TAIL_THRESHOLDS: ${{ inputs.P_TAIL_THRESHOLDS }}
+          UTILITY_QUANTILES: ${{ inputs.UTILITY_QUANTILES }}
+          RANK_METRICS: ${{ inputs.RANK_METRICS }}
+          LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
+          GATE_MODES: ${{ inputs.GATE_MODES }}
+          TRAIL_STOPS: ${{ inputs.TRAIL_STOPS }}
+          TP1_FRAC: ${{ inputs.TP1_FRAC }}
+          ENABLE_TRAILING: ${{ inputs.ENABLE_TRAILING }}
+          TOPK_CONFIGS: ${{ inputs.TOPK_CONFIGS }}
+          PS_MINS: ${{ inputs.PS_MINS }}
+          BADEXIT_MAXES: ${{ inputs.BADEXIT_MAXES }}
+          MAX_LEVERAGE_PCT: ${{ inputs.MAX_LEVERAGE_PCT }}
+          EXCLUDE_TICKERS: ${{ inputs.EXCLUDE_TICKERS }}
+          REQUIRE_FILES: ${{ inputs.REQUIRE_FILES }}
+
+          REGIME_MODE: ${{ inputs.REGIME_MODE }}
+          REGIME_DD_MAX: ${{ inputs.REGIME_DD_MAX }}
+          REGIME_RET20_MIN: ${{ inputs.REGIME_RET20_MIN }}
+          REGIME_ATR_MAX: ${{ inputs.REGIME_ATR_MAX }}
+          REGIME_LEVERAGE_MULT: ${{ inputs.REGIME_LEVERAGE_MULT }}
+
+          TAU_SPLIT: ${{ inputs.TAU_SPLIT }}
+          USE_TAU_H: ${{ inputs.USE_TAU_H }}
+          ENABLE_DCA: ${{ inputs.ENABLE_DCA }}
+
+          OUT_DIR_BASE: data/signals/walkforward
+          WF_TAG_BASE: wf
+        run: |
+          chmod +x scripts/run_walkforward_halfyear.sh
+          ./scripts/run_walkforward_halfyear.sh
+
+      - name: Upload artifacts (this half-year)
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward_${{ matrix.period }}
+          path: data/signals/walkforward/${{ matrix.period }}
+          if-no-files-found: warn
