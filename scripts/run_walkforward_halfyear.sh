@@ -32,11 +32,10 @@ set -euo pipefail
 : "${PS_MINS:?}"
 : "${BADEXIT_MAXES:?}"
 : "${MAX_LEVERAGE_PCT:?}"
-: "${REQUIRE_FILES:?}"
 
 # ✅ optional-but-allowed-empty
 EXCLUDE_TICKERS="${EXCLUDE_TICKERS:-}"
-
+REQUIRE_FILES="${REQUIRE_FILES:-}"
 # optional envs (regime + tau/dca)
 REGIME_MODE="${REGIME_MODE:-off}"
 REGIME_DD_MAX="${REGIME_DD_MAX:-0.20}"
