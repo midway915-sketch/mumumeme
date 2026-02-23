@@ -89,6 +89,29 @@ echo "[INFO] CAP_COMPARE=$CAP_COMPARE"
 echo "[INFO] TP1_HOLD_CAP_SINGLE=$TP1_HOLD_CAP_SINGLE"
 echo "[INFO] TP1_HOLD_CAP_MODES=$TP1_HOLD_CAP_MODES"
 
+# ✅ NEW: Tau/DCA 옵션 (엔진이 지원할 때만 켜서 전달)
+USE_TAU_H="${USE_TAU_H:-false}"
+USE_TAU_H="$(echo "$USE_TAU_H" | tr '[:upper:]' '[:lower:]' | xargs)"
+if [[ "$USE_TAU_H" != "true" && "$USE_TAU_H" != "false" ]]; then
+  echo "[ERROR] USE_TAU_H must be true/false (got: $USE_TAU_H)"
+  exit 1
+fi
+
+ENABLE_DCA="${ENABLE_DCA:-false}"
+ENABLE_DCA="$(echo "$ENABLE_DCA" | tr '[:upper:]' '[:lower:]' | xargs)"
+if [[ "$ENABLE_DCA" != "true" && "$ENABLE_DCA" != "false" ]]; then
+  echo "[ERROR] ENABLE_DCA must be true/false (got: $ENABLE_DCA)"
+  exit 1
+fi
+
+# DCA 조건(옵션): 엔진이 이 인자들을 지원할 때만 의미 있음
+DCA_MAX_ADDS="${DCA_MAX_ADDS:-}"
+DCA_GAP_DAYS="${DCA_GAP_DAYS:-}"
+DCA_TRIGGER="${DCA_TRIGGER:-}"   # 예: drawdown_5p, ret_le_m0p05 등(엔진 규칙에 맞게)
+DCA_ADD_FRAC="${DCA_ADD_FRAC:-}" # 예: 0.50 (추가매수 시 기존 대비 몇 배)
+
+echo "[INFO] USE_TAU_H=$USE_TAU_H ENABLE_DCA=$ENABLE_DCA DCA_MAX_ADDS=${DCA_MAX_ADDS:-<unset>} DCA_GAP_DAYS=${DCA_GAP_DAYS:-<unset>} DCA_TRIGGER=${DCA_TRIGGER:-<unset>} DCA_ADD_FRAC=${DCA_ADD_FRAC:-<unset>}"
+
 # ----- helpers
 split_csv() {
   local s="$1"
@@ -151,6 +174,15 @@ print(hashlib.sha1(payload).hexdigest())
 PY
 }
 
+# cap modes iterator
+iter_cap_modes() {
+  if [ "$CAP_COMPARE" = "true" ]; then
+    split_csv "$TP1_HOLD_CAP_MODES"
+  else
+    echo "$TP1_HOLD_CAP_SINGLE"
+  fi
+}
+
 # ----- print config
 echo "[INFO] TOPK_CONFIGS=$TOPK_CONFIGS"
 echo "[INFO] TRAIL_STOPS=$TRAIL_STOPS TP1_FRAC=$TP1_FRAC ENABLE_TRAILING=$ENABLE_TRAILING"
@@ -175,15 +207,6 @@ touch "$seen_hash_file"
 
 is_hash_seen() { local h="$1"; [ -n "$h" ] && grep -q "^$h$" "$seen_hash_file"; }
 mark_hash_seen() { local h="$1"; [ -n "$h" ] && echo "$h" >> "$seen_hash_file"; }
-
-# cap modes iterator
-iter_cap_modes() {
-  if [ "$CAP_COMPARE" = "true" ]; then
-    split_csv "$TP1_HOLD_CAP_MODES"
-  else
-    echo "$TP1_HOLD_CAP_SINGLE"
-  fi
-}
 
 # ----- main loops
 while read -r mode; do
@@ -301,6 +324,21 @@ PY
                   echo "[SIM] cap_mode=$cap_mode cap_suffix=$cap_suffix"
                   echo "------------------------------"
 
+                  # ✅ NEW: 엔진 추가 옵션은 env 켰을 때만 전달 (엔진이 인자 지원할 때만 사용)
+                  SIM_EXTRA_ARGS=()
+
+                  if [ "$USE_TAU_H" = "true" ]; then
+                    SIM_EXTRA_ARGS+=( --use-tau-h "true" )
+                  fi
+
+                  if [ "$ENABLE_DCA" = "true" ]; then
+                    SIM_EXTRA_ARGS+=( --enable-dca "true" )
+                    [ -n "$DCA_MAX_ADDS" ] && SIM_EXTRA_ARGS+=( --dca-max-adds "$DCA_MAX_ADDS" )
+                    [ -n "$DCA_GAP_DAYS" ] && SIM_EXTRA_ARGS+=( --dca-gap-days "$DCA_GAP_DAYS" )
+                    [ -n "$DCA_TRIGGER" ] && SIM_EXTRA_ARGS+=( --dca-trigger "$DCA_TRIGGER" )
+                    [ -n "$DCA_ADD_FRAC" ] && SIM_EXTRA_ARGS+=( --dca-add-frac "$DCA_ADD_FRAC" )
+                  fi
+
                   python "$SIM" \
                     --picks-path "$picks_path" \
                     --profit-target "$PROFIT_TARGET" \
@@ -321,7 +359,8 @@ PY
                     --weights "$W" \
                     --tag "$TAG" \
                     --suffix "$cap_suffix" \
-                    --out-dir "$OUT_DIR"
+                    --out-dir "$OUT_DIR" \
+                    "${SIM_EXTRA_ARGS[@]}"
 
                   trades_path="$OUT_DIR/sim_engine_trades_${TAG}_gate_${cap_suffix}.parquet"
 
