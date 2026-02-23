@@ -3,13 +3,14 @@ name: raw-data
 on:
   workflow_dispatch:
     inputs:
-      raw_data_url:
-        description: "URL to prices.parquet or prices.csv"
-        required: true
-      raw_data_format:
-        description: "parquet or csv"
-        required: true
-        default: "parquet"
+      max_years:
+        description: "Download recent N years (env MAX_YEARS). Default 11"
+        required: false
+        default: "11"
+      include_extra:
+        description: "Include SPY and ^VIX (true/false). Default true"
+        required: false
+        default: "true"
 
 jobs:
   build-raw:
@@ -17,25 +18,69 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # yfinance 필요 (requirements에 없을 수도 있어서 안전빵)
+          python - <<'PY'
+          import importlib, sys
+          for pkg in ["yfinance", "pandas"]:
+              try:
+                  importlib.import_module(pkg)
+              except Exception:
+                  sys.exit(1)
+          PY || pip install yfinance pandas pyarrow
+
       - name: Prepare folders
         run: |
           mkdir -p data/raw
 
-      - name: Download raw prices
+      - name: Build universe (if needed)
         shell: bash
         run: |
           set -euo pipefail
-          url="${{ inputs.raw_data_url }}"
-          fmt="$(echo "${{ inputs.raw_data_format }}" | tr '[:upper:]' '[:lower:]' | xargs)"
-          if [[ "$fmt" != "parquet" && "$fmt" != "csv" ]]; then
-            echo "[ERROR] raw_data_format must be parquet|csv"
+          if [ -f scripts/universe.py ]; then
+            echo "[INFO] running scripts/universe.py"
+            python scripts/universe.py
+          fi
+
+          if [ ! -f data/universe.csv ]; then
+            echo "[ERROR] data/universe.csv not found. You must create it or ensure scripts/universe.py generates it."
             exit 1
           fi
 
-          out="data/raw/prices.${fmt}"
-          echo "[INFO] downloading -> $out"
-          curl -L --fail --retry 3 --retry-delay 2 -o "$out" "$url"
-          ls -la data/raw
+          echo "[INFO] universe head:"
+          head -n 5 data/universe.csv || true
+
+      - name: Fetch raw prices via yfinance
+        shell: bash
+        env:
+          MAX_YEARS: ${{ inputs.max_years }}
+          INCLUDE_EXTRA: ${{ inputs.include_extra }}
+        run: |
+          set -euo pipefail
+          echo "[INFO] MAX_YEARS=$MAX_YEARS INCLUDE_EXTRA=$INCLUDE_EXTRA"
+
+          extra_flag=""
+          inc="$(echo "$INCLUDE_EXTRA" | tr '[:upper:]' '[:lower:]' | xargs)"
+          if [ "$inc" = "true" ]; then
+            extra_flag="--include-extra"
+          fi
+
+          python scripts/fetch_prices.py $extra_flag
+
+          echo "[INFO] data/raw contents:"
+          ls -la data/raw | sed -n '1,200p'
+
+          if [ ! -f data/raw/prices.parquet ] && [ ! -f data/raw/prices.csv ]; then
+            echo "[ERROR] No prices file produced (expected prices.parquet or prices.csv)"
+            exit 1
+          fi
 
       - name: Upload artifact raw-data
         uses: actions/upload-artifact@v4
