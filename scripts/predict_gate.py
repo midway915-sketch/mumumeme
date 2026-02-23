@@ -220,6 +220,9 @@ def main() -> None:
     ap.add_argument("--topk", type=int, default=1)
     ap.add_argument("--ps-min", type=float, default=0.0)
 
+    # ✅ NEW: badexit filter (0~1). default 1.0 means "no filter"
+    ap.add_argument("--badexit-max", type=float, default=1.0, help="keep rows with p_badexit <= this (default 1.0)")
+
     ap.add_argument("--tag", type=str, required=True)
     ap.add_argument("--suffix", type=str, required=True)
 
@@ -273,10 +276,20 @@ def main() -> None:
     feats["p_success"] = coerce_num(feats, "p_success", 0.0)
     feats["p_tail"] = coerce_num(feats, "p_tail", 0.0)
     feats["ret_score"] = coerce_num(feats, "ret_score", 0.0)
+    # ✅ NEW
+    feats["p_badexit"] = coerce_num(feats, "p_badexit", 0.0)
 
     feats = apply_exclude_tickers(feats, args.exclude_tickers)
 
+    # 1) p_success min
     feats = feats[feats["p_success"] >= float(args.ps_min)].copy()
+
+    # 2) ✅ NEW: p_badexit max (first-pass filter)
+    badexit_max = float(args.badexit_max)
+    feats = feats[feats["p_badexit"] <= badexit_max].copy()
+    rows_after_badexit = int(len(feats))
+
+    # 3) utility + (tail/utility gate)
     feats["utility"] = build_utility(feats, float(args.lambda_tail))
 
     gated = gate_filter(
@@ -288,7 +301,11 @@ def main() -> None:
 
     picks = rank_topk_per_day(gated, rank_by=args.rank_by, topk=int(args.topk))
 
-    keep_cols = [c for c in ["Date", "Ticker", "p_success", "p_tail", "ret_score", "utility"] if c in picks.columns]
+    keep_cols = [
+        c
+        for c in ["Date", "Ticker", "p_success", "p_tail", "p_badexit", "ret_score", "utility"]
+        if c in picks.columns
+    ]
     picks_out = picks[keep_cols].copy()
 
     picks_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,12 +318,17 @@ def main() -> None:
         "rank_by": args.rank_by,
         "topk": int(args.topk),
         "ps_min": float(args.ps_min),
+
+        # ✅ NEW
+        "badexit_max": float(badexit_max),
+        "rows_after_badexit": int(rows_after_badexit),
+
         "tail_threshold": float(args.tail_threshold),
         "utility_quantile": float(args.utility_quantile),
         "lambda_tail": float(args.lambda_tail),
         "exclude_tickers": args.exclude_tickers,
         "features_src": features_src,
-        "rows_in_features": int(len(feats)),
+        "rows_in_features": int(len(feats)),  # NOTE: after ps_min + badexit filters
         "rows_after_gate": int(len(gated)),
         "rows_picks": int(len(picks_out)),
         "profit_target": float(args.profit_target),
