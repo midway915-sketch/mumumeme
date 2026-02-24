@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 
@@ -17,7 +18,8 @@ FEATURE_DIR = DATA_DIR / "features"
 META_DIR = DATA_DIR / "meta"
 
 
-# build_features.py 기준(16) + (옵션) 섹터(2)
+# build_features.py 기준(16) + (옵션) RelStrength(1)
+# ✅ NOTE: Sector_Ret_20 -> Market_ret_20 로 교체(기존 대화에서 수정했던 SSOT와 맞춤)
 DEFAULT_FEATURES = [
     # base (9)
     "Drawdown_252",
@@ -37,8 +39,8 @@ DEFAULT_FEATURES = [
     "vol_surge",
     "trend_align",
     "beta_60",
-    # optional sector (2)
-    "Sector_Ret_20",
+    # optional / derived
+    "Market_ret_20",
     "RelStrength",
 ]
 
@@ -180,18 +182,43 @@ def _predict_proba_1(model, X: np.ndarray) -> np.ndarray:
         return np.clip(y, 0.0, 1.0)
 
 
-def _resolve_tau_paths(tag: str, base_model: str, base_scaler: str) -> tuple[Path, Path, str]:
+def _resolve_model_dir(args) -> Path | None:
+    md = (getattr(args, "model_dir", "") or "").strip()
+    if not md:
+        md = (os.getenv("MODEL_DIR", "") or "").strip()
+    if not md:
+        return None
+    return Path(md)
+
+
+def _resolve_tau_paths(tag: str, base_model: str, base_scaler: str, model_dir: Path | None) -> tuple[Path, Path, str]:
     """
-    ✅ tau는 tag 파일을 최우선으로 쓴다.
-      1) app/tau_model_{tag}.pkl / app/tau_scaler_{tag}.pkl
-      2) args --tau-model/--tau-scaler (base)
+    ✅ tau 로딩 우선순위:
+      1) model_dir/tau_model_{tag}.pkl, model_dir/tau_scaler_{tag}.pkl
+      2) app/tau_model_{tag}.pkl, app/tau_scaler_{tag}.pkl   (구버전 호환)
+      3) model_dir/tau_model.pkl, model_dir/tau_scaler.pkl
+      4) args --tau-model/--tau-scaler (base)
     """
     tag = (tag or "").strip()
+
+    if model_dir is not None and tag:
+        cand_m = model_dir / f"tau_model_{tag}.pkl"
+        cand_s = model_dir / f"tau_scaler_{tag}.pkl"
+        if cand_m.exists() and cand_s.exists():
+            return cand_m, cand_s, "tagged(model_dir/tau_*_{tag}.pkl)"
+
     if tag:
         cand_m = Path("app") / f"tau_model_{tag}.pkl"
         cand_s = Path("app") / f"tau_scaler_{tag}.pkl"
         if cand_m.exists() and cand_s.exists():
             return cand_m, cand_s, "tagged(app/tau_*_{tag}.pkl)"
+
+    if model_dir is not None:
+        cand_m = model_dir / "tau_model.pkl"
+        cand_s = model_dir / "tau_scaler.pkl"
+        if cand_m.exists() and cand_s.exists():
+            return cand_m, cand_s, "base(model_dir/tau_model.pkl)"
+
     return Path(base_model), Path(base_scaler), "base(--tau-model/--tau-scaler)"
 
 
@@ -207,7 +234,15 @@ def main() -> None:
     ap.add_argument("--out-parq", default=str(FEATURE_DIR / "features_scored.parquet"), type=str)
     ap.add_argument("--out-csv", default=str(FEATURE_DIR / "features_scored.csv"), type=str)
 
-    # p_success (base paths only used for directory; actual models are core_tag_h{H})
+    # ✅ NEW: model namespace (per-period)
+    ap.add_argument(
+        "--model-dir",
+        default=os.getenv("MODEL_DIR", "").strip(),
+        type=str,
+        help="Directory containing model/scaler files (overrides app/*). Example: data/models/wf_2018H1",
+    )
+
+    # p_success (base paths only used for fallback if model-dir doesn't have files)
     ap.add_argument("--ps-model", default="app/model.pkl", type=str)
     ap.add_argument("--ps-scaler", default="app/scaler.pkl", type=str)
     ap.add_argument(
@@ -257,6 +292,12 @@ def main() -> None:
     core_tag = _strip_h_from_tag(args.tag)
     hmap = parse_tau_h_map(args.tau_h_map)
 
+    model_dir = _resolve_model_dir(args)
+    if model_dir is not None:
+        print(f"[INFO] MODEL_DIR={model_dir}")
+    else:
+        print("[INFO] MODEL_DIR=<none> (fallback to app/* + explicit paths)")
+
     feats = read_table(Path(args.features_parq), Path(args.features_csv)).copy()
     print("[DEBUG] features_model cols(head):", list(feats.columns)[:30], " index.name:", feats.index.name)
 
@@ -288,9 +329,9 @@ def main() -> None:
     ps_cols = [c for c in ps_cols if c]
 
     # -------------------------
-    # tau_class / tau_H (tagged 우선)
+    # tau_class / tau_H (tagged/model_dir 우선)
     # -------------------------
-    tau_model_path, tau_scaler_path, tau_src = _resolve_tau_paths(args.tag, args.tau_model, args.tau_scaler)
+    tau_model_path, tau_scaler_path, tau_src = _resolve_tau_paths(args.tag, args.tau_model, args.tau_scaler, model_dir)
 
     if tau_model_path.exists() and tau_scaler_path.exists():
         tau_model = joblib.load(str(tau_model_path))
@@ -358,15 +399,48 @@ def main() -> None:
         feats_x = ensure_features_exist(feats, feat_cols, warn_prefix=f"[{col_out}:{feat_cols_src}]")
         X = feats_x[feat_cols].to_numpy(dtype=float)
 
-        base_dir = Path(base_model_path).parent
+        # ✅ search order:
+        # 1) model_dir/{stem}_{core_tag}_h{H}.pkl (and scaler)
+        # 2) app/ parent of base_model_path (legacy)
+        # 3) single fallback: model_dir/{stem}.pkl (and scaler) then base paths
         models: dict[int, tuple[Path, Path]] = {}
-        for h in sorted(set(hmap)):
-            m_path = base_dir / f"{model_stem}_{core_tag}_h{int(h)}.pkl"
-            s_path = base_dir / f"{scaler_stem}_{core_tag}_h{int(h)}.pkl"
-            if m_path.exists() and s_path.exists():
-                models[int(h)] = (m_path, s_path)
+
+        search_dirs: list[Path] = []
+        if model_dir is not None:
+            search_dirs.append(model_dir)
+        search_dirs.append(Path(base_model_path).parent)
+
+        for sd in search_dirs:
+            for h in sorted(set(hmap)):
+                m_path = sd / f"{model_stem}_{core_tag}_h{int(h)}.pkl"
+                s_path = sd / f"{scaler_stem}_{core_tag}_h{int(h)}.pkl"
+                if m_path.exists() and s_path.exists():
+                    models[int(h)] = (m_path, s_path)
+
+            if models:
+                audit_dir = sd
+                break
+        else:
+            audit_dir = search_dirs[0] if search_dirs else Path(base_model_path).parent
 
         if not models:
+            # single fallback priority: model_dir/{stem}.pkl
+            if model_dir is not None:
+                bm = model_dir / f"{model_stem}.pkl"
+                bs = model_dir / f"{scaler_stem}.pkl"
+                if bm.exists() and bs.exists():
+                    model = joblib.load(str(bm))
+                    scaler = joblib.load(str(bs))
+                    Xs = scaler.transform(X)
+                    p = _predict_proba_1(model, Xs)
+                    return pd.Series(p, index=feats.index, dtype=float), {
+                        "enabled": True,
+                        "mode": "single_fallback_model_dir",
+                        "model": str(bm),
+                        "scaler": str(bs),
+                        "core_tag": core_tag,
+                    }
+
             bm = Path(base_model_path)
             bs = Path(base_scaler_path)
             if bm.exists() and bs.exists():
@@ -376,16 +450,18 @@ def main() -> None:
                 p = _predict_proba_1(model, Xs)
                 return pd.Series(p, index=feats.index, dtype=float), {
                     "enabled": True,
-                    "mode": "single_fallback",
+                    "mode": "single_fallback_base_paths",
                     "model": str(bm),
                     "scaler": str(bs),
                     "core_tag": core_tag,
                 }
+
             print(f"[WARN] no models found for {col_out} (core_tag={core_tag}) -> fill {default_value}")
             return pd.Series([default_value] * len(feats), index=feats.index, dtype=float), {
                 "enabled": True,
                 "mode": "missing_models",
                 "core_tag": core_tag,
+                "searched_dirs": [str(d) for d in search_dirs],
             }
 
         tauH = pd.to_numeric(feats["tau_H"], errors="coerce").fillna(int(hmap[1]) if len(hmap) >= 2 else 40).astype(int)
@@ -395,9 +471,11 @@ def main() -> None:
             "enabled": True,
             "mode": "per_H",
             "core_tag": core_tag,
+            "model_dir_used": str(audit_dir),
             "models_found": {str(k): {"model": str(v[0]), "scaler": str(v[1])} for k, v in models.items()},
         }
 
+        # score where tau_H exactly matches
         for h, (m_path, s_path) in models.items():
             idx = np.where(tauH.to_numpy() == int(h))[0]
             if idx.size == 0:
@@ -407,6 +485,7 @@ def main() -> None:
             Xs = scaler.transform(X[idx])
             out[idx] = _predict_proba_1(model, Xs)
 
+        # fallback for tau_H values without a model: nearest-H
         covered = set(models.keys())
         missing_idx = np.where(~np.isin(tauH.to_numpy(), list(covered)))[0]
         if missing_idx.size > 0:
@@ -459,8 +538,6 @@ def main() -> None:
             tail_cols_src = "fallback(ps_cols)"
     tail_cols = [c for c in tail_cols if c]
 
-    # enabled는 "디렉토리"가 아니라 "뭔가 하나라도 존재할 가능성" 기준으로
-    tail_enabled = True
     tail_series, tail_audit = _score_by_h(
         col_out="p_tail",
         model_stem="tail_model",
@@ -469,7 +546,7 @@ def main() -> None:
         base_scaler_path=args.tail_scaler,
         feat_cols=tail_cols,
         feat_cols_src=tail_cols_src,
-        enabled=tail_enabled,
+        enabled=True,
         default_value=0.0,
     )
     feats["p_tail"] = tail_series.astype(float)
@@ -492,7 +569,6 @@ def main() -> None:
             bad_cols_src = "fallback(ps_cols)"
     bad_cols = [c for c in bad_cols if c]
 
-    bad_enabled = True
     bad_series, bad_audit = _score_by_h(
         col_out="p_badexit",
         model_stem="badexit_model",
@@ -501,7 +577,7 @@ def main() -> None:
         base_scaler_path=args.badexit_scaler,
         feat_cols=bad_cols,
         feat_cols_src=bad_cols_src,
-        enabled=bad_enabled,
+        enabled=True,
         default_value=0.0,
     )
     feats["p_badexit"] = bad_series.astype(float)
@@ -525,6 +601,7 @@ def main() -> None:
     print("[INFO] scoring summary")
     print("tag:", args.tag)
     print("core_tag:", core_tag)
+    print("MODEL_DIR:", str(model_dir) if model_dir is not None else "<none>")
 
     print("tau model/scaler src:", tau_src, "|", str(tau_model_path), "/", str(tau_scaler_path))
     print("tau cols source:", tau_cols_src)
