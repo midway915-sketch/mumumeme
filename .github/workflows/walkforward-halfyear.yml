@@ -655,6 +655,39 @@ jobs:
               print(f"[CHECK-2] mean calc failed: {e}")
           PY
 
+          # ============================================================
+          # ✅ CHECK LOG (2B): labels(27 rows)가 무엇으로 집계된 건지 확인
+          #  - ticker/date/entry_id 같은 키들의 nunique를 찍어서 "왜 27이냐" 확정
+          # ============================================================
+          BADLBL="${badlbl}" python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+          
+          p = Path(os.environ["BADLBL"])
+          df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
+          
+          print(f"[CHECK-2B] labels_path={p}")
+          print(f"[CHECK-2B] rows={len(df)} cols={len(df.columns)}")
+          print("[CHECK-2B] columns head:", df.columns.tolist()[:30])
+          
+          # 흔히 있을 법한 키 후보들 nunique 확인
+          cands = ["Ticker","ticker","Symbol","symbol","Date","date","EntryDate","ExitDate","entry_date","exit_date","TradeID","trade_id","id"]
+          for c in cands:
+              if c in df.columns:
+                  print(f"[CHECK-2B] nunique({c})={df[c].nunique(dropna=True)}")
+          
+          # BadExit가 있으면 분포
+          for c in ["BadExit","badexit","y_badexit","is_badexit"]:
+              if c in df.columns:
+                  print("[CHECK-2B] value_counts for", c)
+                  print(df[c].value_counts(dropna=False).to_string())
+                  break
+          
+          print("[CHECK-2B] head:")
+          print(df.head(5).to_string(index=False))
+          PY
+
           python scripts/train_badexit_model_wf_lite.py \
             --data-path "${badlbl}" \
             --label-col "${LABEL_COL}" \
