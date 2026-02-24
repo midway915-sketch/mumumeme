@@ -173,7 +173,6 @@ jobs:
           STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
           MAX_EXTEND_DAYS: "20"
 
-          # walkforward config (keep same as your base)
           P_TAIL_THRESHOLDS: "0.10,0.20,0.30"
           UTILITY_QUANTILES: "0.60,0.75,0.90"
           RANK_METRICS: "utility"
@@ -205,16 +204,6 @@ jobs:
           set -euo pipefail
 
           chmod +x scripts/run_walkforward_halfyear.sh
-
-          # ------------------------------------------------------------
-          # helpers
-          # ------------------------------------------------------------
-          pick_one () {
-            local pat="$1"
-            local f
-            f="$(ls -1 ${pat} 2>/dev/null | head -n 1 || true)"
-            echo "${f}"
-          }
 
           ensure_universe () {
             if [ -f data/universe.csv ]; then return 0; fi
@@ -257,172 +246,6 @@ jobs:
           PY
           }
 
-          # Tail labels path (best-effort: repo naming dependent)
-          find_tail_labels () {
-            python - <<'PY'
-          import glob
-          cand = []
-          cand += glob.glob("data/labels/labels_tail*.parquet")
-          cand += glob.glob("data/labels/labels_tail*.csv")
-          cand += glob.glob("data/labels/*tail*labels*.parquet")
-          cand += glob.glob("data/labels/*tail*labels*.csv")
-          cand = sorted(set(cand))
-          print(cand[0] if cand else "")
-          PY
-          }
-
-          # Tau labels path tagged (best-effort)
-          find_tau_labels () {
-            python - <<'PY'
-          import os, glob
-          tag=os.environ["TAG"]
-          cand=[]
-          cand += glob.glob(f"data/labels/*tau*{tag}*.parquet")
-          cand += glob.glob(f"data/labels/*tau*{tag}*.csv")
-          cand += glob.glob(f"data/labels/labels_tau_{tag}.parquet")
-          cand += glob.glob(f"data/labels/labels_tau_{tag}.csv")
-          cand = sorted(set(cand))
-          print(cand[0] if cand else "")
-          PY
-          }
-
-          cut_inplace_by_date () {
-            # args: PATH CUT_DATE OUT_COPY(optional)
-            local p="$1"
-            local cut="$2"
-            local copy="${3:-}"
-            if [ -z "$p" ] || [ ! -f "$p" ]; then
-              echo "[CUT] skip (missing): $p"
-              return 0
-            fi
-            CUT_DATE="$cut" IN_PATH="$p" OUT_COPY="$copy" python - <<'PY'
-          import os
-          import pandas as pd
-          from pathlib import Path
-
-          p = Path(os.environ["IN_PATH"])
-          cut = pd.to_datetime(os.environ["CUT_DATE"])
-          out_copy = os.environ.get("OUT_COPY","").strip()
-
-          if p.suffix == ".parquet":
-              df = pd.read_parquet(p)
-          else:
-              df = pd.read_csv(p)
-
-          if "Date" not in df.columns:
-              print(f"[CUT] no Date column -> skip: {p}")
-              raise SystemExit(0)
-
-          dt = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
-          df = df.loc[dt.notna()].copy()
-          df["Date"] = dt.loc[dt.notna()].values
-          before = len(df)
-          df = df[df["Date"] <= cut].copy()
-          after = len(df)
-
-          # write back (inplace)
-          if p.suffix == ".parquet":
-              df.to_parquet(p, index=False)
-          else:
-              df.to_csv(p, index=False)
-
-          print(f"[CUT] {p}: {before} -> {after} (<= {cut.date()})")
-
-          if out_copy:
-              cp = Path(out_copy)
-              cp.parent.mkdir(parents=True, exist_ok=True)
-              if cp.suffix == ".parquet":
-                  df.to_parquet(cp, index=False)
-              else:
-                  df.to_csv(cp, index=False)
-              print(f"[CUT] wrote copy: {cp}")
-          PY
-          }
-
-          # Gate/tail/tau label summary (your CHK-MDL)
-          summarize_labels () {
-            TAG="$TAG" python - <<'PY'
-          import os, glob
-          from pathlib import Path
-          import pandas as pd
-
-          TAG = os.environ["TAG"]
-
-          def read_any(p):
-              p = Path(p)
-              if not p.exists(): return None
-              return pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
-
-          def pick(globs_):
-              out=[]
-              for g in globs_:
-                  out += glob.glob(g)
-              out = sorted(set(out))
-              return out[0] if out else ""
-
-          def summarize(df, label_candidates, name):
-              if df is None:
-                  print(f"[CHK-MDL] {name}: MISSING")
-                  return
-              cols = list(df.columns)
-              lab = None
-              for c in label_candidates:
-                  if c in cols:
-                      lab = c
-                      break
-              print(f"[CHK-MDL] {name}: rows={len(df)} cols={len(cols)} label_col={lab}")
-              if lab is not None:
-                  vc = df[lab].value_counts(dropna=False)
-                  print(f"[CHK-MDL] {name}: value_counts({lab}) top:")
-                  print(vc.head(10).to_string())
-                  try:
-                      s = pd.to_numeric(df[lab], errors="coerce")
-                      if s.notna().all():
-                          u = sorted(s.unique().tolist())
-                          if set(u).issubset({0,1}):
-                              print(f"[CHK-MDL] {name}: pos_rate={float(s.mean()):.6f}")
-                  except Exception:
-                      pass
-
-          gate_path = pick([f"data/labels/labels_model_{TAG}.parquet", f"data/labels/labels_model_{TAG}.csv"])
-          tail_path = pick(["data/labels/labels_tail*.parquet","data/labels/labels_tail*.csv","data/labels/*tail*labels*.parquet","data/labels/*tail*labels*.csv"])
-          tau_path  = pick([f"data/labels/*tau*{TAG}*.parquet", f"data/labels/*tau*{TAG}*.csv", f"data/labels/labels_tau_{TAG}.parquet", f"data/labels/labels_tau_{TAG}.csv"])
-
-          summarize(read_any(gate_path) if gate_path else None, ["y","Y","label","target","p_success","p","success","y_success"], f"GATE labels ({gate_path or 'missing'})")
-          summarize(read_any(tail_path) if tail_path else None, ["y_tail","tail","label","target","p_tail"], f"TAIL labels ({tail_path or 'missing'})")
-          summarize(read_any(tau_path)  if tau_path  else None, ["y_tau","tau","label","target","H","tau_h"], f"TAU labels ({tau_path or 'missing'})")
-          PY
-          }
-
-          # Ensure features_scored.csv in a folder (inputs folder)
-          ensure_features_scored_csv () {
-            local dir="$1"
-            if [ ! -d "$dir" ]; then
-              echo "[INFO] skip (missing dir): $dir"
-              return 0
-            fi
-            if [ -f "${dir}/features_scored.csv" ]; then
-              echo "[OK] already exists: ${dir}/features_scored.csv"
-              return 0
-            fi
-            if [ -f "${dir}/features_scored.parquet" ]; then
-              echo "[INFO] convert parquet -> csv: ${dir}/features_scored.parquet"
-              DIR="${dir}" python - <<'PY'
-          import os
-          import pandas as pd
-          d = os.environ["DIR"]
-          df = pd.read_parquet(f"{d}/features_scored.parquet")
-          df.to_csv(f"{d}/features_scored.csv", index=False)
-          print("[DONE] wrote", f"{d}/features_scored.csv", "rows=", len(df))
-          PY
-              return 0
-            fi
-            echo "[WARN] no features_scored.(csv|parquet) in ${dir}"
-          }
-
-          # ------------------------------------------------------------
-          # parse matrix
-          # ------------------------------------------------------------
           echo "$MATRIX_JSON" > /tmp/matrix.json
           python - <<'PY'
           import json
@@ -433,25 +256,12 @@ jobs:
           PY
 
           mkdir -p data/features data/labels data/meta app data/models data/signals/walkforward data/signals/walkforward2
-          mkdir -p data/badexit_pool   # expanding badexit trades pool (past-only)
-
-          # ------------------------------------------------------------
-          # IMPORTANT:
-          # - BadExit expanding pool is PAST-ONLY.
-          # - For current period, we train badexit using pool (past),
-          #   then we add current period wf#1 trades into pool for NEXT periods.
-          # ------------------------------------------------------------
+          mkdir -p data/badexit_pool
 
           python - <<'PY'
-          import json
-          m=json.load(open("/tmp/matrix.json","r"))
-          for i,it in enumerate(m["include"], start=1):
-              print(f"[PLAN] {i:02d} {it['period']}  train={it['TRAIN_START']}..{it['TRAIN_END']}  cut={it['CUT_DATE']}  test={it['TEST_START']}..{it['TEST_END']}")
-          PY
-
-          # loop (sequential)
-          python - <<'PY'
-          import json, os, subprocess, textwrap
+          import json, os, glob, subprocess
+          from pathlib import Path
+          import pandas as pd
 
           m=json.load(open("/tmp/matrix.json","r"))["include"]
 
@@ -460,6 +270,45 @@ jobs:
               if env: e.update(env)
               print("\n[CMD]\n"+cmd)
               subprocess.check_call(cmd, shell=True, env=e)
+
+          def pick_first(patterns):
+              out=[]
+              for p in patterns:
+                  out += glob.glob(p)
+              out = sorted(set(out))
+              return out[0] if out else ""
+
+          def cut_by_date_inplace(in_path, cut_date, out_copy=""):
+              p=Path(in_path)
+              if not p.exists():
+                  print(f"[CUT] skip (missing): {p}")
+                  return
+              cut=pd.to_datetime(cut_date)
+              df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
+              if "Date" not in df.columns:
+                  print(f"[CUT] no Date column -> skip: {p}")
+                  return
+              dt = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+              df = df.loc[dt.notna()].copy()
+              df["Date"] = dt.loc[dt.notna()].values
+              before=len(df)
+              df = df[df["Date"]<=cut].copy()
+              after=len(df)
+
+              if p.suffix==".parquet":
+                  df.to_parquet(p, index=False)
+              else:
+                  df.to_csv(p, index=False)
+              print(f"[CUT] {p}: {before} -> {after} (<= {cut.date()})")
+
+              if out_copy:
+                  cp=Path(out_copy)
+                  cp.parent.mkdir(parents=True, exist_ok=True)
+                  if cp.suffix==".parquet":
+                      df.to_parquet(cp, index=False)
+                  else:
+                      df.to_csv(cp, index=False)
+                  print(f"[CUT] wrote copy: {cp}")
 
           for idx, it in enumerate(m):
               period=it["period"]
@@ -475,12 +324,10 @@ jobs:
               }
 
               sh(f'echo "\\n====================\\n[PERIOD] {period} (#{idx+1}/{len(m)})\\n===================="', env=env)
-
-              # Export TAG/MODEL_DIR for helpers
               sh('TAG="wf_${WF_PERIOD}"; echo "[PERIOD] TAG=${TAG}"; echo "TAG=${TAG}" >> $GITHUB_ENV', env=env)
               sh('MODEL_DIR="data/models/wf_${WF_PERIOD}"; mkdir -p "${MODEL_DIR}"; echo "[PERIOD] MODEL_DIR=${MODEL_DIR}"', env=env)
 
-              # Ensure universe
+              # universe
               sh('bash -lc \'set -euo pipefail; '
                  'if [ ! -f data/universe.csv ]; then '
                  'echo "[INFO] data/universe.csv missing -> generating from raw prices"; '
@@ -502,11 +349,11 @@ jobs:
                  'PY2\n'
                  'fi\'', env=env)
 
-              # Build features (shared in workspace, OK)
+              # features
               sh('python scripts/build_features.py', env=env)
 
               # -------------------------
-              # Gate labels: rolling
+              # Gate labels: rolling (TRAIN_START)
               # -------------------------
               sh('bash -lc \'set -euo pipefail; '
                  'python scripts/build_labels.py '
@@ -516,8 +363,7 @@ jobs:
                  '--start-date "${TRAIN_START}"\'', env=env)
 
               # -------------------------
-              # Tail labels: expanding
-              # - build full, then CUT <= CUT_DATE inplace (no lookahead)
+              # Tail labels: build full then CUT expanding<=CUT_DATE (NO lookahead)
               # -------------------------
               sh('bash -lc \'set -euo pipefail; '
                  'python scripts/build_tail_labels.py '
@@ -526,54 +372,22 @@ jobs:
                  '--stop-level "${STOP_LEVEL}" '
                  '--max-extend-days "${MAX_EXTEND_DAYS}"\'', env=env)
 
-              sh('bash -lc \'set -euo pipefail; '
-                 'TAG="wf_${WF_PERIOD}"; '
-                 'CUT="${CUT_DATE}"; '
-                 'TL="$(python - <<PY3\n'
-                 'import glob\n'
-                 'cand=[]\n'
-                 'cand += glob.glob("data/labels/labels_tail*.parquet")\n'
-                 'cand += glob.glob("data/labels/labels_tail*.csv")\n'
-                 'cand += glob.glob("data/labels/*tail*labels*.parquet")\n'
-                 'cand += glob.glob("data/labels/*tail*labels*.csv")\n'
-                 'cand=sorted(set(cand))\n'
-                 'print(cand[0] if cand else "")\n'
-                 'PY3\n'
-                 ')"; '
-                 'echo "[TAIL] labels_path=${TL}"; '
-                 'if [ -n "${TL}" ] && [ -f "${TL}" ]; then '
-                 'CUT_DATE="${CUT}" IN_PATH="${TL}" OUT_COPY="data/labels/labels_tail_${TAG}$(python -c "import os; p=os.environ.get(\'IN_PATH\',\'\'); print(\'.parquet\' if p.endswith(\'.parquet\') else \'.csv\')")" python - <<PY4\n'
-                 'import os\n'
-                 'import pandas as pd\n'
-                 'from pathlib import Path\n'
-                 'p=Path(os.environ["IN_PATH"])\n'
-                 'cut=pd.to_datetime(os.environ["CUT_DATE"])\n'
-                 'out_copy=os.environ.get("OUT_COPY","").strip()\n'
-                 'df=pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)\n'
-                 'if "Date" not in df.columns:\n'
-                 '  print(f"[CUT] no Date column -> skip: {p}")\n'
-                 '  raise SystemExit(0)\n'
-                 'dt=pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)\n'
-                 'df=df.loc[dt.notna()].copy()\n'
-                 'df["Date"]=dt.loc[dt.notna()].values\n'
-                 'before=len(df)\n'
-                 'df=df[df["Date"]<=cut].copy()\n'
-                 'after=len(df)\n'
-                 'if p.suffix==".parquet": df.to_parquet(p, index=False)\n'
-                 'else: df.to_csv(p, index=False)\n'
-                 'print(f"[CUT] {p}: {before} -> {after} (<= {cut.date()})")\n'
-                 'if out_copy:\n'
-                 '  cp=Path(out_copy)\n'
-                 '  cp.parent.mkdir(parents=True, exist_ok=True)\n'
-                 '  if cp.suffix==".parquet": df.to_parquet(cp, index=False)\n'
-                 '  else: df.to_csv(cp, index=False)\n'
-                 '  print(f"[CUT] wrote copy: {cp}")\n'
-                 'PY4\n'
-                 'fi\'', env=env)
+              TAG=f"wf_{period}"
+              cut=it["CUT_DATE"]
+
+              tail_path = pick_first([
+                  "data/labels/labels_tail*.parquet",
+                  "data/labels/labels_tail*.csv",
+                  "data/labels/*tail*labels*.parquet",
+                  "data/labels/*tail*labels*.csv",
+              ])
+              if tail_path:
+                  out_copy = f"data/labels/labels_tail_{TAG}" + (".parquet" if tail_path.endswith(".parquet") else ".csv")
+                  print(f"[TAIL] labels_path={tail_path}")
+                  cut_by_date_inplace(tail_path, cut, out_copy)
 
               # -------------------------
-              # Tau labels: expanding
-              # - build tagged, then CUT <= CUT_DATE inplace
+              # Tau labels: build tagged then CUT expanding<=CUT_DATE (NO lookahead)
               # -------------------------
               sh('bash -lc \'set -euo pipefail; '
                  'TAG="wf_${WF_PERIOD}"; '
@@ -584,55 +398,19 @@ jobs:
                  '--stop-level "${STOP_LEVEL}" '
                  '--max-extend-days "${MAX_EXTEND_DAYS}"\'', env=env)
 
-              sh('bash -lc \'set -euo pipefail; '
-                 'TAG="wf_${WF_PERIOD}"; '
-                 'CUT="${CUT_DATE}"; '
-                 'TL="$(python - <<PY5\n'
-                 'import os, glob\n'
-                 'tag=os.environ["TAG"]\n'
-                 'cand=[]\n'
-                 'cand += glob.glob(f"data/labels/*tau*{tag}*.parquet")\n'
-                 'cand += glob.glob(f"data/labels/*tau*{tag}*.csv")\n'
-                 'cand += glob.glob(f"data/labels/labels_tau_{tag}.parquet")\n'
-                 'cand += glob.glob(f"data/labels/labels_tau_{tag}.csv")\n'
-                 'cand=sorted(set(cand))\n'
-                 'print(cand[0] if cand else "")\n'
-                 'PY5\n'
-                 ')"; '
-                 'echo "[TAU] labels_path=${TL}"; '
-                 'if [ -n "${TL}" ] && [ -f "${TL}" ]; then '
-                 'CUT_DATE="${CUT}" IN_PATH="${TL}" OUT_COPY="data/labels/labels_tau_${TAG}$(python -c "import os; p=os.environ.get(\'IN_PATH\',\'\'); print(\'.parquet\' if p.endswith(\'.parquet\') else \'.csv\')")" python - <<PY6\n'
-                 'import os\n'
-                 'import pandas as pd\n'
-                 'from pathlib import Path\n'
-                 'p=Path(os.environ["IN_PATH"])\n'
-                 'cut=pd.to_datetime(os.environ["CUT_DATE"])\n'
-                 'out_copy=os.environ.get("OUT_COPY","").strip()\n'
-                 'df=pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)\n'
-                 'if "Date" not in df.columns:\n'
-                 '  print(f"[CUT] no Date column -> skip: {p}")\n'
-                 '  raise SystemExit(0)\n'
-                 'dt=pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)\n'
-                 'df=df.loc[dt.notna()].copy()\n'
-                 'df["Date"]=dt.loc[dt.notna()].values\n'
-                 'before=len(df)\n'
-                 'df=df[df["Date"]<=cut].copy()\n'
-                 'after=len(df)\n'
-                 'if p.suffix==".parquet": df.to_parquet(p, index=False)\n'
-                 'else: df.to_csv(p, index=False)\n'
-                 'print(f"[CUT] {p}: {before} -> {after} (<= {cut.date()})")\n'
-                 'if out_copy:\n'
-                 '  cp=Path(out_copy)\n'
-                 '  cp.parent.mkdir(parents=True, exist_ok=True)\n'
-                 '  if cp.suffix==".parquet": df.to_parquet(cp, index=False)\n'
-                 '  else: df.to_csv(cp, index=False)\n'
-                 '  print(f"[CUT] wrote copy: {cp}")\n'
-                 'PY6\n'
-                 'fi\'', env=env)
+              tau_path = pick_first([
+                  f"data/labels/*tau*{TAG}*.parquet",
+                  f"data/labels/*tau*{TAG}*.csv",
+                  f"data/labels/labels_tau_{TAG}.parquet",
+                  f"data/labels/labels_tau_{TAG}.csv",
+              ])
+              if tau_path:
+                  out_copy = f"data/labels/labels_tau_{TAG}" + (".parquet" if tau_path.endswith(".parquet") else ".csv")
+                  print(f"[TAU] labels_path={tau_path}")
+                  cut_by_date_inplace(tau_path, cut, out_copy)
 
               # -------------------------
-              # Gate features/labels cut (rolling gate only)
-              # - features_model + labels_model cut to CUT_DATE
+              # Gate features/labels CUT <= CUT_DATE (rolling gate only)
               # -------------------------
               sh('bash -lc \'set -euo pipefail; '
                  'TAG="wf_${WF_PERIOD}"; CUT_DATE="${CUT_DATE}"; '
@@ -665,50 +443,8 @@ jobs:
                  'print("[CUT] labels_model rows=", len(lm_cut))\n'
                  'PY7\'', env=env)
 
-              # Label sanity logs
-              sh('bash -lc \'set -euo pipefail; TAG="wf_${WF_PERIOD}"; '
-                 'TAG="${TAG}" python - <<PY8\n'
-                 'import os, glob\n'
-                 'from pathlib import Path\n'
-                 'import pandas as pd\n'
-                 'TAG=os.environ["TAG"]\n'
-                 'def read_any(p):\n'
-                 '  p=Path(p)\n'
-                 '  if not p.exists(): return None\n'
-                 '  return pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)\n'
-                 'def pick(gs):\n'
-                 '  out=[]\n'
-                 '  for g in gs: out+=glob.glob(g)\n'
-                 '  out=sorted(set(out))\n'
-                 '  return out[0] if out else ""\n'
-                 'def summ(df, cands, name):\n'
-                 '  if df is None:\n'
-                 '    print(f"[CHK-MDL] {name}: MISSING"); return\n'
-                 '  cols=list(df.columns)\n'
-                 '  lab=None\n'
-                 '  for c in cands:\n'
-                 '    if c in cols: lab=c; break\n'
-                 '  print(f"[CHK-MDL] {name}: rows={len(df)} cols={len(cols)} label_col={lab}")\n'
-                 '  if lab is not None:\n'
-                 '    vc=df[lab].value_counts(dropna=False)\n'
-                 '    print(f"[CHK-MDL] {name}: value_counts({lab}) top:")\n'
-                 '    print(vc.head(10).to_string())\n'
-                 '    try:\n'
-                 '      s=pd.to_numeric(df[lab], errors="coerce")\n'
-                 '      if s.notna().all() and set(s.unique()).issubset({0,1}):\n'
-                 '        print(f"[CHK-MDL] {name}: pos_rate={float(s.mean()):.6f}")\n'
-                 '    except Exception:\n'
-                 '      pass\n'
-                 'gate_path=pick([f"data/labels/labels_model_{TAG}.parquet", f"data/labels/labels_model_{TAG}.csv"])\n'
-                 'tail_path=pick(["data/labels/labels_tail*.parquet","data/labels/labels_tail*.csv","data/labels/*tail*labels*.parquet","data/labels/*tail*labels*.csv"])\n'
-                 'tau_path=pick([f"data/labels/*tau*{TAG}*.parquet", f"data/labels/*tau*{TAG}*.csv", f"data/labels/labels_tau_{TAG}.parquet", f"data/labels/labels_tau_{TAG}.csv"])\n'
-                 'summ(read_any(gate_path) if gate_path else None, ["y","Y","label","target","p_success","p","success","y_success"], f"GATE labels ({gate_path or \'missing\'})")\n'
-                 'summ(read_any(tail_path) if tail_path else None, ["y_tail","tail","label","target","p_tail"], f"TAIL labels ({tail_path or \'missing\'})")\n'
-                 'summ(read_any(tau_path) if tau_path else None, ["y_tau","tau","label","target","H","tau_h"], f"TAU labels ({tau_path or \'missing\'})")\n'
-                 'PY8\'', env=env)
-
               # -------------------------
-              # Train Gate (rolling), Tail (expanding), Tau (expanding)
+              # Train Gate / Tail / Tau
               # -------------------------
               sh('bash -lc \'set -euo pipefail; TAG="wf_${WF_PERIOD}"; '
                  'echo "[TRAIN] python scripts/train_model.py --tag ${TAG}"; '
@@ -726,7 +462,7 @@ jobs:
                  'echo "[TRAIN] python scripts/train_tau_model.py --tag ${TAG}"; '
                  'python scripts/train_tau_model.py --tag "${TAG}"\'', env=env)
 
-              # Stage models for this period
+              # Stage models
               sh('bash -lc \'set -euo pipefail; '
                  'TAG="wf_${WF_PERIOD}"; MODEL_DIR="data/models/${TAG}"; mkdir -p "${MODEL_DIR}"; '
                  'pick_one () { local pat="$1"; local f; f="$(ls -1 ${pat} 2>/dev/null | head -n 1 || true)"; echo "${f}"; }\n'
@@ -749,9 +485,7 @@ jobs:
                  'test -f "${MODEL_DIR}/tau_model.pkl"; test -f "${MODEL_DIR}/tau_scaler.pkl";\n'
                  'echo "[TRAIN DONE] gate(rolling) + tail/tau(expanding<=CUT) ready"\'', env=env)
 
-              # -------------------------
-              # Walkforward #1 (no badexit yet for current period)
-              # -------------------------
+              # Walkforward #1
               sh('bash -lc \'set -euo pipefail; '
                  'WF_PERIOD="${WF_PERIOD}"; '
                  'MODEL_DIR="data/models/wf_${WF_PERIOD}"; '
@@ -767,11 +501,7 @@ jobs:
                  './scripts/run_walkforward_halfyear.sh;\n'
                  'echo "[RUN1] done. signals: data/signals/walkforward/${WF_PERIOD}"; ls -la "data/signals/walkforward/${WF_PERIOD}" | sed -n "1,200p" || true\'', env=env)
 
-              # -------------------------
-              # BadExit expanding (PAST-ONLY pool)
-              # - train using data/badexit_pool only (which contains trades from periods < current)
-              # - if pool empty -> skip training and skip wf2 (or copy wf1 -> wf2)
-              # -------------------------
+              # BadExit expanding (past-only pool)
               sh('bash -lc \'set -euo pipefail; '
                  'WF_PERIOD="${WF_PERIOD}"; TAG="wf_${WF_PERIOD}"; MODEL_DIR="data/models/${TAG}";\n'
                  'POOL="data/badexit_pool"; mkdir -p "${POOL}";\n'
@@ -793,7 +523,6 @@ jobs:
                  'PYX\n'
                  ')";\n'
                  '  echo "[BADEXIT-EXP] EX_TAG=${EX_TAG}";\n'
-                 '  # CHECK-1C (pool matched only)\n'
                  '  SIGNALS_DIR="${POOL}" EX_TAG="${EX_TAG}" python - <<PY1\n'
                  'import os, glob\n'
                  'import pandas as pd\n'
@@ -845,7 +574,6 @@ jobs:
                  '  )";\n'
                  '  if [ "${LABEL_COL}" = "__MISSING__" ]; then echo "[ERROR] label col missing"; exit 1; fi\n'
                  '  echo "[BADEXIT] detected label_col=${LABEL_COL}";\n'
-                 '  # CHECK-2B\n'
                  '  BADLBL="${badlbl}" LABEL_COL="${LABEL_COL}" python - <<PY3\n'
                  'import os\n'
                  'import pandas as pd\n'
@@ -878,10 +606,7 @@ jobs:
                  '  echo "[BADEXIT] staged in ${MODEL_DIR}:"; ls -la "${MODEL_DIR}" | sed -n "1,200p";\n'
                  'fi\'', env=env)
 
-              # -------------------------
-              # Walkforward #2 (with badexit) if available
-              # - else: copy wf1 -> wf2 to keep downstream paths consistent
-              # -------------------------
+              # Walkforward #2 (with badexit) else copy wf1 -> wf2
               sh('bash -lc \'set -euo pipefail; '
                  'WF_PERIOD="${WF_PERIOD}"; TAG="wf_${WF_PERIOD}"; MODEL_DIR="data/models/${TAG}";\n'
                  'if [ "${BADEXIT_AVAILABLE:-false}" != "true" ]; then\n'
@@ -902,27 +627,7 @@ jobs:
                  'fi\n'
                  'echo "[RUN2] done. signals: data/signals/walkforward2/${WF_PERIOD}"; ls -la "data/signals/walkforward2/${WF_PERIOD}" | sed -n "1,200p" || true\'', env=env)
 
-              # Ensure features_scored.csv in both outputs
-              sh('bash -lc \'set -euo pipefail; '
-                 'p1="data/signals/walkforward/${WF_PERIOD}/_inputs"; '
-                 'p2="data/signals/walkforward2/${WF_PERIOD}/_inputs"; '
-                 'for d in "$p1" "$p2"; do '
-                 '  if [ -d "$d" ]; then '
-                 '    if [ ! -f "$d/features_scored.csv" ] && [ -f "$d/features_scored.parquet" ]; then '
-                 '      DIR="$d" python - <<PY9\n'
-                 'import os\n'
-                 'import pandas as pd\n'
-                 'd=os.environ["DIR"]\n'
-                 'df=pd.read_parquet(f"{d}/features_scored.parquet")\n'
-                 'df.to_csv(f"{d}/features_scored.csv", index=False)\n'
-                 'print("[DONE] wrote", f"{d}/features_scored.csv", "rows=", len(df))\n'
-                 'PY9\n'
-                 '    fi; '
-                 '    ls -la "$d" | sed -n "1,120p" || true; '
-                 '  fi; '
-                 'done\'', env=env)
-
-              # Finally, add current period trades (wf1) into pool for future periods (expanding, past-only)
+              # add current period trades into pool AFTER training (past-only for next periods)
               sh('bash -lc \'set -euo pipefail; '
                  'WF_PERIOD="${WF_PERIOD}"; '
                  'SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"; '
@@ -956,7 +661,6 @@ jobs:
           echo "[TREE] signals walkforward2:"
           find data/signals/walkforward2 -maxdepth 2 -type d | sed -n '1,200p' || true
 
-      # One-shot uploads (simpler + reliable with sequential loop)
       - name: Upload artifact (walkforward all)
         uses: actions/upload-artifact@v4
         with:
