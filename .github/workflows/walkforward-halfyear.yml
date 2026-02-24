@@ -165,8 +165,6 @@ jobs:
 
       # ============================================================
       # (A) TRAIN (per half-year, cut at CUT_DATE)
-      #  - gate/tail/tau: 강제
-      #  - badexit: signals_dir 필요 -> WALKFORWARD 이후에 강제 생성/학습
       # ============================================================
       - name: Train models for this half-year (cut at CUT_DATE)
         env:
@@ -411,30 +409,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-        
+
           TAG="wf_${WF_PERIOD}"
           MODEL_DIR="data/models/${TAG}"
-        
+
           echo "[BADEXIT] TAG=${TAG}"
           echo "[BADEXIT] model_dir=${MODEL_DIR}"
-        
+
           SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"
-        
+
           echo "[DEBUG] pre-badexit signals tree:"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
-        
+
           if [ ! -d "${SIGNALS_DIR}" ]; then
             echo "[ERROR] signals_dir missing: ${SIGNALS_DIR}"
             find data/signals -maxdepth 4 -type d | sed -n '1,200p' || true
             exit 1
           fi
-        
+
           echo "[BADEXIT] using signals_dir=${SIGNALS_DIR}"
           ls -la "${SIGNALS_DIR}" | sed -n '1,200p' || true
-        
+
           echo "[DEBUG] trades files (depth 3):"
-          find "${SIGNALS_DIR}" -maxdepth 3 -type f \( -name 'sim_engine_trades_*.parquet' -o -name 'sim_engine_trades_*.csv' \) | sed -n '1,200p'
-        
+          # NOTE: avoid bash parsing issues with '(' by using multiple -name and -o without grouping
+          find "${SIGNALS_DIR}" -maxdepth 3 -type f -name 'sim_engine_trades_*.parquet' -print | sed -n '1,200p' || true
+          find "${SIGNALS_DIR}" -maxdepth 3 -type f -name 'sim_engine_trades_*.csv' -print | sed -n '1,200p' || true
+
           EX_TAG="$(python - <<'PY'
           import os
           pt=float(os.environ["PROFIT_TARGET"])
@@ -446,7 +446,7 @@ jobs:
           print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
           PY
           )"
-          echo "[BADEXIT] expected trades tag(EX_TAG)=${EX_TAG}" expected trades tag(EX_TAG)=${EX_TAG}"
+          echo "[BADEXIT] expected trades tag(EX_TAG)=${EX_TAG}"
 
           shopt -s nullglob
           made=0
