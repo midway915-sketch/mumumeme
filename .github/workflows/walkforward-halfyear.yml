@@ -165,7 +165,7 @@ jobs:
           ls -la data/raw
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
-            - name: Train models for this half-year (cut at CUT_DATE)
+      - name: Train models for this half-year (cut at CUT_DATE)
         env:
           WF_PERIOD: ${{ matrix.period }}
           TRAIN_START: ${{ matrix.TRAIN_START }}
