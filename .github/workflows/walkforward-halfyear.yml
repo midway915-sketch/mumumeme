@@ -168,7 +168,7 @@ jobs:
       # ============================================================
       # (A) TRAIN (per half-year, cut at CUT_DATE) ✅ "반드시 성공"
       #  - gate/tail: 필수(실패하면 job 실패)
-      #  - tau/badexit: 레포 CLI/라벨 준비가 확정되기 전이라 "있으면 학습+스테이징, 없으면 스킵"
+      #  - tau/badexit: 있으면 학습+스테이징, 없으면 스킵(절대 실패 X)
       # ============================================================
       - name: Train models for this half-year (cut at CUT_DATE)
         env:
@@ -237,14 +237,6 @@ jobs:
           PY
           fi
 
-          python scripts/train_tail_model.py -h || true
-          python scripts/train_badexit_model_wf_lite.py -h || true
-          python scripts/train_tau_model.py -h || true
-          
-          python scripts/build_tail_labels.py -h || true
-          python scripts/build_tau_labels.py -h || true
-          python scripts/build_badexit_labels.py -h || true
-          
           # 1) features
           python scripts/build_features.py
 
@@ -302,37 +294,38 @@ jobs:
           python scripts/train_model.py --tag "${TAG}"
 
           # 6) train tail model (필수 args 4개)
-          #    + out 파일명을 TAG로 고정해서 스테이징이 항상 성공하도록
+          #    -> 기본 출력이 app/tail_model_{tag}.pkl / app/tail_scaler_{tag}.pkl (help 로그에서 확인)
           echo "[TRAIN] python scripts/train_tail_model.py (required args)"
           python scripts/train_tail_model.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}" \
-            --out-model "app/tail_model_${TAG}.pkl" \
-            --out-scaler "app/tail_scaler_${TAG}.pkl"
+            --max-extend-days "${MAX_EXTEND_DAYS}"
 
           echo "[TRAIN] produced app/:"
           ls -la app | sed -n '1,200p'
 
           # 7) stage required models -> data/models/${TAG} (고정 파일명)
-          # gate: app/model_*TAG*.pkl, app/scaler_*TAG*.pkl 중 첫번째를 채택
+          # gate: tag 포함 파일을 우선
           mf="$(pick_one "app/model_*${TAG}*.pkl")"
           sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
           if [ -z "${mf}" ] || [ -z "${sf}" ]; then
             echo "[ERROR] gate model/scaler not found for TAG=${TAG}"
-            echo "[ERROR] expected files like:"
-            echo "  app/model_${TAG}.pkl / app/scaler_${TAG}.pkl  (or app/model_wf_XXXX.pkl style)"
+            echo "[ERROR] searched: app/model_*${TAG}*.pkl and app/scaler_*${TAG}*.pkl"
             exit 1
           fi
           cp -v "${mf}" "${MODEL_DIR}/model.pkl"
           cp -v "${sf}" "${MODEL_DIR}/scaler.pkl"
 
-          # tail: 우리가 out-model/out-scaler로 강제했으니 이 파일이 반드시 있어야 함
-          test -f "app/tail_model_${TAG}.pkl"
-          test -f "app/tail_scaler_${TAG}.pkl"
-          cp -v "app/tail_model_${TAG}.pkl" "${MODEL_DIR}/tail_model.pkl"
-          cp -v "app/tail_scaler_${TAG}.pkl" "${MODEL_DIR}/tail_scaler.pkl"
+          # tail: default output name (tag 기준)
+          tm="app/tail_model_${TAG}.pkl"
+          ts="app/tail_scaler_${TAG}.pkl"
+          if [ ! -f "${tm}" ] || [ ! -f "${ts}" ]; then
+            echo "[ERROR] tail model/scaler not found: ${tm} / ${ts}"
+            exit 1
+          fi
+          cp -v "${tm}" "${MODEL_DIR}/tail_model.pkl"
+          cp -v "${ts}" "${MODEL_DIR}/tail_scaler.pkl"
 
           echo "[TRAIN] staged required models in ${MODEL_DIR}:"
           ls -la "${MODEL_DIR}" | sed -n '1,200p'
@@ -342,15 +335,13 @@ jobs:
           test -f "${MODEL_DIR}/tail_scaler.pkl"
 
           # 8) OPTIONAL: tau/badexit (있으면 학습+스테이징, 없으면 스킵)
-          #    - 여기서 "무조건 성공"의 의미는: 없어도 train step 자체가 실패하지 않게.
-          #    - tau/badexit까지 '강제'하려면, build_*_labels.py CLI/출력 규칙을 먼저 확정해야 함.
           echo "[TRAIN] optional: tau/badexit (skip-if-missing)"
 
-          # tau: train_tau_model.py는 tag 기준 labels_tau_TAG.* 필요
+          # tau: train_tau_model.py는 labels_tau_TAG.* (또는 legacy labels_tau.*)가 있어야 함
           if [ -f "data/labels/labels_tau_${TAG}.parquet" ] || [ -f "data/labels/labels_tau_${TAG}.csv" ] || \
              [ -f "data/labels/labels_tau.parquet" ] || [ -f "data/labels/labels_tau.csv" ]; then
             echo "[TRAIN] tau labels found -> training tau"
-            python scripts/train_tau_model.py --tag "${TAG}"
+            python scripts/train_tau_model.py --tag "${TAG}" || true
             taum="$(pick_one "app/tau_model_*${TAG}*.pkl")"
             taus="$(pick_one "app/tau_scaler_*${TAG}*.pkl")"
             if [ -n "${taum}" ] && [ -n "${taus}" ]; then
@@ -364,7 +355,7 @@ jobs:
             echo "[TRAIN] no tau labels found -> skip tau"
           fi
 
-          # badexit: wf_lite는 --data-path 필수 (labels_badexit_*이 있어야 학습 가능)
+          # badexit: wf_lite는 --data-path 필수
           badlbl="$(pick_one "data/labels/labels_badexit_${TAG}.parquet data/labels/labels_badexit_${TAG}.csv data/labels/labels_badexit.parquet data/labels/labels_badexit.csv")"
           if [ -n "${badlbl}" ]; then
             echo "[TRAIN] badexit labels found (${badlbl}) -> training badexit"
@@ -372,7 +363,7 @@ jobs:
               --data-path "${badlbl}" \
               --out-model "app/badexit_model_${TAG}.pkl" \
               --out-scaler "app/badexit_scaler_${TAG}.pkl" \
-              --out-report "data/meta/train_badexit_report_${TAG}.json"
+              --out-report "data/meta/train_badexit_report_${TAG}.json" || true
             if [ -f "app/badexit_model_${TAG}.pkl" ] && [ -f "app/badexit_scaler_${TAG}.pkl" ]; then
               cp -v "app/badexit_model_${TAG}.pkl" "${MODEL_DIR}/badexit_model.pkl"
               cp -v "app/badexit_scaler_${TAG}.pkl" "${MODEL_DIR}/badexit_scaler.pkl"
