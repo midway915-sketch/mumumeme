@@ -135,7 +135,8 @@ jobs:
           cat /tmp/matrix.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-  run:
+  train:
+    name: train-models (per half-year)
     needs: [raw-data, make-matrix]
     runs-on: ubuntu-latest
     strategy:
@@ -148,7 +149,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (train)
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
@@ -165,8 +166,9 @@ jobs:
           ls -la data/raw
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
-      - name: Train models for this half-year (cut at CUT_DATE)
+      - name: Train models for this half-year
         env:
+          # ---- matrix slice
           WF_PERIOD: ${{ matrix.period }}
           TRAIN_START: ${{ matrix.TRAIN_START }}
           TRAIN_END: ${{ matrix.TRAIN_END }}
@@ -176,23 +178,24 @@ jobs:
           TEST_END: ${{ matrix.TEST_END }}
           CUT_DATE: ${{ matrix.CUT_DATE }}
 
+          # ---- core label params
           PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
           MAX_DAYS: ${{ inputs.MAX_DAYS }}
           STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
 
-          # ✅ required by build_tail_labels.py
+          # ---- tail label needs this (your error log)
           MAX_EXTEND_DAYS: "20"
 
+          # ---- tau mapping (score_features uses this)
           TAU_H_MAP: "30,40,50"
         shell: bash
         run: |
           set -euo pipefail
-
           TAG="wf_${WF_PERIOD}"
           echo "[TRAIN] TAG=${TAG} CUT_DATE=${CUT_DATE}"
-          mkdir -p data/features data/labels data/meta app
+          echo "[TRAIN] TRAIN ${TRAIN_START}..${TRAIN_END} VALID ${VALID_START}..${VALID_END}"
 
-          # 0) universe.csv (없으면 raw에서 생성)
+          # 0) universe.csv (if missing)
           if [ ! -f data/universe.csv ]; then
             echo "[INFO] data/universe.csv missing -> generating from raw prices"
             python - <<'PY'
@@ -206,7 +209,12 @@ jobs:
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-          ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+          if "Ticker" not in df.columns:
+              raise SystemExit("[ERROR] raw prices missing Ticker column")
+          ticks = (
+              df["Ticker"].astype(str).str.upper().str.strip()
+                .dropna().unique().tolist()
+          )
           ticks = sorted(set([t for t in ticks if t]))
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
@@ -215,86 +223,104 @@ jobs:
           PY
           fi
 
-          # 1) features
-          python scripts/build_features.py --start-date "${TRAIN_START}"
+          # 1) build features (repo 기준: build_features.py는 cut-date 안 받음)
+          python scripts/build_features.py
 
-          # 2) labels (build_labels.py는 이 인자만 받는 게 로그로 확인됨)
+          # 2) build labels (repo 기준: build_labels.py는 아래 인자만 받음)
           python scripts/build_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --start-date "${TRAIN_START}"
 
-          # ✅ tail labels: 반드시 --max-extend-days 필요
+          # 3) build tail labels (repo 기준: --max-extend-days 필수)
           python scripts/build_tail_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # badexit/tau labels: 일단 tag만 (CLI 요구사항 모르면 보수적으로)
-          # (만약 여기서 required arg 뜨면, 그 에러 로그 기준으로 바로 맞춰줄게)
-          python scripts/build_badexit_labels.py || true
-          python scripts/build_tau_labels.py || true
+          # 4) train gate / tail / badexit / tau (레포 파일명 기준)
+          #    (각 스크립트가 내부적으로 data/*를 읽고 app/*.pkl 혹은 report json을 쓰는 구조를 가정)
+          echo "[TRAIN] train_model.py --tag ${TAG}"
+          python scripts/train_model.py --tag "${TAG}"
 
-          # 3) CUT_DATE로 tag 스냅샷 만들기 (누수 방지)
-          TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
-          import os
-          from pathlib import Path
-          import pandas as pd
-          
-          TAG = os.environ["TAG"]
-          CUT = pd.to_datetime(os.environ["CUT_DATE"])
-          
-          def read_any(parq, csv):
-              if Path(parq).exists(): return pd.read_parquet(parq)
-              if Path(csv).exists():  return pd.read_csv(csv)
-              raise FileNotFoundError(f"missing {parq} or {csv}")
-          
-          def write_parq(df, p):
-              Path(p).parent.mkdir(parents=True, exist_ok=True)
-              df.to_parquet(p, index=False)
-          
-          # features_model snapshot (cut)
-          f = read_any("data/features/features_model.parquet", "data/features/features_model.csv")
-          f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.tz_localize(None)
-          f = f.dropna(subset=["Date"])
-          f_cut = f[f["Date"] <= CUT].copy()
-          write_parq(f_cut, f"data/features/features_model_{TAG}.parquet")
-          print("[SNAP] features_model ->", f"features_model_{TAG}.parquet", "rows=", len(f_cut))
-          
-          # labels_model snapshot (cut)
-          lm = read_any("data/labels/labels_model.parquet", "data/labels/labels_model.csv")
-          lm["Date"] = pd.to_datetime(lm["Date"], errors="coerce").dt.tz_localize(None)
-          lm = lm.dropna(subset=["Date"])
-          lm_cut = lm[lm["Date"] <= CUT].copy()
-          write_parq(lm_cut, f"data/labels/labels_model_{TAG}.parquet")
-          print("[SNAP] labels_model ->", f"labels_model_{TAG}.parquet", "rows=", len(lm_cut))
-          PY
+          echo "[TRAIN] train_tail_model.py --tag ${TAG}"
+          python scripts/train_tail_model.py --tag "${TAG}"
 
-          # 4) train (레포 스크립트명 기준)
-          IFS=',' read -r H0 H1 H2 <<< "${TAU_H_MAP}"
+          echo "[TRAIN] train_badexit_model_wf_lite.py --tag ${TAG}"
+          python scripts/train_badexit_model_wf_lite.py --tag "${TAG}"
 
-          for H in "${H0}" "${H1}" "${H2}"; do
-            echo "[TRAIN] train_model tag=${TAG} H=${H}"
-            python scripts/train_model.py --tag "${TAG}" --H "${H}" || true
-
-            echo "[TRAIN] train_tail_model tag=${TAG} H=${H}"
-            python scripts/train_tail_model.py --tag "${TAG}" --H "${H}" || true
-          done
-
-          echo "[TRAIN] train_badexit_model tag=${TAG}"
-          python scripts/train_badexit_model.py --tag "${TAG}" || true
-
-          echo "[TRAIN] train_tau_model tag=${TAG}"
+          echo "[TRAIN] train_tau_model.py --tag ${TAG}"
           python scripts/train_tau_model.py --tag "${TAG}" || true
 
-          echo "[TRAIN] produced app/:"
-          ls -la app | sed -n '1,200p'
+          # 5) stage models so score_features can find them (data/models/<TAG>/)
+          mkdir -p "data/models/${TAG}"
 
-      # ============================================================
-      # (B) WALKFORWARD (same period)
-      # ============================================================
+          echo "[TRAIN] app/ contents:"
+          ls -la app | sed -n '1,200p' || true
+
+          shopt -s nullglob
+          for f in app/*.pkl; do
+            cp -v "$f" "data/models/${TAG}/" || true
+          done
+
+          echo "[TRAIN] data/models/${TAG} contents:"
+          ls -la "data/models/${TAG}" | sed -n '1,200p' || true
+
+          # fail fast if essential gate model/scaler not staged
+          test -f "data/models/${TAG}/model.pkl"
+          test -f "data/models/${TAG}/scaler.pkl"
+
+      - name: Upload artifact (models for this half-year)
+        uses: actions/upload-artifact@v4
+        with:
+          name: models_${{ matrix.period }}
+          path: data/models/wf_${{ matrix.period }}
+          if-no-files-found: error
+
+  run:
+    needs: [raw-data, make-matrix, train]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Download raw-data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+
+      - name: Download models artifact (this half-year)
+        uses: actions/download-artifact@v4
+        with:
+          name: models_${{ matrix.period }}
+          path: data/models/wf_${{ matrix.period }}
+
+      - name: Verify inputs present
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la data/raw | sed -n '1,200p'
+          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
+
+          echo "[INFO] model dir:"
+          ls -la "data/models/wf_${{ matrix.period }}" | sed -n '1,200p'
+          test -f "data/models/wf_${{ matrix.period }}/model.pkl"
+          test -f "data/models/wf_${{ matrix.period }}/scaler.pkl"
+
       - name: Walkforward run (one half-year)
         env:
           # ---- matrix slice
@@ -326,6 +352,9 @@ jobs:
           BADEXIT_MAXES: "1.00"
           MAX_LEVERAGE_PCT: "1.0"
 
+          # ---- model location for scoring
+          MODEL_DIR: data/models/wf_${{ matrix.period }}
+
           # ---- set -u 터지는 애들: 무조건 세팅(빈 문자열 OK)
           EXCLUDE_TICKERS: ""
           REQUIRE_FILES: ""
@@ -345,6 +374,7 @@ jobs:
           # ---- output partitioning
           OUT_DIR_BASE: data/signals/walkforward
           WF_TAG_BASE: wf
+
         run: |
           chmod +x scripts/run_walkforward_halfyear.sh
           ./scripts/run_walkforward_halfyear.sh
@@ -390,8 +420,8 @@ jobs:
 
           shopt -s nullglob
           for d in _wf_artifacts/walkforward_*; do
-            base="$(basename "$d")"
-            period="${base#walkforward_}"
+            base="$(basename "$d")"             # e.g. walkforward_2018H1
+            period="${base#walkforward_}"       # e.g. 2018H1
             out="data/signals/walkforward/${period}"
             mkdir -p "$out"
             echo "[INFO] stage ${base} -> ${out}"
