@@ -394,6 +394,10 @@ jobs:
           chmod +x scripts/run_walkforward_halfyear.sh
           ./scripts/run_walkforward_halfyear.sh
 
+          echo "[DEBUG] after walkforward, signals tree:"
+          find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
+          ls -la "data/signals/walkforward/${WF_PERIOD}" | sed -n '1,200p' || true
+
       # ============================================================
       # (C) BADEXIT (signals 생성 후)
       # ============================================================
@@ -414,6 +418,9 @@ jobs:
           echo "[BADEXIT] TAG=${TAG}"
           echo "[BADEXIT] model_dir=${MODEL_DIR}"
 
+          echo "[DEBUG] pre-badexit signals tree:"
+          find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
+          
           SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"
           if [ ! -d "${SIGNALS_DIR}" ]; then
             echo "[ERROR] signals_dir missing: ${SIGNALS_DIR}"
