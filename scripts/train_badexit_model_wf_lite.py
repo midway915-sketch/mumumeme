@@ -8,9 +8,9 @@ Writes:
 - data/meta/train_badexit_report.json
 
 Assumes input dataset has:
-- Date, Ticker (Ticker optional)
-- features columns (SSOT feature_cols.json preferred; fallback numeric autodetect)
-- label column (default: y_badexit)
+- Date, Ticker
+- features columns (per SSOT feature_cols.json or DEFAULT_FEATURES fallback)
+- label column
 """
 from __future__ import annotations
 
@@ -37,44 +37,38 @@ def _norm_date(s: pd.Series) -> pd.Series:
 
 def _load_ssot_cols() -> list[str] | None:
     """
-    Supports these SSOT formats:
+    data/meta/feature_cols.json supports:
       - ["c1","c2",...]
       - {"feature_cols":[...]}
       - {"cols":[...]}
       - {"features":[...]}
-      - {"p_success_cols":[...]}  (fallback key)
+      - {"p_success_cols":[...]} (legacy)
     """
     p = META_DIR / "feature_cols.json"
     if not p.exists():
         return None
-
     try:
-        j = json.loads(p.read_text(encoding="utf-8"))
-
+        payload = json.loads(p.read_text(encoding="utf-8"))
         cols = None
-        if isinstance(j, list):
-            cols = j
-        elif isinstance(j, dict):
+        if isinstance(payload, list):
+            cols = payload
+        elif isinstance(payload, dict):
             for k in ("feature_cols", "cols", "features", "p_success_cols"):
-                v = j.get(k)
+                v = payload.get(k)
                 if isinstance(v, list) and v:
                     cols = v
                     break
-
         if isinstance(cols, list) and cols:
             out = [str(c).strip() for c in cols if str(c).strip()]
             return out if out else None
     except Exception:
         return None
-
     return None
 
 
 def _coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     out = df.copy()
     for c in cols:
-        if c not in out.columns:
-            continue
         out[c] = (
             pd.to_numeric(out[c], errors="coerce")
             .replace([np.inf, -np.inf], np.nan)
@@ -90,73 +84,20 @@ def _halfyear_key(d: pd.Timestamp) -> str:
     return f"{y}H{h}"
 
 
-def _detect_numeric_feature_cols(df: pd.DataFrame, label_col: str) -> list[str]:
-    drop = {
-        "Date",
-        "Ticker",
-        label_col,
-        # common scored/meta cols
-        "p_success",
-        "p_tail",
-        "p_badexit",
-        "tau_H",
-        "tau_class",
-    }
-
-    cand = [c for c in df.columns if c not in drop]
-    feat_cols: list[str] = []
-
-    # robust: "numeric dtype" OR "can be coerced to numeric with not-all-NaN"
-    for c in cand:
+def _infer_numeric_feature_cols(df: pd.DataFrame, drop: set[str]) -> list[str]:
+    """
+    ✅ dtype가 object여도 '숫자로 변환 가능'하면 feature로 인정한다.
+    """
+    cols = [c for c in df.columns if c not in drop]
+    out: list[str] = []
+    for c in cols:
         if pd.api.types.is_numeric_dtype(df[c]):
-            feat_cols.append(c)
+            out.append(c)
             continue
         s = pd.to_numeric(df[c], errors="coerce")
-        if s.notna().any():
-            feat_cols.append(c)
-
-    # keep stable ordering
-    return feat_cols
-
-
-def _fit_lr_safe(X: np.ndarray, y: np.ndarray) -> tuple[StandardScaler, LogisticRegression, dict]:
-    """
-    Fit StandardScaler + LogisticRegression safely even if y has 1 class.
-    If one-class: add 1 synthetic opposite sample with tiny weight.
-    """
-    info = {"n_classes": int(np.unique(y).size)}
-
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-
-    model = LogisticRegression(max_iter=200, solver="lbfgs")
-
-    uniq = np.unique(y)
-    if uniq.size >= 2:
-        model.fit(Xs, y)
-        return scaler, model, info
-
-    only = int(uniq[0])
-    opp = 1 - only
-
-    X_syn = X[:1].copy()
-    X_syn = X_syn + 1e-9  # tiny jitter to avoid exact duplicate
-    y_syn = np.array([opp], dtype=int)
-
-    X_aug = np.vstack([X, X_syn])
-    y_aug = np.concatenate([y, y_syn])
-
-    scaler2 = StandardScaler()
-    Xs_aug = scaler2.fit_transform(X_aug)
-
-    sw = np.ones(len(y_aug), dtype=float)
-    sw[-1] = 1e-6  # tiny weight on synthetic sample
-
-    model2 = LogisticRegression(max_iter=200, solver="lbfgs")
-    model2.fit(Xs_aug, y_aug, sample_weight=sw)
-
-    info.update({"one_class": True, "only": only, "synthetic_added": True, "synthetic_weight": float(sw[-1])})
-    return scaler2, model2, info
+        if np.isfinite(s.to_numpy(dtype=float, copy=False)).any():
+            out.append(c)
+    return out
 
 
 def main() -> None:
@@ -183,27 +124,28 @@ def main() -> None:
     df["Date"] = _norm_date(df["Date"])
     df = df.dropna(subset=["Date"]).reset_index(drop=True)
 
-    # 1) feature cols
-    ssot_cols = _load_ssot_cols()
-    if ssot_cols:
-        # keep only those present; if none present -> fallback
-        present = [c for c in ssot_cols if c in df.columns]
-        if present:
-            feat_cols = present
-        else:
-            feat_cols = _detect_numeric_feature_cols(df, args.label_col)
-    else:
-        feat_cols = _detect_numeric_feature_cols(df, args.label_col)
-
+    # features columns: SSOT 우선
+    feat_cols = _load_ssot_cols()
     if not feat_cols:
-        raise RuntimeError(f"no feature cols found. columns={list(df.columns)}")
+        drop = {"Date", "Ticker", args.label_col, "p_success", "p_tail", "p_badexit", "tau_H", "tau_class", "tau_pmax"}
+        feat_cols = _infer_numeric_feature_cols(df, drop)
+        if not feat_cols:
+            raise RuntimeError(f"no feature cols found. columns={list(df.columns)}")
+
+    # ensure present
+    missing = [c for c in feat_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"SSOT feature_cols missing in data: {missing[:30]}")
 
     df = _coerce_numeric(df, feat_cols)
-
     y = pd.to_numeric(df[args.label_col], errors="coerce").fillna(0).astype(int).clip(0, 1).to_numpy()
     X = df[feat_cols].to_numpy(dtype=float)
 
-    # 2) half-year walk-forward
+    # one-class safe handling for final model
+    classes = np.unique(y)
+    n_classes = int(len(classes))
+
+    # half-year walk-forward splits
     df["_hy"] = df["Date"].apply(_halfyear_key)
     hy_list = sorted(df["_hy"].unique())
 
@@ -221,25 +163,58 @@ def main() -> None:
         if tr_idx.size == 0 or va_idx.size == 0:
             continue
 
-        scaler, model, info = _fit_lr_safe(X[tr_idx], y[tr_idx])
+        # if training fold is one-class, skip fold
+        if len(np.unique(y[tr_idx])) < 2:
+            fold_logs.append({"val_halfyear": val_hy, "skipped": True, "reason": "one_class_train", "n_tr": int(tr_idx.size), "n_va": int(va_idx.size)})
+            continue
+
+        scaler = StandardScaler()
+        Xtr = scaler.fit_transform(X[tr_idx])
         Xva = scaler.transform(X[va_idx])
+
+        model = LogisticRegression(max_iter=200, solver="lbfgs")
+        model.fit(Xtr, y[tr_idx])
+
         pva = model.predict_proba(Xva)[:, 1]
         oof_pred[va_idx] = pva
 
-        ll = log_loss(y[va_idx], np.clip(pva, 1e-6, 1 - 1e-6), labels=[0, 1])
-        fold_logs.append(
-            {
-                "val_halfyear": val_hy,
-                "logloss": float(ll),
-                "n_tr": int(tr_idx.size),
-                "n_va": int(va_idx.size),
-                "train_fit_info": info,
-            }
-        )
-        print(f"[INFO] val={val_hy} logloss={ll:.6f} n_tr={tr_idx.size} n_va={va_idx.size} info={info}")
+        # log_loss는 y_val이 one-class면 에러날 수 있으니 보호
+        if len(np.unique(y[va_idx])) >= 2:
+            ll = log_loss(y[va_idx], np.clip(pva, 1e-6, 1 - 1e-6))
+            fold_logs.append({"val_halfyear": val_hy, "logloss": float(ll), "n_tr": int(tr_idx.size), "n_va": int(va_idx.size)})
+            print(f"[INFO] val={val_hy} logloss={ll:.6f} n_tr={tr_idx.size} n_va={va_idx.size}")
+        else:
+            fold_logs.append({"val_halfyear": val_hy, "skipped": True, "reason": "one_class_val", "n_tr": int(tr_idx.size), "n_va": int(va_idx.size)})
+            print(f"[INFO] val={val_hy} skipped logloss (one_class_val) n_tr={tr_idx.size} n_va={va_idx.size}")
 
-    # 3) final fit (all data)
-    final_scaler, final_model, final_info = _fit_lr_safe(X, y)
+    # final train on all data (production scoring)
+    final_scaler = StandardScaler()
+    Xs = final_scaler.fit_transform(X)
+
+    final_model = LogisticRegression(max_iter=200, solver="lbfgs")
+
+    sample_weight = None
+    if n_classes < 2:
+        # append 1 synthetic opposite sample with tiny weight
+        only = int(classes[0])
+        opp = 1 - only
+        X_syn = Xs[0:1].copy()
+        X_syn = X_syn + 1e-9  # tiny noise
+        y_syn = np.array([opp], dtype=int)
+
+        Xs2 = np.vstack([Xs, X_syn])
+        y2 = np.concatenate([y, y_syn])
+
+        w = np.ones(len(y2), dtype=float)
+        w[-1] = 1e-6  # tiny weight for synthetic row
+        sample_weight = w
+
+        print(f"[BADEXIT] n_classes=1 -> train safe LR with 1 synthetic opposite sample (tiny weight)")
+        final_model.fit(Xs2, y2, sample_weight=sample_weight)
+        n_pos = int(y.sum())
+    else:
+        final_model.fit(Xs, y)
+        n_pos = int(y.sum())
 
     APP_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
@@ -251,13 +226,12 @@ def main() -> None:
         "label_col": args.label_col,
         "feature_cols": feat_cols,
         "splits": "half-year walk-forward",
-        "min_train_halfyears": int(args.min_train_halfyears),
         "folds": fold_logs,
         "oof_coverage": float(np.isfinite(oof_pred).mean()),
         "n_rows": int(len(df)),
-        "n_pos": int(y.sum()),
-        "final_fit_info": final_info,
-        "ssot_loaded": bool(ssot_cols),
+        "n_pos": int(n_pos),
+        "n_classes": int(n_classes),
+        "one_class_safe_train": bool(n_classes < 2),
     }
     Path(args.out_report).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
