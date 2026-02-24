@@ -218,7 +218,7 @@ jobs:
           # 1) features
           python scripts/build_features.py
 
-          python scripts/build_badexit_labels.py --tag "${TAG}"
+        
           python scripts/build_tau_labels.py --tag "${TAG}"
 
           # 2) labels
