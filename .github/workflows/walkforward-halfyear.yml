@@ -417,6 +417,7 @@ jobs:
           echo "[BADEXIT] model_dir=${MODEL_DIR}"
 
           SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"
+          export SIGNALS_DIR
 
           echo "[DEBUG] pre-badexit signals tree:"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
@@ -433,6 +434,27 @@ jobs:
           echo "[DEBUG] trades files:"
           find "${SIGNALS_DIR}" -maxdepth 3 -type f -name 'sim_engine_trades_*.parquet' -print | sed -n '1,200p' || true
           find "${SIGNALS_DIR}" -maxdepth 3 -type f -name 'sim_engine_trades_*.csv' -print | sed -n '1,200p' || true
+
+          # ============================================================
+          # ✅ CHECK LOG (1): 어떤 trades 파일들이 있는지/몇 개인지 확인
+          #  - badexit 0 문제의 1차 분기: "재료(trades)가 있나? 무엇을 읽게 될까?"
+          # ============================================================
+          python - <<'PY'
+          import glob, os
+          d = os.environ.get("SIGNALS_DIR", "")
+          if not d:
+              raise SystemExit("[CHECK] SIGNALS_DIR env missing")
+          ps = sorted(glob.glob(os.path.join(d, "sim_engine_trades_*.parquet")))
+          cs = sorted(glob.glob(os.path.join(d, "sim_engine_trades_*.csv")))
+          print(f"[CHECK] SIGNALS_DIR={d}")
+          print(f"[CHECK] trades parquet count={len(ps)}")
+          print(f"[CHECK] trades csv count={len(cs)}")
+          # show a few examples (head)
+          for p in ps[:5]:
+              print(" -", p)
+          for c in cs[:5]:
+              print(" -", c)
+          PY
 
           EX_TAG="$(python - <<'PY'
           import os
@@ -532,11 +554,8 @@ jobs:
           ls -la "${MODEL_DIR}" | sed -n '1,200p'
           test -f "${MODEL_DIR}/badexit_model.pkl"
           test -f "${MODEL_DIR}/badexit_scaler.pkl"
-
       # ============================================================
       # (D) WALKFORWARD #2 (after badexit is staged)
-      #  - assumes run_walkforward_halfyear.sh will re-score features
-      #    using MODEL_DIR that now contains badexit_model.pkl
       # ============================================================
       - name: Walkforward run #2 (with badexit)
         env:
@@ -620,11 +639,14 @@ jobs:
 
             if [ -f "${dir}/features_scored.parquet" ]; then
               echo "[INFO] convert parquet -> csv: ${dir}/features_scored.parquet"
-              python - <<PY
+              DIR="${dir}" python - <<'PY'
+          import os
           import pandas as pd
-          df = pd.read_parquet("${dir}/features_scored.parquet")
-          df.to_csv("${dir}/features_scored.csv", index=False)
-          print("[DONE] wrote ${dir}/features_scored.csv rows=", len(df))
+
+          d = os.environ["DIR"]
+          df = pd.read_parquet(f"{d}/features_scored.parquet")
+          df.to_csv(f"{d}/features_scored.csv", index=False)
+          print("[DONE] wrote", f"{d}/features_scored.csv", "rows=", len(df))
           PY
             else
               echo "[WARN] no features_scored.(csv|parquet) in ${dir}"
@@ -687,13 +709,13 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install -U pandas pyarrow
 
-      - name: Download all walkforward artifacts
+      - name: Download all walkforward artifacts (#1)
         uses: actions/download-artifact@v4
         with:
           pattern: walkforward_*
           path: _wf_artifacts
 
-      - name: Rebuild expected folder structure
+      - name: Rebuild expected folder structure (#1)
         shell: bash
         run: |
           set -euo pipefail
