@@ -528,7 +528,7 @@ jobs:
           test -f "${MODEL_DIR}/badexit_model.pkl"
           test -f "${MODEL_DIR}/badexit_scaler.pkl"
 
-          BADLBL: ${{ '' }}
+          export BADLBL="${badlbl}"
 
       - name: Upload artifacts (this half-year)
         uses: actions/upload-artifact@v4
