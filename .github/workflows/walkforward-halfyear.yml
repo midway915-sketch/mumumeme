@@ -285,6 +285,86 @@ jobs:
           print("[CUT] labels_model rows=", len(lm_cut))
           PY
 
+          # ============================================================
+          # ✅ CHECK (GATE / TAIL / TAU): rows + label distribution
+          #  - "반기별 학습 샘플 충분?" 바로 보는 핵심 로그
+          # ============================================================
+          TAG="${TAG}" python - <<'PY'
+          import os, glob
+          from pathlib import Path
+          import pandas as pd
+
+          TAG = os.environ["TAG"]
+
+          def read_any(p):
+            p = Path(p)
+            if not p.exists():
+              return None
+            if p.suffix == ".parquet":
+              return pd.read_parquet(p)
+            return pd.read_csv(p)
+
+          def pick(globs):
+            out=[]
+            for g in globs:
+              out += glob.glob(g)
+            out = sorted(set(out))
+            return out[0] if out else ""
+
+          def summarize(df, label_candidates, name):
+            if df is None:
+              print(f"[CHK-MDL] {name}: MISSING")
+              return
+            cols = list(df.columns)
+            lab = None
+            for c in label_candidates:
+              if c in cols:
+                lab = c
+                break
+            print(f"[CHK-MDL] {name}: rows={len(df)} cols={len(cols)} label_col={lab}")
+            if lab is not None:
+              vc = df[lab].value_counts(dropna=False)
+              print(f"[CHK-MDL] {name}: value_counts({lab}) top:")
+              print(vc.head(10).to_string())
+              # positive rate only if binary-ish
+              try:
+                s = pd.to_numeric(df[lab], errors="coerce")
+                if s.notna().all():
+                  u = sorted(s.unique().tolist())
+                  if set(u).issubset({0,1}):
+                    print(f"[CHK-MDL] {name}: pos_rate={float(s.mean()):.6f}")
+              except Exception:
+                pass
+
+          # Gate labels (tagged)
+          gate_path = pick([
+            f"data/labels/labels_model_{TAG}.parquet",
+            f"data/labels/labels_model_{TAG}.csv",
+          ])
+          gate = read_any(gate_path) if gate_path else None
+          summarize(gate, ["y", "Y", "label", "target", "p_success", "p", "success", "y_success"], f"GATE labels ({gate_path or 'missing'})")
+
+          # Tail labels (best-effort: script-dependent naming)
+          tail_path = pick([
+            "data/labels/*tail*labels*.parquet",
+            "data/labels/*tail*labels*.csv",
+            "data/labels/labels_tail*.parquet",
+            "data/labels/labels_tail*.csv",
+          ])
+          tail = read_any(tail_path) if tail_path else None
+          summarize(tail, ["y_tail", "tail", "label", "target", "p_tail"], f"TAIL labels ({tail_path or 'missing'})")
+
+          # Tau labels (tagged, best-effort)
+          tau_path = pick([
+            f"data/labels/*tau*{TAG}*.parquet",
+            f"data/labels/*tau*{TAG}*.csv",
+            "data/labels/*tau*labels*.parquet",
+            "data/labels/*tau*labels*.csv",
+          ])
+          tau = read_any(tau_path) if tau_path else None
+          summarize(tau, ["y_tau", "tau", "label", "target", "H", "tau_h"], f"TAU labels ({tau_path or 'missing'})")
+          PY
+
           echo "[TRAIN] python scripts/train_model.py --tag ${TAG}"
           python scripts/train_model.py --tag "${TAG}"
 
@@ -419,79 +499,11 @@ jobs:
           SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"
           export SIGNALS_DIR
 
-          echo "[DEBUG] pre-badexit signals tree:"
-          find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
-
           if [ ! -d "${SIGNALS_DIR}" ]; then
             echo "[ERROR] signals_dir missing: ${SIGNALS_DIR}"
             find data/signals -maxdepth 4 -type d | sed -n '1,200p' || true
             exit 1
           fi
-
-          echo "[BADEXIT] using signals_dir=${SIGNALS_DIR}"
-          ls -la "${SIGNALS_DIR}" | sed -n '1,200p' || true
-
-          echo "[DEBUG] trades files:"
-          find "${SIGNALS_DIR}" -maxdepth 3 -type f -name 'sim_engine_trades_*.parquet' -print | sed -n '1,200p' || true
-          find "${SIGNALS_DIR}" -maxdepth 3 -type f -name 'sim_engine_trades_*.csv' -print | sed -n '1,200p' || true
-
-          # ============================================================
-          # ✅ CHECK LOG (1): 어떤 trades 파일들이 있는지/몇 개인지 확인
-          # ============================================================
-          python - <<'PY'
-          import glob, os
-          d = os.environ.get("SIGNALS_DIR", "")
-          if not d:
-              raise SystemExit("[CHECK] SIGNALS_DIR env missing")
-          ps = sorted(glob.glob(os.path.join(d, "sim_engine_trades_*.parquet")))
-          cs = sorted(glob.glob(os.path.join(d, "sim_engine_trades_*.csv")))
-          print(f"[CHECK] SIGNALS_DIR={d}")
-          print(f"[CHECK] trades parquet count={len(ps)}")
-          print(f"[CHECK] trades csv count={len(cs)}")
-          for p in ps[:5]:
-              print(" -", p)
-          for c in cs[:5]:
-              print(" -", c)
-          PY
-
-          # ============================================================
-          # ✅ CHECK LOG (1b): trades 파일별 row 수 + 총합
-          #  - badexit labels rows가 너무 작을 때(예: 11) 원인 빠르게 잡는 용도
-          # ============================================================
-          python - <<'PY'
-          import glob, os
-          import pandas as pd
-
-          d = os.environ.get("SIGNALS_DIR", "")
-          if not d:
-              raise SystemExit("[CHECK-1B] SIGNALS_DIR env missing")
-
-          paths = sorted(glob.glob(os.path.join(d, "sim_engine_trades_*.parquet"))) + \
-                  sorted(glob.glob(os.path.join(d, "sim_engine_trades_*.csv")))
-
-          print(f"[CHECK-1B] SIGNALS_DIR={d}")
-          print(f"[CHECK-1B] trades total files={len(paths)}")
-
-          total = 0
-          shown = 0
-          for p in paths:
-              try:
-                  if p.endswith(".parquet"):
-                      df = pd.read_parquet(p)
-                  else:
-                      df = pd.read_csv(p)
-                  n = len(df)
-              except Exception as e:
-                  print(f"[CHECK-1B] FAIL read: {p} err={e}")
-                  continue
-
-              total += n
-              if shown < 12:
-                  print(f"[CHECK-1B] rows={n} file={p}")
-                  shown += 1
-
-          print(f"[CHECK-1B] trades rows total={total}")
-          PY
 
           EX_TAG="$(python - <<'PY'
           import os
@@ -504,8 +516,56 @@ jobs:
           print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
           PY
           )"
-          echo "[BADEXIT] expected trades tag(EX_TAG)=${EX_TAG}"
+          echo "[INFO] EX_TAG=${EX_TAG}"
 
+          # ============================================================
+          # ✅ CHECK-1C: EX_TAG prefix로 "실제로 badexit가 읽을 trades 세트"만 집계
+          # ============================================================
+          EX_TAG="${EX_TAG}" python - <<'PY'
+          import os, glob
+          import pandas as pd
+
+          d = os.environ.get("SIGNALS_DIR", "")
+          ex = os.environ.get("EX_TAG", "")
+          if not d:
+              raise SystemExit("[CHECK-1C] SIGNALS_DIR env missing")
+          if not ex:
+              raise SystemExit("[CHECK-1C] EX_TAG env missing")
+
+          pats = [
+              os.path.join(d, f"sim_engine_trades_{ex}__*.parquet"),
+              os.path.join(d, f"sim_engine_trades_{ex}__*.csv"),
+          ]
+          files=[]
+          for p in pats:
+              files += glob.glob(p)
+          files = sorted(set(files))
+
+          print(f"[CHECK-1C] SIGNALS_DIR={d}")
+          print(f"[CHECK-1C] EX_TAG={ex}")
+          print(f"[CHECK-1C] matched files={len(files)}")
+
+          total=0
+          shown=0
+          for f in files:
+              try:
+                  if f.endswith(".parquet"):
+                      df = pd.read_parquet(f)
+                  else:
+                      df = pd.read_csv(f)
+                  n = len(df)
+              except Exception as e:
+                  print(f"[CHECK-1C] read_fail file={f} err={e}")
+                  continue
+              total += n
+              if shown < 18:
+                  print(f"[CHECK-1C] rows={n} file={f}")
+                  shown += 1
+          print(f"[CHECK-1C] matched rows total={total}")
+          PY
+
+          # (compat copies) wf_* 파일들을 EX_TAG prefix 형태로 복사해서
+          # build_badexit_labels.py가 어떤 패턴을 쓰든 "읽을 재료"가 생기게 함
           shopt -s nullglob
           made=0
           for f in "${SIGNALS_DIR}"/sim_engine_trades_*.csv "${SIGNALS_DIR}"/sim_engine_trades_*.parquet; do
@@ -517,53 +577,6 @@ jobs:
             fi
           done
           echo "[BADEXIT] compatibility copies made: ${made}"
-
-          # ============================================================
-          # ✅ CHECK LOG (1C): EX_TAG 패턴으로 "실제로 읽힐 후보"가 몇 개인지/rows 합이 얼마인지
-          #  - labels rows(27)가 왜 그렇게 작은지 1차로 갈라냄
-          # ============================================================
-          EX_TAG="${EX_TAG}" python - <<'PY'
-          import glob, os
-          import pandas as pd
-          
-          d = os.environ.get("SIGNALS_DIR", "")
-          ex = os.environ.get("EX_TAG", "")
-          if not d:
-              raise SystemExit("[CHECK-1C] SIGNALS_DIR env missing")
-          if not ex:
-              raise SystemExit("[CHECK-1C] EX_TAG env missing")
-          
-          pats = [
-              os.path.join(d, f"sim_engine_trades_{ex}__*.parquet"),
-              os.path.join(d, f"sim_engine_trades_{ex}__*.csv"),
-              os.path.join(d, f"sim_engine_trades_{ex}*.parquet"),
-              os.path.join(d, f"sim_engine_trades_{ex}*.csv"),
-          ]
-          paths = []
-          for pat in pats:
-              paths += glob.glob(pat)
-          paths = sorted(set(paths))
-          
-          print(f"[CHECK-1C] SIGNALS_DIR={d}")
-          print(f"[CHECK-1C] EX_TAG={ex}")
-          print(f"[CHECK-1C] matched files={len(paths)}")
-          
-          total = 0
-          shown = 0
-          for p in paths:
-              try:
-                  df = pd.read_parquet(p) if p.endswith(".parquet") else pd.read_csv(p)
-                  n = len(df)
-              except Exception as e:
-                  print(f"[CHECK-1C] FAIL read: {p} err={e}")
-                  continue
-              total += n
-              if shown < 20:
-                  print(f"[CHECK-1C] rows={n} file={p}")
-                  shown += 1
-          
-          print(f"[CHECK-1C] matched rows total={total}")
-          PY
 
           python scripts/build_badexit_labels.py \
             --profit-target "${PROFIT_TARGET}" \
@@ -623,8 +636,7 @@ jobs:
           echo "[BADEXIT] detected label_col=${LABEL_COL}"
 
           # ============================================================
-          # ✅ CHECK LOG (2): labels rows/cols + 라벨 분포(0/1) 확인
-          #  - "badexit 0 문제"를 확실히 갈라내는 로그
+          # ✅ CHECK-2B: badexit labels 분포(양성 0/붕괴) 확인
           # ============================================================
           BADLBL="${badlbl}" LABEL_COL="${LABEL_COL}" python - <<'PY'
           import os
@@ -632,58 +644,25 @@ jobs:
           from pathlib import Path
 
           p = Path(os.environ["BADLBL"])
-          label_col = os.environ["LABEL_COL"]
-
+          lab = os.environ["LABEL_COL"]
           df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
-          print(f"[CHECK-2] labels_path={p}")
-          print(f"[CHECK-2] rows={len(df)} cols={df.shape[1]}")
 
-          if label_col not in df.columns:
-              print(f"[CHECK-2] ERROR label_col missing: {label_col}")
-              print("[CHECK-2] columns=", list(df.columns))
-              raise SystemExit(1)
-
-          y = df[label_col]
-          print(f"[CHECK-2] label_col={label_col} dtype={y.dtype}")
-          vc = y.value_counts(dropna=False)
-          print("[CHECK-2] value_counts:")
-          print(vc.to_string())
-          try:
-              mean = float(pd.to_numeric(y, errors="coerce").mean())
-              print(f"[CHECK-2] mean={mean:.6f}  (if 0/1 -> positive rate)")
-          except Exception as e:
-              print(f"[CHECK-2] mean calc failed: {e}")
-          PY
-
-          # ============================================================
-          # ✅ CHECK LOG (2B): labels(27 rows)가 무엇으로 집계된 건지 확인
-          #  - ticker/date/entry_id 같은 키들의 nunique를 찍어서 "왜 27이냐" 확정
-          # ============================================================
-          BADLBL="${badlbl}" python - <<'PY'
-          import os
-          import pandas as pd
-          from pathlib import Path
-          
-          p = Path(os.environ["BADLBL"])
-          df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
-          
           print(f"[CHECK-2B] labels_path={p}")
           print(f"[CHECK-2B] rows={len(df)} cols={len(df.columns)}")
-          print("[CHECK-2B] columns head:", df.columns.tolist()[:30])
-          
-          # 흔히 있을 법한 키 후보들 nunique 확인
-          cands = ["Ticker","ticker","Symbol","symbol","Date","date","EntryDate","ExitDate","entry_date","exit_date","TradeID","trade_id","id"]
-          for c in cands:
-              if c in df.columns:
-                  print(f"[CHECK-2B] nunique({c})={df[c].nunique(dropna=True)}")
-          
-          # BadExit가 있으면 분포
-          for c in ["BadExit","badexit","y_badexit","is_badexit"]:
-              if c in df.columns:
-                  print("[CHECK-2B] value_counts for", c)
-                  print(df[c].value_counts(dropna=False).to_string())
-                  break
-          
+          print(f"[CHECK-2B] columns head: {list(df.columns)[:30]}")
+          if "Ticker" in df.columns:
+              print(f"[CHECK-2B] nunique(Ticker)={df['Ticker'].nunique()}")
+          if "Date" in df.columns:
+              print(f"[CHECK-2B] nunique(Date)={df['Date'].nunique()}")
+          print(f"[CHECK-2B] value_counts for {lab}")
+          vc = df[lab].value_counts(dropna=False)
+          print(vc.to_string())
+          try:
+              s = pd.to_numeric(df[lab], errors="coerce")
+              if s.notna().all() and set(s.unique()).issubset({0,1}):
+                  print(f"[CHECK-2B] pos_rate={float(s.mean()):.6f}")
+          except Exception:
+              pass
           print("[CHECK-2B] head:")
           print(df.head(5).to_string(index=False))
           PY
