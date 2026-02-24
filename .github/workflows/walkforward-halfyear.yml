@@ -436,20 +436,18 @@ jobs:
           find "${SIGNALS_DIR}" -maxdepth 3 -type f -name 'sim_engine_trades_*.csv' -print | sed -n '1,200p' || true
 
           # ============================================================
-          # ✅ CHECK LOG (1): 어떤 trades 파일들이 있는지/몇 개인지 확인
-          #  - badexit 0 문제의 1차 분기: "재료(trades)가 있나? 무엇을 읽게 될까?"
+          # ✅ CHECK LOG (1): trades 존재/개수/예시
           # ============================================================
           python - <<'PY'
           import glob, os
           d = os.environ.get("SIGNALS_DIR", "")
           if not d:
-              raise SystemExit("[CHECK] SIGNALS_DIR env missing")
+              raise SystemExit("[CHECK-1] SIGNALS_DIR env missing")
           ps = sorted(glob.glob(os.path.join(d, "sim_engine_trades_*.parquet")))
           cs = sorted(glob.glob(os.path.join(d, "sim_engine_trades_*.csv")))
-          print(f"[CHECK] SIGNALS_DIR={d}")
-          print(f"[CHECK] trades parquet count={len(ps)}")
-          print(f"[CHECK] trades csv count={len(cs)}")
-          # show a few examples (head)
+          print(f"[CHECK-1] SIGNALS_DIR={d}")
+          print(f"[CHECK-1] trades parquet count={len(ps)}")
+          print(f"[CHECK-1] trades csv count={len(cs)}")
           for p in ps[:5]:
               print(" -", p)
           for c in cs[:5]:
@@ -503,8 +501,57 @@ jobs:
             exit 1
           fi
           echo "[BADEXIT] labels=${badlbl}"
+          export BADLBL="${badlbl}"
 
-          LABEL_COL="$(BADLBL="${badlbl}" python - <<'PY'
+          # ============================================================
+          # ✅ CHECK LOG (2): 라벨 분포(0/1) 확인 → "badexit 0 문제" 바로 판정
+          # ============================================================
+          python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+
+          p = Path(os.environ["BADLBL"])
+          df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
+
+          cols = list(df.columns)
+          candidates = ["y_badexit", "BadExit", "badexit", "is_badexit", "label", "target"]
+          label_col = None
+          for c in candidates:
+              if c in cols:
+                  label_col = c
+                  break
+
+          print(f"[CHECK-2] labels_path={p}")
+          print(f"[CHECK-2] rows={len(df)} cols={len(cols)}")
+          if label_col is None:
+              print("[CHECK-2] label_col=__MISSING__")
+              print("[CHECK-2] columns:", cols)
+              raise SystemExit(0)
+
+          s = df[label_col]
+          # coerce to numeric if possible
+          s_num = pd.to_numeric(s, errors="coerce")
+          if s_num.notna().mean() > 0.9:
+              s_use = s_num
+          else:
+              s_use = s
+
+          print(f"[CHECK-2] label_col={label_col} dtype={s_use.dtype}")
+          try:
+              vc = s_use.value_counts(dropna=False)
+              print("[CHECK-2] value_counts:")
+              print(vc.to_string())
+          except Exception as e:
+              print("[CHECK-2] value_counts failed:", repr(e))
+
+          # if numeric 0/1, show mean
+          if pd.api.types.is_numeric_dtype(s_use):
+              m = float(s_use.mean(skipna=True))
+              print(f"[CHECK-2] mean={m:.6f}  (if 0/1 -> positive rate)")
+          PY
+
+          LABEL_COL="$(python - <<'PY'
           import os
           import pandas as pd
           from pathlib import Path
@@ -554,6 +601,7 @@ jobs:
           ls -la "${MODEL_DIR}" | sed -n '1,200p'
           test -f "${MODEL_DIR}/badexit_model.pkl"
           test -f "${MODEL_DIR}/badexit_scaler.pkl"
+
       # ============================================================
       # (D) WALKFORWARD #2 (after badexit is staged)
       # ============================================================
