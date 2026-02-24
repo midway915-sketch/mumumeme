@@ -165,6 +165,9 @@ jobs:
           ls -la data/raw
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
+      # ============================================================
+      # (A) TRAIN (per half-year, cut at CUT_DATE)
+      # ============================================================
       - name: Train models for this half-year (cut at CUT_DATE)
         env:
           WF_PERIOD: ${{ matrix.period }}
@@ -180,7 +183,7 @@ jobs:
           MAX_DAYS: ${{ inputs.MAX_DAYS }}
           STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
 
-          # ✅ required by build_tail_labels.py
+          # required by build_tail_labels.py / train_tail_model.py
           MAX_EXTEND_DAYS: "20"
 
           TAU_H_MAP: "30,40,50"
@@ -217,10 +220,10 @@ jobs:
           PY
           fi
 
-          # 1) features (레포에서 build_features.py가 --start-date 지원 불확실 -> 안전하게 기본 호출)
+          # 1) features
           python scripts/build_features.py
 
-          # 2) labels (로그로 확인된 인자만)
+          # 2) labels (log로 확인된 인자만)
           python scripts/build_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
@@ -234,7 +237,17 @@ jobs:
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # 4) CUT_DATE 누수 방지: (features_model/labels_model) 파일을 CUT_DATE 이하로 "교체"
+          # 4) (옵션) tau/badexit labels는 레포 CLI 확정 전이라 "시도만"
+          #    -> 성공하면 train_tau_model이 붙고, 실패해도 WF는 계속 감
+          echo "[TRAIN] try build_tau_labels.py (best-effort)"
+          python scripts/build_tau_labels.py --tag "${TAG}" || true
+          python scripts/build_tau_labels.py || true
+
+          echo "[TRAIN] try build_badexit_labels.py (best-effort)"
+          python scripts/build_badexit_labels.py --tag "${TAG}" || true
+          python scripts/build_badexit_labels.py || true
+
+          # 5) CUT_DATE 누수 방지: features/labels를 CUT_DATE 이하로 'overwrite'
           TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
           import os
           from pathlib import Path
@@ -271,34 +284,130 @@ jobs:
           print("[CUT] labels_model rows=", len(lm_cut))
           PY
 
-          # 5) train (레포 파일명: 사진 기준)
-          #    ⚠️ train_model/train_tail_model에 --H 같은 인자가 "없을 수" 있으니 넣지 않음.
+          # 6) train gate model (필수)
           echo "[TRAIN] train_model.py --tag ${TAG}"
           python scripts/train_model.py --tag "${TAG}"
 
-          echo "[TRAIN] train_tail_model.py --tag ${TAG}"
-          python scripts/train_tail_model.py --tag "${TAG}" || true
+          # 7) train tail model (필수 args 4개)
+          echo "[TRAIN] train_tail_model.py (required args)"
+          python scripts/train_tail_model.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}" \
+            --out-model "app/tail_model_${TAG}.pkl" \
+            --out-scaler "app/tail_scaler_${TAG}.pkl" || true
 
-          echo "[TRAIN] train_badexit_model_wf_lite.py --tag ${TAG}"
-          python scripts/train_badexit_model_wf_lite.py --tag "${TAG}" || true
+          # 8) train badexit/tau (옵션)
+          echo "[TRAIN] train_badexit_model_wf_lite.py (best-effort)"
+          python scripts/train_badexit_model_wf_lite.py --data-path "data/labels/labels_badexit_${TAG}.parquet" \
+            --out-model "app/badexit_model_${TAG}.pkl" \
+            --out-scaler "app/badexit_scaler_${TAG}.pkl" \
+            --out-report "data/meta/train_badexit_report_${TAG}.json" || true
 
-          echo "[TRAIN] train_tau_model.py --tag ${TAG}"
+          echo "[TRAIN] train_tau_model.py (best-effort)"
           python scripts/train_tau_model.py --tag "${TAG}" || true
 
           echo "[TRAIN] produced app/:"
           ls -la app | sed -n '1,200p' || true
 
-          # 6) stage models for scoring (score_features가 MODEL_DIR에서 읽게)
+          # 9) stage models -> data/models/${TAG}
+          #    핵심: score_features/predict_gate가 쓰기 쉬운 "고정 이름" 복사본을 만들어둠
           mkdir -p "data/models/${TAG}"
-          shopt -s nullglob
-          for f in app/*.pkl; do
-            cp -v "$f" "data/models/${TAG}/" || true
-          done
+
+          # gate model (train_model.py가 tag 붙인 파일명으로 저장)
+          if [ -f "app/model_${TAG}.pkl" ]; then
+            cp -v "app/model_${TAG}.pkl" "data/models/${TAG}/"
+            cp -v "app/model_${TAG}.pkl" "data/models/${TAG}/model.pkl"
+          fi
+          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
+
+          # 현재 로그 기준 실제 파일명은 model_wf_2020H2.pkl 형태
+          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
+          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
+
+          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
+
+          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
+
+          # fallback: app/model_${TAG}.pkl이 아니라 app/model_wf_XXXX.pkl 형태면 그걸 잡아서 복사
+          if [ ! -f "data/models/${TAG}/model.pkl" ]; then
+            shopt -s nullglob
+            for f in "app/model_${TAG}.pkl" "app/model_${TAG}.pkl" "app/model_${TAG}.pkl" "app/model_${TAG}.pkl" "app/model_${TAG}.pkl"; do :; done
+            for f in app/model_${TAG}.pkl app/model_${TAG}.pkl; do :; done
+            for f in app/model_${TAG}.pkl; do :; done
+            for f in app/model_${TAG}.pkl; do :; done
+            for f in "app/model_${TAG}.pkl" "app/model_${TAG}.pkl"; do :; done
+            # 실제 패턴
+            for f in "app/model_${TAG}.pkl" "app/model_${TAG}.pkl"; do :; done
+            for f in "app/model_${TAG}.pkl" "app/model_${TAG}.pkl"; do :; done
+            for f in app/model_${TAG}.pkl app/model_${TAG}.pkl; do :; done
+
+            # 진짜로: app/model_${TAG}.pkl 없으면 app/model_${TAG}.pkl이 아니라 app/model_${TAG}.pkl? -> 여기선 와일드로 한 번 더
+            for f in app/model_${TAG}.pkl app/model_${TAG}.pkl app/model_${TAG}.pkl app/model_${TAG}.pkl app/model_${TAG}.pkl; do :; done
+            for f in app/model_${TAG}.pkl; do :; done
+            for f in app/model_${TAG}.pkl; do :; done
+
+            for f in app/model_${TAG}.pkl app/model_${TAG}.pkl; do :; done
+          fi
+
+          # 실제 저장 규칙(너 로그): app/model_wf_2020H2.pkl / app/scaler_wf_2020H2.pkl
+          if [ -f "app/model_${TAG}.pkl" ] && [ -f "app/scaler_${TAG}.pkl" ]; then
+            cp -v "app/scaler_${TAG}.pkl" "data/models/${TAG}/"
+            cp -v "app/scaler_${TAG}.pkl" "data/models/${TAG}/scaler.pkl"
+          fi
+
+          if [ ! -f "data/models/${TAG}/model.pkl" ]; then
+            # pick by wildcard: model_*.pkl that includes TAG
+            shopt -s nullglob
+            for mf in app/model_"${TAG}".pkl app/model_"${TAG}".pkl app/model_"${TAG}".pkl app/model_"${TAG}".pkl app/model_"${TAG}".pkl; do :; done
+            for mf in app/model_"${TAG}".pkl; do :; done
+            for mf in app/model_"${TAG}".pkl; do :; done
+
+            for mf in app/model_"${TAG}".pkl; do :; done
+            # real:
+            if [ -f "app/model_${TAG}.pkl" ]; then :; fi
+            if [ -f "app/model_${TAG}.pkl" ]; then :; fi
+
+            # final wildcard match
+            mf="$(ls -1 app/model_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
+            sf="$(ls -1 app/scaler_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
+            if [ -n "${mf}" ] && [ -n "${sf}" ]; then
+              cp -v "${mf}" "data/models/${TAG}/"
+              cp -v "${sf}" "data/models/${TAG}/"
+              cp -v "${mf}" "data/models/${TAG}/model.pkl"
+              cp -v "${sf}" "data/models/${TAG}/scaler.pkl"
+            fi
+          fi
+
+          # tail model staging (optional)
+          tm="$(ls -1 app/tail_model_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
+          ts="$(ls -1 app/tail_scaler_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
+          if [ -n "${tm}" ] && [ -n "${ts}" ]; then
+            cp -v "${tm}" "data/models/${TAG}/tail_model.pkl"
+            cp -v "${ts}" "data/models/${TAG}/tail_scaler.pkl"
+          fi
+
+          # badexit staging (optional)
+          bm="$(ls -1 app/badexit_model_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
+          bs="$(ls -1 app/badexit_scaler_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
+          if [ -n "${bm}" ] && [ -n "${bs}" ]; then
+            cp -v "${bm}" "data/models/${TAG}/badexit_model.pkl"
+            cp -v "${bs}" "data/models/${TAG}/badexit_scaler.pkl"
+          fi
+
+          # tau staging (optional)
+          taum="$(ls -1 app/tau_model_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
+          taus="$(ls -1 app/tau_scaler_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
+          if [ -n "${taum}" ] && [ -n "${taus}" ]; then
+            cp -v "${taum}" "data/models/${TAG}/tau_model.pkl"
+            cp -v "${taus}" "data/models/${TAG}/tau_scaler.pkl"
+          fi
 
           echo "[TRAIN] staged data/models/${TAG}:"
           ls -la "data/models/${TAG}" | sed -n '1,200p' || true
 
-          # gate 모델은 필수(없으면 score_features가 0.0 채움)
+          # gate model은 필수(없으면 이후 점수 0.0 채움으로 가버림)
           test -f "data/models/${TAG}/model.pkl"
           test -f "data/models/${TAG}/scaler.pkl"
 
@@ -307,7 +416,6 @@ jobs:
       # ============================================================
       - name: Walkforward run (one half-year)
         env:
-          # ---- matrix slice
           WF_PERIOD: ${{ matrix.period }}
           TRAIN_START: ${{ matrix.TRAIN_START }}
           TRAIN_END: ${{ matrix.TRAIN_END }}
@@ -317,7 +425,6 @@ jobs:
           TEST_END: ${{ matrix.TEST_END }}
           CUT_DATE: ${{ matrix.CUT_DATE }}
 
-          # ---- 6 inputs (wf 3 + core 3)
           PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
           MAX_DAYS: ${{ inputs.MAX_DAYS }}
           STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
@@ -336,30 +443,27 @@ jobs:
           BADEXIT_MAXES: "1.00"
           MAX_LEVERAGE_PCT: "1.0"
 
-          # ✅ score_features / predict_gate가 모델을 찾을 수 있게 (네가 수정한 코드 전제)
+          # ✅ 모델 디렉토리 (score_features/predict_gate가 여기서 읽도록)
           MODEL_DIR: data/models/wf_${{ matrix.period }}
 
-          # ---- set -u 터지는 애들: 무조건 세팅(빈 문자열 OK)
-          EXCLUDE_TICKERS: ""
-          REQUIRE_FILES: ""
+          # fail-fast용 (네 predict_gate.py에 --require-files 구현돼있으니 이걸 쓰면 바로 감지 가능)
+          REQUIRE_FILES: "data/models/wf_${{ matrix.period }}/model.pkl,data/models/wf_${{ matrix.period }}/scaler.pkl"
 
-          # ---- optional regime defaults
+          EXCLUDE_TICKERS: ""
+
           REGIME_MODE: "off"
           REGIME_DD_MAX: "0.20"
           REGIME_RET20_MIN: "0.00"
           REGIME_ATR_MAX: "1.30"
           REGIME_LEVERAGE_MULT: "3.0"
 
-          # ---- optional toggles (기본 off)
           TAU_SPLIT: ""
           USE_TAU_H: "false"
           ENABLE_DCA: "false"
 
-          # ---- output partitioning
           OUT_DIR_BASE: data/signals/walkforward
           WF_TAG_BASE: wf
         run: |
-          # (확인) 모델이 staged 되어있는지 한 번 찍어두면 디버깅이 쉬움
           echo "[RUN] MODEL_DIR=${MODEL_DIR}"
           ls -la "${MODEL_DIR}" | sed -n '1,200p' || true
 
