@@ -396,8 +396,6 @@ jobs:
 
       # ============================================================
       # (C) BADEXIT (signals 생성 후)
-      #   - SSOT(feature_cols.json)가 dict/list 어느 형태든 처리
-      #   - one-class면 synthetic 1 row 추가
       # ============================================================
       - name: Build+Train badexit model (post-walkforward, required)
         env:
@@ -507,77 +505,8 @@ jobs:
           fi
           echo "[BADEXIT] detected label_col=${LABEL_COL}"
 
-          TMP_BADLBL="data/labels/_tmp_badexit_train_${TAG}.csv"
-          BADLBL="${badlbl}" LABEL_COL="${LABEL_COL}" OUT="${TMP_BADLBL}" python - <<'PY'
-          import os, json
-          import pandas as pd
-          from pathlib import Path
-
-          p = Path(os.environ["BADLBL"])
-          label_col = os.environ["LABEL_COL"]
-          out = Path(os.environ["OUT"])
-
-          df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
-          if label_col not in df.columns:
-              raise SystemExit(f"[BADEXIT][ERROR] label_col missing: {label_col}")
-
-          # feature cols: SSOT 우선 (dict/list 모두 지원), 없으면 Date/Ticker/label 제외 전부
-          ssot = Path("data/meta/feature_cols.json")
-          feat_cols = []
-          if ssot.exists():
-              data = json.loads(ssot.read_text())
-              cols = None
-              if isinstance(data, list):
-                  cols = data
-              elif isinstance(data, dict):
-                  for k in ["cols", "feature_cols", "features", "p_success_cols"]:
-                      if k in data and isinstance(data[k], list):
-                          cols = data[k]
-                          break
-              if cols:
-                  feat_cols = [c for c in cols if c in df.columns]
-                  print(f"[BADEXIT] SSOT feature cols loaded (n={len(cols)}), matched={len(feat_cols)}")
-              else:
-                  print("[BADEXIT][WARN] SSOT feature_cols.json exists but format not recognized -> fallback")
-          else:
-              print("[BADEXIT][INFO] SSOT feature_cols.json missing -> fallback")
-
-          if not feat_cols:
-              drop = {"Date", "Ticker", label_col}
-              feat_cols = [c for c in df.columns if c not in drop]
-
-          if not feat_cols:
-              raise SystemExit(f"[BADEXIT][ERROR] no feature cols found. columns={list(df.columns)}")
-
-          y = df[label_col].astype(int)
-          n_classes = y.nunique(dropna=True)
-          print(f"[BADEXIT] n_classes={n_classes} (label_col={label_col})")
-
-          out.parent.mkdir(parents=True, exist_ok=True)
-          if n_classes >= 2:
-              df.to_csv(out, index=False)
-              print(f"[BADEXIT] wrote tmp train file (no change): {out}")
-              raise SystemExit(0)
-
-          # one-class -> add one opposite sample
-          only = int(y.iloc[0])
-          opp = 1 - only
-          row = df.iloc[[0]].copy()
-          row[label_col] = opp
-
-          # tiny noise on numeric feat cols to avoid identical rows
-          for c in feat_cols:
-              if pd.api.types.is_numeric_dtype(df[c]):
-                  v = float(row[c].iloc[0]) if pd.notna(row[c].iloc[0]) else 0.0
-                  row[c] = v + 1e-9
-
-          df2 = pd.concat([df, row], ignore_index=True)
-          df2.to_csv(out, index=False)
-          print(f"[BADEXIT][WARN] only 1 class -> appended 1 synthetic opposite row. wrote: {out}")
-          PY
-
           python scripts/train_badexit_model_wf_lite.py \
-            --data-path "${TMP_BADLBL}" \
+            --data-path "${badlbl}" \
             --label-col "${LABEL_COL}" \
             --out-model "app/badexit_model_${TAG}.pkl" \
             --out-scaler "app/badexit_scaler_${TAG}.pkl" \
