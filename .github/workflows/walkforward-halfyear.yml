@@ -164,7 +164,9 @@ jobs:
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
       # ============================================================
-      # (A) TRAIN (per half-year, cut at CUT_DATE) ✅ gate/tail/badexit/tau 모두 "강제"
+      # (A) TRAIN (per half-year, cut at CUT_DATE)
+      #  - gate/tail/tau: "강제" (실패하면 job 실패)
+      #  - badexit: signals_dir 필요 -> 아래 WALKFORWARD 이후 단계에서 "강제 생성/학습"
       # ============================================================
       - name: Train models for this half-year (cut at CUT_DATE)
         env:
@@ -248,14 +250,7 @@ jobs:
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # 4) badexit labels (필수)
-          python scripts/build_badexit_labels.py \
-            --profit-target "${PROFIT_TARGET}" \
-            --max-days "${MAX_DAYS}" \
-            --stop-level "${STOP_LEVEL}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}"
-
-          # 5) tau labels (✅ 필수: tag + 4개)
+          # 4) tau labels (필수: tag + 4개)
           python scripts/build_tau_labels.py \
             --tag "${TAG}" \
             --profit-target "${PROFIT_TARGET}" \
@@ -263,7 +258,7 @@ jobs:
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # 6) CUT_DATE 누수 방지: features_model/labels_model을 CUT_DATE 이하로 overwrite + tagged snapshot
+          # 5) CUT_DATE 누수 방지: features_model/labels_model을 CUT_DATE 이하로 overwrite + tagged snapshot
           TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
           import os
           from pathlib import Path
@@ -298,11 +293,11 @@ jobs:
           print("[CUT] labels_model rows=", len(lm_cut))
           PY
 
-          # 7) train gate (필수)
+          # 6) train gate (필수)
           echo "[TRAIN] python scripts/train_model.py --tag ${TAG}"
           python scripts/train_model.py --tag "${TAG}"
 
-          # 8) train tail (필수 args 4개)
+          # 7) train tail (필수 args 4개)
           echo "[TRAIN] python scripts/train_tail_model.py (required args)"
           python scripts/train_tail_model.py \
             --profit-target "${PROFIT_TARGET}" \
@@ -310,29 +305,14 @@ jobs:
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # 9) train badexit (필수: --data-path)
-          badlbl="$(pick_one "data/labels/*badexit*.parquet data/labels/*badexit*.csv")"
-          if [ -z "${badlbl}" ]; then
-            echo "[ERROR] badexit labels not found after build_badexit_labels.py"
-            ls -la data/labels | sed -n '1,200p' || true
-            exit 1
-          fi
-          echo "[TRAIN] badexit labels: ${badlbl}"
-
-          python scripts/train_badexit_model_wf_lite.py \
-            --data-path "${badlbl}" \
-            --out-model "app/badexit_model_${TAG}.pkl" \
-            --out-scaler "app/badexit_scaler_${TAG}.pkl" \
-            --out-report "data/meta/train_badexit_report_${TAG}.json"
-
-          # 10) train tau (필수: tag)
+          # 8) train tau (필수: tag)
           echo "[TRAIN] python scripts/train_tau_model.py --tag ${TAG}"
           python scripts/train_tau_model.py --tag "${TAG}"
 
           echo "[TRAIN] produced app/:"
           ls -la app | sed -n '1,200p'
 
-          # 11) stage required models -> data/models/${TAG} (고정 파일명)
+          # 9) stage required models -> data/models/${TAG} (고정 파일명)
 
           # gate
           mf="$(pick_one "app/model_*${TAG}*.pkl")"
@@ -344,19 +324,13 @@ jobs:
           cp -v "${mf}" "${MODEL_DIR}/model.pkl"
           cp -v "${sf}" "${MODEL_DIR}/scaler.pkl"
 
-          # tail: train_tail_model.py가 compatibility copy를 만들어줌
+          # tail: compatibility copy 사용(로그로 검증됨)
           test -f "app/tail_model.pkl"
           test -f "app/tail_scaler.pkl"
           cp -v "app/tail_model.pkl" "${MODEL_DIR}/tail_model.pkl"
           cp -v "app/tail_scaler.pkl" "${MODEL_DIR}/tail_scaler.pkl"
 
-          # badexit
-          test -f "app/badexit_model_${TAG}.pkl"
-          test -f "app/badexit_scaler_${TAG}.pkl"
-          cp -v "app/badexit_model_${TAG}.pkl" "${MODEL_DIR}/badexit_model.pkl"
-          cp -v "app/badexit_scaler_${TAG}.pkl" "${MODEL_DIR}/badexit_scaler.pkl"
-
-          # tau: train_tau_model.py는 보통 tagged 출력 or app/tau_model.pkl 형태 가능 -> 둘 다 대응
+          # tau: tagged 또는 compatibility 둘 다 대응
           taum="$(pick_one "app/tau_model_*${TAG}*.pkl app/tau_model.pkl")"
           taus="$(pick_one "app/tau_scaler_*${TAG}*.pkl app/tau_scaler.pkl")"
           if [ -z "${taum}" ] || [ -z "${taus}" ]; then
@@ -369,17 +343,15 @@ jobs:
           echo "[TRAIN] staged required models in ${MODEL_DIR}:"
           ls -la "${MODEL_DIR}" | sed -n '1,200p'
 
-          # 최종 강제 체크 (6개 + tau 2개)
+          # 최종 강제 체크 (gate+tail+tau)
           test -f "${MODEL_DIR}/model.pkl"
           test -f "${MODEL_DIR}/scaler.pkl"
           test -f "${MODEL_DIR}/tail_model.pkl"
           test -f "${MODEL_DIR}/tail_scaler.pkl"
-          test -f "${MODEL_DIR}/badexit_model.pkl"
-          test -f "${MODEL_DIR}/badexit_scaler.pkl"
           test -f "${MODEL_DIR}/tau_model.pkl"
           test -f "${MODEL_DIR}/tau_scaler.pkl"
 
-          echo "[TRAIN DONE] required models ready in ${MODEL_DIR}"
+          echo "[TRAIN DONE] gate/tail/tau ready in ${MODEL_DIR}"
 
       # ============================================================
       # (B) WALKFORWARD (same period)
@@ -414,7 +386,8 @@ jobs:
 
           MODEL_DIR: data/models/wf_${{ matrix.period }}
 
-          REQUIRE_FILES: "data/models/wf_${{ matrix.period }}/model.pkl,data/models/wf_${{ matrix.period }}/scaler.pkl,data/models/wf_${{ matrix.period }}/tail_model.pkl,data/models/wf_${{ matrix.period }}/tail_scaler.pkl,data/models/wf_${{ matrix.period }}/badexit_model.pkl,data/models/wf_${{ matrix.period }}/badexit_scaler.pkl,data/models/wf_${{ matrix.period }}/tau_model.pkl,data/models/wf_${{ matrix.period }}/tau_scaler.pkl"
+          # ✅ 여기서는 badexit 제외(아직 signals 전이므로 badexit는 아래에서 생성)
+          REQUIRE_FILES: "data/models/wf_${{ matrix.period }}/model.pkl,data/models/wf_${{ matrix.period }}/scaler.pkl,data/models/wf_${{ matrix.period }}/tail_model.pkl,data/models/wf_${{ matrix.period }}/tail_scaler.pkl,data/models/wf_${{ matrix.period }}/tau_model.pkl,data/models/wf_${{ matrix.period }}/tau_scaler.pkl"
 
           EXCLUDE_TICKERS: ""
 
@@ -436,6 +409,81 @@ jobs:
 
           chmod +x scripts/run_walkforward_halfyear.sh
           ./scripts/run_walkforward_halfyear.sh
+
+      # ============================================================
+      # (C) BADEXIT (signals 생성 후에만 가능) ✅ 여기서 "강제"
+      #  - build_badexit_labels.py는 signals_dir이 필요해서, WALKFORWARD 다음에 실행
+      # ============================================================
+      - name: Build+Train badexit model (post-walkforward, required)
+        env:
+          WF_PERIOD: ${{ matrix.period }}
+          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
+          MAX_DAYS: ${{ inputs.MAX_DAYS }}
+          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
+          MAX_EXTEND_DAYS: "20"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="wf_${WF_PERIOD}"
+          MODEL_DIR="data/models/${TAG}"
+
+          echo "[BADEXIT] TAG=${TAG}"
+          echo "[BADEXIT] model_dir=${MODEL_DIR}"
+
+          # signals_dir 선택(둘 중 존재하는 쪽)
+          SIG1="data/signals/walkforward/${WF_PERIOD}"
+          SIG2="data/signals"
+          if [ -d "${SIG1}" ]; then
+            SIGNALS_DIR="${SIG1}"
+          else
+            SIGNALS_DIR="${SIG2}"
+          fi
+
+          echo "[BADEXIT] using signals_dir=${SIGNALS_DIR}"
+          ls -la "${SIGNALS_DIR}" | sed -n '1,200p' || true
+
+          # build badexit labels (필수 인자 4개 + signals-dir)
+          python scripts/build_badexit_labels.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}" \
+            --signals-dir "${SIGNALS_DIR}"
+
+          # locate labels file (가장 최근/일치하는 걸 first-match로)
+          pick_one () {
+            local pat="$1"
+            local f
+            f="$(ls -1 ${pat} 2>/dev/null | head -n 1 || true)"
+            echo "${f}"
+          }
+
+          badlbl="$(pick_one "data/labels/labels_badexit_${TAG}.parquet data/labels/labels_badexit_${TAG}.csv data/labels/*badexit*.parquet data/labels/*badexit*.csv")"
+          if [ -z "${badlbl}" ]; then
+            echo "[ERROR] badexit labels not found after build_badexit_labels.py"
+            ls -la data/labels | sed -n '1,200p' || true
+            exit 1
+          fi
+          echo "[BADEXIT] labels=${badlbl}"
+
+          python scripts/train_badexit_model_wf_lite.py \
+            --data-path "${badlbl}" \
+            --out-model "app/badexit_model_${TAG}.pkl" \
+            --out-scaler "app/badexit_scaler_${TAG}.pkl" \
+            --out-report "data/meta/train_badexit_report_${TAG}.json"
+
+          test -f "app/badexit_model_${TAG}.pkl"
+          test -f "app/badexit_scaler_${TAG}.pkl"
+
+          cp -v "app/badexit_model_${TAG}.pkl" "${MODEL_DIR}/badexit_model.pkl"
+          cp -v "app/badexit_scaler_${TAG}.pkl" "${MODEL_DIR}/badexit_scaler.pkl"
+
+          echo "[BADEXIT] staged in ${MODEL_DIR}:"
+          ls -la "${MODEL_DIR}" | sed -n '1,200p'
+
+          test -f "${MODEL_DIR}/badexit_model.pkl"
+          test -f "${MODEL_DIR}/badexit_scaler.pkl"
 
       - name: Upload artifacts (this half-year)
         uses: actions/upload-artifact@v4
