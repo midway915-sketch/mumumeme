@@ -228,6 +228,50 @@ def main():
     ap.add_argument("--date-from", default="", type=str, help="optional inclusive date filter YYYY-MM-DD")
     ap.add_argument("--date-to", default="", type=str, help="optional inclusive date filter YYYY-MM-DD")
 
+# --- (A) argparse에 추가 (main() 안에서) ---
+    parser.add_argument(
+    "--model-dir",
+    type=str,
+    default=os.getenv("MODEL_DIR", "").strip(),
+    help="Directory containing model/scaler files. If empty, falls back to app/.",
+)
+
+# --- (B) _load_models() 수정/교체 ---
+from pathlib import Path
+import os
+
+def _resolve_model_dir(args) -> Path:
+    md = (getattr(args, "model_dir", "") or "").strip()
+    if md:
+        return Path(md)
+    return Path("app")  # fallback (기존 동작)
+
+def _load_models(args):
+    model_dir = _resolve_model_dir(args)
+
+    model_p = model_dir / "model.pkl"
+    scaler_p = model_dir / "scaler.pkl"
+    tail_model_p = model_dir / "tail_model.pkl"
+    tail_scaler_p = model_dir / "tail_scaler.pkl"
+
+    # (기존대로) p_success 모델/scaler는 필수
+    if not model_p.exists() or not scaler_p.exists():
+        raise FileNotFoundError(f"Missing model/scaler: {model_p} {scaler_p}")
+
+    # tail 모델은 전략/모드에 따라 필요할 수 있으니 기존 로직 유지하되
+    # 없으면 여기서 예외를 내거나(엄격) / 나중에 fallback을 선택(완화)하면 됨.
+    if not tail_model_p.exists() or not tail_scaler_p.exists():
+        raise FileNotFoundError(f"Missing tail model/scaler: {tail_model_p} {tail_scaler_p}")
+
+    # 아래는 네가 원래 쓰던 로드 방식대로
+    import joblib
+    model = joblib.load(model_p)
+    scaler = joblib.load(scaler_p)
+    tail_model = joblib.load(tail_model_p)
+    tail_scaler = joblib.load(tail_scaler_p)
+
+    return model, scaler, tail_model, tail_scaler
+
     args = ap.parse_args()
 
     req = [x.strip() for x in str(args.require_files or "").split(",") if x.strip()]
