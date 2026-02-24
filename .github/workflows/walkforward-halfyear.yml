@@ -237,6 +237,14 @@ jobs:
           PY
           fi
 
+          python scripts/train_tail_model.py -h || true
+          python scripts/train_badexit_model_wf_lite.py -h || true
+          python scripts/train_tau_model.py -h || true
+          
+          python scripts/build_tail_labels.py -h || true
+          python scripts/build_tau_labels.py -h || true
+          python scripts/build_badexit_labels.py -h || true
+          
           # 1) features
           python scripts/build_features.py
 
