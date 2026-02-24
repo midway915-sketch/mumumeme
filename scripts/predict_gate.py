@@ -80,6 +80,21 @@ def _load_tail_models(model_dir: Path):
     return joblib.load(model_p), joblib.load(scaler_p)
 
 
+def _load_badexit_models(model_dir: Path):
+    """
+    Supports both:
+      - model_dir/badexit_model.pkl + badexit_scaler.pkl (staged)
+      - model_dir/badexit_model_{tag}.pkl etc. (not used here, but staged should exist)
+    """
+    import joblib
+
+    model_p = model_dir / "badexit_model.pkl"
+    scaler_p = model_dir / "badexit_scaler.pkl"
+    if not model_p.exists() or not scaler_p.exists():
+        raise FileNotFoundError(f"Missing badexit model/scaler: {model_p} {scaler_p}")
+    return joblib.load(model_p), joblib.load(scaler_p)
+
+
 def _has_valid_numeric_col(df: pd.DataFrame, col: str) -> bool:
     if col not in df.columns:
         return False
@@ -87,20 +102,44 @@ def _has_valid_numeric_col(df: pd.DataFrame, col: str) -> bool:
     return np.isfinite(s).any()
 
 
-def _get_feature_cols(df: pd.DataFrame) -> list[str]:
+def _load_ssot_feature_cols() -> list[str] | None:
+    """
+    data/meta/feature_cols.json supports:
+      - ["c1","c2",...]
+      - {"feature_cols":[...]}
+      - {"cols":[...]}
+      - {"features":[...]}
+      - {"p_success_cols":[...]}  (legacy fallback)
+    """
     meta = DATA_DIR / "meta" / "feature_cols.json"
-    if meta.exists():
-        try:
-            payload = json.loads(meta.read_text(encoding="utf-8"))
-            cols = payload.get("feature_cols") or payload.get("cols") or payload.get("features")
-            if isinstance(cols, list) and cols:
-                cols = [str(c).strip() for c in cols if str(c).strip()]
-                missing = [c for c in cols if c not in df.columns]
-                if missing:
-                    raise ValueError(f"feature_cols.json contains missing cols in features: {missing[:20]}")
-                return cols
-        except Exception:
-            pass
+    if not meta.exists():
+        return None
+    try:
+        payload = json.loads(meta.read_text(encoding="utf-8"))
+        cols = None
+        if isinstance(payload, list):
+            cols = payload
+        elif isinstance(payload, dict):
+            for k in ("feature_cols", "cols", "features", "p_success_cols"):
+                v = payload.get(k)
+                if isinstance(v, list) and v:
+                    cols = v
+                    break
+        if isinstance(cols, list) and cols:
+            out = [str(c).strip() for c in cols if str(c).strip()]
+            return out if out else None
+    except Exception:
+        return None
+    return None
+
+
+def _get_feature_cols(df: pd.DataFrame) -> list[str]:
+    ssot = _load_ssot_feature_cols()
+    if ssot:
+        missing = [c for c in ssot if c not in df.columns]
+        if missing:
+            raise ValueError(f"feature_cols.json contains missing cols in features: {missing[:20]}")
+        return ssot
 
     drop = {
         "Date",
@@ -123,6 +162,11 @@ def _get_feature_cols(df: pd.DataFrame) -> list[str]:
     for c in cols:
         if pd.api.types.is_numeric_dtype(df[c]):
             out.append(c)
+        else:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if s.notna().any():
+                out.append(c)
+
     if not out:
         raise RuntimeError("No numeric feature cols found.")
     return out
@@ -264,7 +308,6 @@ def main() -> None:
             sys.exit(2)
 
     model_dir = _resolve_model_dir(args.model_dir)
-
     feats = _load_features(args.features_path)
 
     # apply date range early (inclusive)
@@ -317,6 +360,30 @@ def main() -> None:
             feats2["p_tail"] = 0.0
             scored_mode_pt = "filled_0_not_needed"
 
+    # ---- p_badexit (compute if needed for filtering)
+    scored_mode_be = "not_used"
+    if args.badexit_max is not None:
+        use_scored_be = _has_valid_numeric_col(feats2, "p_badexit")
+        if use_scored_be:
+            feats2["p_badexit"] = pd.to_numeric(feats2["p_badexit"], errors="coerce").fillna(0.0).astype(float)
+            scored_mode_be = "use_features_col"
+        else:
+            # only compute if we actually want to filter
+            try:
+                if feat_cols is None:
+                    feat_cols = _get_feature_cols(feats2)
+                    feats2 = _coerce_numeric(feats2, feat_cols)
+                X = feats2[feat_cols].to_numpy(dtype=float)
+                be_model, be_scaler = _load_badexit_models(model_dir)
+                Xb = be_scaler.transform(X)
+                bproba = be_model.predict_proba(Xb)
+                feats2["p_badexit"] = (bproba[:, 1] if bproba.shape[1] >= 2 else bproba[:, 0]).astype(float)
+                scored_mode_be = "model_predict"
+            except FileNotFoundError as e:
+                # if model missing, degrade gracefully to 0.0 so pipeline doesn't die
+                feats2["p_badexit"] = 0.0
+                scored_mode_be = f"filled_0_missing_models ({e})"
+
     # exclude tickers
     if args.exclude_tickers:
         ex = [x.strip().upper() for x in args.exclude_tickers.split(",") if x.strip()]
@@ -354,6 +421,7 @@ def main() -> None:
                     "regime": regime_audit,
                     "p_success_source": scored_mode_ps,
                     "p_tail_source": scored_mode_pt,
+                    "p_badexit_source": scored_mode_be,
                     "model_dir": str(model_dir),
                 },
                 indent=2,
@@ -402,8 +470,9 @@ def main() -> None:
             feats2["ret_score"] = feats2["utility_raw"]
         feats2["score"] = feats2["ret_score"].fillna(-np.inf)
 
-    if args.badexit_max is not None and "p_badexit" in feats2.columns:
-        feats2["p_badexit"] = pd.to_numeric(feats2["p_badexit"], errors="coerce").fillna(0.0).astype(float)
+    # badexit filter
+    if args.badexit_max is not None:
+        feats2["p_badexit"] = pd.to_numeric(feats2.get("p_badexit", 0.0), errors="coerce").fillna(0.0).astype(float)
         feats2 = feats2[feats2["p_badexit"] <= float(args.badexit_max)].copy()
 
     feats2 = feats2.sort_values(["Date", "score"], ascending=[True, False]).reset_index(drop=True)
@@ -436,6 +505,7 @@ def main() -> None:
         "regime": regime_audit,
         "p_success_source": scored_mode_ps,
         "p_tail_source": scored_mode_pt,
+        "p_badexit_source": scored_mode_be,
         "date_from": args.date_from,
         "date_to": args.date_to,
         "model_dir": str(model_dir),
