@@ -167,8 +167,9 @@ jobs:
 
       # ============================================================
       # (A) TRAIN MODELS (per half-year) -> tag = wf_${period}
-      #     - build features/labels
-      #     - cut to CUT_DATE (== VALID_END) to avoid leakage
+      #     - build features
+      #     - build labels (레포 지원 인자만!)
+      #     - cut snapshot at CUT_DATE to avoid leakage
       #     - train p_success(per H), p_tail(per H), p_badexit, tau
       # ============================================================
       - name: Train models for this half-year (cut at CUT_DATE)
@@ -186,19 +187,7 @@ jobs:
           MAX_DAYS: ${{ inputs.MAX_DAYS }}
           STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
 
-          # tau class -> H mapping (score_features.py 기본과 맞춤)
           TAU_H_MAP: "30,40,50"
-
-          # labels 옵션 (레포 build_labels.py 기본값과 맞춤)
-          MAX_EXTEND_DAYS: "20"
-          ENABLE_TRAILING: "true"
-          TRAIL_STOP: "0.10"
-          TP1_FRAC: "0.50"
-          TP1_HOLD_CAP_MODE: "none"
-          TP1_HOLD_CAP_SINGLE: "none"
-          CAP_COMPARE: "false"
-          TP1_TRAIL_UNLIMITED: "true"
-          ENABLE_DCA: "false"
         shell: bash
         run: |
           set -euo pipefail
@@ -228,76 +217,42 @@ jobs:
           out.to_csv("data/universe.csv", index=False)
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
           PY
-                    fi
+          fi
 
-          # 1) features (TRAIN_START부터 생성; 이후 CUT_DATE로 잘라 tag 스냅샷 작성)
+          # 1) features
           python scripts/build_features.py --start-date "${TRAIN_START}"
 
-          # 2) labels 생성 (레포 스크립트 기준)
-          #    p_success labels_model.parquet 는 tag별 파일이 기본이 아니라서,
-          #    생성 후 labels_model_{TAG}.parquet 로 "스냅샷 복사"를 만들어줌.
+          # 2) labels (레포 build_labels.py 지원 인자만 사용)
           python scripts/build_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}" \
-            --trail-stop "${TRAIL_STOP}" \
-            --tp1-frac "${TP1_FRAC}" \
-            --enable-trailing "${ENABLE_TRAILING}" \
-            --tp1-hold-cap-mode "${TP1_HOLD_CAP_MODE}" \
-            --tp1-hold-cap-single "${TP1_HOLD_CAP_SINGLE}" \
-            --cap-compare "${CAP_COMPARE}" \
-            --tp1-trail-unlimited "${TP1_TRAIL_UNLIMITED}" \
-            --enable-dca "${ENABLE_DCA}"
+            --start-date "${TRAIN_START}"
 
-          # tail / badexit / tau labels (얘들은 --tag 지원)
+          # tail/badexit/tau labels (tag 포함 + core 3 + start-date만)
           python scripts/build_tail_labels.py \
             --tag "${TAG}" \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}" \
-            --trail-stop "${TRAIL_STOP}" \
-            --tp1-frac "${TP1_FRAC}" \
-            --enable-trailing "${ENABLE_TRAILING}" \
-            --tp1-hold-cap-mode "${TP1_HOLD_CAP_MODE}" \
-            --tp1-hold-cap-single "${TP1_HOLD_CAP_SINGLE}" \
-            --cap-compare "${CAP_COMPARE}" \
-            --tp1-trail-unlimited "${TP1_TRAIL_UNLIMITED}" \
-            --enable-dca "${ENABLE_DCA}"
+            --start-date "${TRAIN_START}"
 
           python scripts/build_badexit_labels.py \
             --tag "${TAG}" \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}" \
-            --trail-stop "${TRAIL_STOP}" \
-            --tp1-frac "${TP1_FRAC}" \
-            --enable-trailing "${ENABLE_TRAILING}" \
-            --tp1-hold-cap-mode "${TP1_HOLD_CAP_MODE}" \
-            --tp1-hold-cap-single "${TP1_HOLD_CAP_SINGLE}" \
-            --cap-compare "${CAP_COMPARE}" \
-            --tp1-trail-unlimited "${TP1_TRAIL_UNLIMITED}" \
-            --enable-dca "${ENABLE_DCA}"
+            --start-date "${TRAIN_START}"
 
           python scripts/build_tau_labels.py \
             --tag "${TAG}" \
             --profit-target "${PROFIT_TARGET}" \
-            --stop-level "${STOP_LEVEL}" \
             --max-days "${MAX_DAYS}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}" \
-            --trail-stop "${TRAIL_STOP}" \
-            --tp1-frac "${TP1_FRAC}" \
-            --enable-trailing "${ENABLE_TRAILING}" \
-            --tp1-hold-cap-mode "${TP1_HOLD_CAP_MODE}" \
-            --tp1-hold-cap-single "${TP1_HOLD_CAP_SINGLE}" \
-            --cap-compare "${CAP_COMPARE}" \
-            --tp1-trail-unlimited "${TP1_TRAIL_UNLIMITED}" \
-            --enable-dca "${ENABLE_DCA}"
+            --stop-level "${STOP_LEVEL}" \
+            --start-date "${TRAIN_START}"
 
           # 3) CUT_DATE로 tag 스냅샷 만들기 (누수 방지)
-          python - <<'PY'
+          TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
           import os
           from pathlib import Path
           import pandas as pd
@@ -314,24 +269,24 @@ jobs:
               Path(p).parent.mkdir(parents=True, exist_ok=True)
               df.to_parquet(p, index=False)
           
-          # features_model -> features_model_{TAG}.parquet (cut)
+          # features_model snapshot (cut)
           f = read_any("data/features/features_model.parquet", "data/features/features_model.csv")
           f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.tz_localize(None)
           f = f.dropna(subset=["Date"])
           f_cut = f[f["Date"] <= CUT].copy()
           write_parq(f_cut, f"data/features/features_model_{TAG}.parquet")
-          print("[SNAP] features_model rows:", len(f), "-> cut:", len(f_cut))
+          print("[SNAP] features_model ->", f"features_model_{TAG}.parquet", "rows=", len(f_cut))
           
-          # p_success labels_model -> labels_model_{TAG}.parquet (cut)
+          # labels_model snapshot (cut)
           lm = read_any("data/labels/labels_model.parquet", "data/labels/labels_model.csv")
           lm["Date"] = pd.to_datetime(lm["Date"], errors="coerce").dt.tz_localize(None)
           lm = lm.dropna(subset=["Date"])
           lm_cut = lm[lm["Date"] <= CUT].copy()
           write_parq(lm_cut, f"data/labels/labels_model_{TAG}.parquet")
-          print("[SNAP] labels_model rows:", len(lm), "-> cut:", len(lm_cut))
+          print("[SNAP] labels_model ->", f"labels_model_{TAG}.parquet", "rows=", len(lm_cut))
           
-          # tag 기반 labels는 파일명이 이미 tag를 포함함. (tail/badexit/tau)
-          def snap_tagged(stem):
+          # tagged labels (cut inplace if exists)
+          def cut_inplace(stem):
               p = Path(f"data/labels/{stem}_{TAG}.parquet")
               if not p.exists():
                   print("[WARN] missing", p)
@@ -340,27 +295,23 @@ jobs:
               df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
               df = df.dropna(subset=["Date"])
               df_cut = df[df["Date"] <= CUT].copy()
-              df_cut.to_parquet(p, index=False)  # 같은 파일을 cut으로 덮어씀
-              print(f"[SNAP] {p.name} -> cut rows={len(df_cut)}")
+              df_cut.to_parquet(p, index=False)
+              print("[SNAP] cut", p.name, "rows=", len(df_cut))
           
-          snap_tagged("labels_tail")
-          snap_tagged("labels_badexit")
-          snap_tagged("labels_tau")
-          PY
-                    TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
-          # env 바인딩용 no-op
+          cut_inplace("labels_tail")
+          cut_inplace("labels_badexit")
+          cut_inplace("labels_tau")
           PY
 
-          # 4) train (레포 스크립트/인자 그대로)
-          #    - p_success/p_tail 은 per-H (TAU_H_MAP 기준 30/40/50)
+          # 4) train (레포 스크립트명 기준)
           IFS=',' read -r H0 H1 H2 <<< "${TAU_H_MAP}"
 
           for H in "${H0}" "${H1}" "${H2}"; do
             echo "[TRAIN] train_model tag=${TAG} H=${H}"
-            python scripts/train_model.py --tag "${TAG}" --H "${H}" --label-col "y"
+            python scripts/train_model.py --tag "${TAG}" --H "${H}"
 
             echo "[TRAIN] train_tail_model tag=${TAG} H=${H}"
-            python scripts/train_tail_model.py --tag "${TAG}" --H "${H}" --label-col "y_tail"
+            python scripts/train_tail_model.py --tag "${TAG}" --H "${H}"
           done
 
           echo "[TRAIN] train_badexit_model tag=${TAG}"
