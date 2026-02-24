@@ -205,7 +205,6 @@ jobs:
             echo "${f}"
           }
 
-          # 0) universe.csv (없으면 raw에서 생성)
           if [ ! -f data/universe.csv ]; then
             echo "[INFO] data/universe.csv missing -> generating from raw prices"
             python - <<'PY'
@@ -233,24 +232,20 @@ jobs:
           PY
           fi
 
-          # 1) features
           python scripts/build_features.py
 
-          # 2) labels (gate)
           python scripts/build_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --start-date "${TRAIN_START}"
 
-          # 3) tail labels (필수)
           python scripts/build_tail_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # 4) tau labels (필수: tag + 4개)
           python scripts/build_tau_labels.py \
             --tag "${TAG}" \
             --profit-target "${PROFIT_TARGET}" \
@@ -258,7 +253,6 @@ jobs:
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # 5) CUT_DATE 누수 방지
           TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
           import os
           from pathlib import Path
@@ -293,11 +287,9 @@ jobs:
           print("[CUT] labels_model rows=", len(lm_cut))
           PY
 
-          # 6) train gate (필수)
           echo "[TRAIN] python scripts/train_model.py --tag ${TAG}"
           python scripts/train_model.py --tag "${TAG}"
 
-          # 7) train tail (필수)
           echo "[TRAIN] python scripts/train_tail_model.py (required args)"
           python scripts/train_tail_model.py \
             --profit-target "${PROFIT_TARGET}" \
@@ -305,14 +297,12 @@ jobs:
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # 8) train tau (필수)
           echo "[TRAIN] python scripts/train_tau_model.py --tag ${TAG}"
           python scripts/train_tau_model.py --tag "${TAG}"
 
           echo "[TRAIN] produced app/:"
           ls -la app | sed -n '1,200p'
 
-          # 9) stage required models -> data/models/${TAG}
           mf="$(pick_one "app/model_*${TAG}*.pkl")"
           sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
           if [ -z "${mf}" ] || [ -z "${sf}" ]; then
@@ -322,13 +312,11 @@ jobs:
           cp -v "${mf}" "${MODEL_DIR}/model.pkl"
           cp -v "${sf}" "${MODEL_DIR}/scaler.pkl"
 
-          # tail compatibility copy
           test -f "app/tail_model.pkl"
           test -f "app/tail_scaler.pkl"
           cp -v "app/tail_model.pkl" "${MODEL_DIR}/tail_model.pkl"
           cp -v "app/tail_scaler.pkl" "${MODEL_DIR}/tail_scaler.pkl"
 
-          # tau: tagged or compatibility
           taum="$(pick_one "app/tau_model_*${TAG}*.pkl app/tau_model.pkl")"
           taus="$(pick_one "app/tau_scaler_*${TAG}*.pkl app/tau_scaler.pkl")"
           if [ -z "${taum}" ] || [ -z "${taus}" ]; then
@@ -407,7 +395,7 @@ jobs:
           ./scripts/run_walkforward_halfyear.sh
 
       # ============================================================
-      # (C) BADEXIT (signals 생성 후) - "EX_TAG 호환 복사본" 만들어서 강제 성공
+      # (C) BADEXIT (signals 생성 후) - label col 자동탐지 + EX_TAG 호환복사
       # ============================================================
       - name: Build+Train badexit model (post-walkforward, required)
         env:
@@ -426,7 +414,6 @@ jobs:
           echo "[BADEXIT] TAG=${TAG}"
           echo "[BADEXIT] model_dir=${MODEL_DIR}"
 
-          # signals_dir: period 폴더가 있으면 그걸 사용
           SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"
           if [ ! -d "${SIGNALS_DIR}" ]; then
             echo "[ERROR] signals_dir missing: ${SIGNALS_DIR}"
@@ -436,9 +423,8 @@ jobs:
           echo "[BADEXIT] using signals_dir=${SIGNALS_DIR}"
           ls -la "${SIGNALS_DIR}" | sed -n '1,200p' || true
 
-          # build_badexit_labels.py가 찾는 tag(EX_TAG) = pt??_h??_sl??_ex??
           EX_TAG="$(python - <<'PY'
-          import math, os
+          import os
           pt=float(os.environ["PROFIT_TARGET"])
           h=int(os.environ["MAX_DAYS"])
           sl=float(os.environ["STOP_LEVEL"])
@@ -450,12 +436,11 @@ jobs:
           )"
           echo "[BADEXIT] expected trades tag(EX_TAG)=${EX_TAG}"
 
-          # ✅ 호환 복사본 생성: 기존 trades 파일명에 EX_TAG가 없어서 못 찾는 문제 해결
+          # 호환 복사본 생성 (EX_TAG 포함)
           shopt -s nullglob
           made=0
           for f in "${SIGNALS_DIR}"/sim_engine_trades_*.csv "${SIGNALS_DIR}"/sim_engine_trades_*.parquet; do
             base="$(basename "$f")"
-            # 예: sim_engine_trades_pt10_h40_sl10_ex20__<원본파일명>
             out="${SIGNALS_DIR}/sim_engine_trades_${EX_TAG}__${base}"
             if [ ! -f "${out}" ]; then
               cp -v "$f" "${out}"
@@ -463,9 +448,7 @@ jobs:
             fi
           done
           echo "[BADEXIT] compatibility copies made: ${made}"
-          ls -la "${SIGNALS_DIR}" | sed -n '1,200p' || true
 
-          # build badexit labels (필수 인자 4개 + signals-dir)
           python scripts/build_badexit_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
@@ -474,7 +457,6 @@ jobs:
             --signals-dir "${SIGNALS_DIR}" \
             --also-read-csv
 
-          # locate labels file (tag 우선)
           pick_one () {
             local pat="$1"
             local f
@@ -482,7 +464,8 @@ jobs:
             echo "${f}"
           }
 
-          badlbl="$(pick_one "data/labels/labels_badexit_${TAG}.parquet data/labels/labels_badexit_${TAG}.csv data/labels/*badexit*.parquet data/labels/*badexit*.csv")"
+          # parquet 우선
+          badlbl="$(pick_one "data/labels/labels_badexit_${TAG}.parquet data/labels/labels_badexit_${TAG}.csv data/labels/labels_badexit_${EX_TAG}.parquet data/labels/labels_badexit_${EX_TAG}.csv data/labels/*badexit*.parquet data/labels/*badexit*.csv")"
           if [ -z "${badlbl}" ]; then
             echo "[ERROR] badexit labels not found after build_badexit_labels.py"
             ls -la data/labels | sed -n '1,200p' || true
@@ -490,23 +473,63 @@ jobs:
           fi
           echo "[BADEXIT] labels=${badlbl}"
 
+          # ✅ 라벨 컬럼 자동 탐지 -> --label-col로 넘김
+          LABEL_COL="$(python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+
+          p = Path(os.environ["BADLBL"])
+          if p.suffix == ".parquet":
+              df = pd.read_parquet(p)
+          else:
+              df = pd.read_csv(p)
+
+          cols = list(df.columns)
+          candidates = ["y_badexit", "BadExit", "badexit", "is_badexit", "label", "target"]
+          for c in candidates:
+              if c in cols:
+                  print(c)
+                  raise SystemExit(0)
+
+          print("__MISSING__")
+          print("COLS=" + ",".join(cols))
+          PY
+          )"
+          if [ "${LABEL_COL}" = "__MISSING__" ]; then
+            echo "[ERROR] could not find badexit label column in ${badlbl}"
+            python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+          p = Path(os.environ["BADLBL"])
+          df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
+          print("columns:", list(df.columns))
+          print(df.head(3).to_string(index=False))
+          PY
+            exit 1
+          fi
+          echo "[BADEXIT] detected label_col=${LABEL_COL}"
+
           python scripts/train_badexit_model_wf_lite.py \
             --data-path "${badlbl}" \
+            --label-col "${LABEL_COL}" \
             --out-model "app/badexit_model_${TAG}.pkl" \
             --out-scaler "app/badexit_scaler_${TAG}.pkl" \
             --out-report "data/meta/train_badexit_report_${TAG}.json"
 
           test -f "app/badexit_model_${TAG}.pkl"
           test -f "app/badexit_scaler_${TAG}.pkl"
-
           cp -v "app/badexit_model_${TAG}.pkl" "${MODEL_DIR}/badexit_model.pkl"
           cp -v "app/badexit_scaler_${TAG}.pkl" "${MODEL_DIR}/badexit_scaler.pkl"
 
           echo "[BADEXIT] staged in ${MODEL_DIR}:"
           ls -la "${MODEL_DIR}" | sed -n '1,200p'
-
           test -f "${MODEL_DIR}/badexit_model.pkl"
           test -f "${MODEL_DIR}/badexit_scaler.pkl"
+
+        env:
+          BADLBL: ${{ '' }}
 
       - name: Upload artifacts (this half-year)
         uses: actions/upload-artifact@v4
