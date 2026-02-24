@@ -518,6 +518,53 @@ jobs:
           done
           echo "[BADEXIT] compatibility copies made: ${made}"
 
+          # ============================================================
+          # ✅ CHECK LOG (1C): EX_TAG 패턴으로 "실제로 읽힐 후보"가 몇 개인지/rows 합이 얼마인지
+          #  - labels rows(27)가 왜 그렇게 작은지 1차로 갈라냄
+          # ============================================================
+          EX_TAG="${EX_TAG}" python - <<'PY'
+          import glob, os
+          import pandas as pd
+          
+          d = os.environ.get("SIGNALS_DIR", "")
+          ex = os.environ.get("EX_TAG", "")
+          if not d:
+              raise SystemExit("[CHECK-1C] SIGNALS_DIR env missing")
+          if not ex:
+              raise SystemExit("[CHECK-1C] EX_TAG env missing")
+          
+          pats = [
+              os.path.join(d, f"sim_engine_trades_{ex}__*.parquet"),
+              os.path.join(d, f"sim_engine_trades_{ex}__*.csv"),
+              os.path.join(d, f"sim_engine_trades_{ex}*.parquet"),
+              os.path.join(d, f"sim_engine_trades_{ex}*.csv"),
+          ]
+          paths = []
+          for pat in pats:
+              paths += glob.glob(pat)
+          paths = sorted(set(paths))
+          
+          print(f"[CHECK-1C] SIGNALS_DIR={d}")
+          print(f"[CHECK-1C] EX_TAG={ex}")
+          print(f"[CHECK-1C] matched files={len(paths)}")
+          
+          total = 0
+          shown = 0
+          for p in paths:
+              try:
+                  df = pd.read_parquet(p) if p.endswith(".parquet") else pd.read_csv(p)
+                  n = len(df)
+              except Exception as e:
+                  print(f"[CHECK-1C] FAIL read: {p} err={e}")
+                  continue
+              total += n
+              if shown < 20:
+                  print(f"[CHECK-1C] rows={n} file={p}")
+                  shown += 1
+          
+          print(f"[CHECK-1C] matched rows total={total}")
+          PY
+
           python scripts/build_badexit_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
