@@ -464,26 +464,23 @@ jobs:
             echo "${f}"
           }
 
-          # parquet 우선
           badlbl="$(pick_one "data/labels/labels_badexit_${TAG}.parquet data/labels/labels_badexit_${TAG}.csv data/labels/labels_badexit_${EX_TAG}.parquet data/labels/labels_badexit_${EX_TAG}.csv data/labels/*badexit*.parquet data/labels/*badexit*.csv")"
           if [ -z "${badlbl}" ]; then
             echo "[ERROR] badexit labels not found after build_badexit_labels.py"
             ls -la data/labels | sed -n '1,200p' || true
             exit 1
           fi
-          echo "[BADEXIT] labels=${badlbl}"
+          export BADLBL="${badlbl}"
+          echo "[BADEXIT] labels=${BADLBL}"
 
-          # ✅ 라벨 컬럼 자동 탐지 -> --label-col로 넘김
+          # ✅ 라벨 컬럼 자동 탐지 (stdout은 "컬럼명" 또는 "__MISSING__"만!)
           LABEL_COL="$(python - <<'PY'
           import os
-          import pandas as pd
           from pathlib import Path
+          import pandas as pd
 
           p = Path(os.environ["BADLBL"])
-          if p.suffix == ".parquet":
-              df = pd.read_parquet(p)
-          else:
-              df = pd.read_csv(p)
+          df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
 
           cols = list(df.columns)
           candidates = ["y_badexit", "BadExit", "badexit", "is_badexit", "label", "target"]
@@ -492,27 +489,30 @@ jobs:
                   print(c)
                   raise SystemExit(0)
 
+          # debug는 stderr로만
+          import sys
+          print("COLS=" + ",".join(cols), file=sys.stderr)
           print("__MISSING__")
-          print("COLS=" + ",".join(cols))
           PY
           )"
+
           if [ "${LABEL_COL}" = "__MISSING__" ]; then
-            echo "[ERROR] could not find badexit label column in ${badlbl}"
+            echo "[ERROR] could not find badexit label column in ${BADLBL}"
             python - <<'PY'
           import os
-          import pandas as pd
           from pathlib import Path
+          import pandas as pd
           p = Path(os.environ["BADLBL"])
           df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
           print("columns:", list(df.columns))
-          print(df.head(3).to_string(index=False))
+          print(df.head(5).to_string(index=False))
           PY
             exit 1
           fi
           echo "[BADEXIT] detected label_col=${LABEL_COL}"
 
           python scripts/train_badexit_model_wf_lite.py \
-            --data-path "${badlbl}" \
+            --data-path "${BADLBL}" \
             --label-col "${LABEL_COL}" \
             --out-model "app/badexit_model_${TAG}.pkl" \
             --out-scaler "app/badexit_scaler_${TAG}.pkl" \
@@ -527,8 +527,6 @@ jobs:
           ls -la "${MODEL_DIR}" | sed -n '1,200p'
           test -f "${MODEL_DIR}/badexit_model.pkl"
           test -f "${MODEL_DIR}/badexit_scaler.pkl"
-
-          export BADLBL="${badlbl}"
 
       - name: Upload artifacts (this half-year)
         uses: actions/upload-artifact@v4
