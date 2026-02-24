@@ -97,17 +97,31 @@ def _load_feature_cols_from_report(report_path: Path) -> list[str] | None:
 def _load_feature_cols_from_ssot() -> list[str] | None:
     """
     data/meta/feature_cols.json (SSOT) 우선 사용.
-    형식:
-      {"feature_cols":[...], "sector_enabled": true/false, ...}
+
+    ✅ 지원 형식:
+      - ["c1","c2",...]
+      - {"feature_cols":[...]}
+      - {"cols":[...]}
+      - {"features":[...]}
+      - {"p_success_cols":[...]}  (legacy)
     """
     p = META_DIR / "feature_cols.json"
     if not p.exists():
         return None
     try:
-        j = json.loads(p.read_text(encoding="utf-8"))
-        cols = j.get("feature_cols")
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        cols = None
+        if isinstance(payload, list):
+            cols = payload
+        elif isinstance(payload, dict):
+            for k in ("feature_cols", "cols", "features", "p_success_cols"):
+                v = payload.get(k)
+                if isinstance(v, list) and v:
+                    cols = v
+                    break
         if isinstance(cols, list) and cols:
-            return [str(c) for c in cols if str(c).strip()]
+            out = [str(c).strip() for c in cols if str(c).strip()]
+            return out if out else None
     except Exception:
         return None
     return None
@@ -125,8 +139,12 @@ def load_tau_feature_cols(tag: str) -> list[str] | None:
     return _load_feature_cols_from_report(META_DIR / f"train_tau_report_{tag}.json")
 
 
-def load_badexit_feature_cols() -> list[str] | None:
-    return _load_feature_cols_from_report(META_DIR / "train_badexit_report.json")
+def load_badexit_feature_cols(tag: str) -> list[str] | None:
+    """
+    ✅ workflow에서 저장하는 형태:
+      data/meta/train_badexit_report_${TAG}.json
+    """
+    return _load_feature_cols_from_report(META_DIR / f"train_badexit_report_{tag}.json")
 
 
 def parse_tau_h_map(s: str) -> list[int]:
@@ -269,7 +287,7 @@ def main() -> None:
         "--badexit-features",
         default="",
         type=str,
-        help="comma-separated override. default=report(train_badexit_report.json) -> SSOT -> ps-features",
+        help="comma-separated override. default=report(train_badexit_report_{TAG}.json) -> SSOT -> ps-features",
     )
 
     # tau (tagged 우선)
@@ -521,7 +539,7 @@ def main() -> None:
     feats["p_success"] = ps_series.astype(float)
 
     # -------------------------
-    # p_tail (per tau_H) optional
+    # p_tail (per tau_H)
     # -------------------------
     if args.tail_features.strip():
         tail_cols = parse_csv_cols(args.tail_features)
@@ -552,22 +570,26 @@ def main() -> None:
     feats["p_tail"] = tail_series.astype(float)
 
     # -------------------------
-    # p_badexit (per tau_H) optional
+    # p_badexit (per tau_H)
     # -------------------------
     if args.badexit_features.strip():
         bad_cols = parse_csv_cols(args.badexit_features)
         bad_cols_src = "--badexit-features"
     else:
-        bad_cols = load_badexit_feature_cols()
+        bad_cols = load_badexit_feature_cols(f"wf_{os.getenv('WF_PERIOD','')}".strip())  # unused; just keep safe
+        # 위 줄은 실수 방지용인데, 실제로는 아래에서 TAG="wf_${WF_PERIOD}"로 호출하니까 args.tag가 그걸 가지고 있음.
+        # 그래서 args.tag를 우선으로 다시 덮는다.
+        bad_cols = load_badexit_feature_cols(args.tag) or None
+
         if bad_cols:
-            bad_cols_src = "report(train_badexit_report.json)"
+            bad_cols_src = f"report(train_badexit_report_{args.tag}.json)"
         elif ssot_cols:
             bad_cols = ssot_cols
             bad_cols_src = "SSOT(data/meta/feature_cols.json)"
         else:
             bad_cols = ps_cols
             bad_cols_src = "fallback(ps_cols)"
-    bad_cols = [c for c in bad_cols if c]
+    bad_cols = [c for c in (bad_cols or []) if c]
 
     bad_series, bad_audit = _score_by_h(
         col_out="p_badexit",
@@ -575,8 +597,8 @@ def main() -> None:
         scaler_stem="badexit_scaler",
         base_model_path=args.badexit_model,
         base_scaler_path=args.badexit_scaler,
-        feat_cols=bad_cols,
-        feat_cols_src=bad_cols_src,
+        feat_cols=bad_cols if bad_cols else ps_cols,  # 마지막 안전장치
+        feat_cols_src=bad_cols_src if bad_cols else "fallback(ps_cols:empty_bad_cols)",
         enabled=True,
         default_value=0.0,
     )
