@@ -190,7 +190,7 @@ jobs:
 
           TAG="wf_${WF_PERIOD}"
           echo "[TRAIN] TAG=${TAG} CUT_DATE=${CUT_DATE}"
-          mkdir -p data/features data/labels data/meta app
+          mkdir -p data/features data/labels data/meta app "data/models/${TAG}"
 
           # 0) universe.csv (없으면 raw에서 생성)
           if [ ! -f data/universe.csv ]; then
@@ -206,6 +206,8 @@ jobs:
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
+          if "Ticker" not in df.columns:
+              raise SystemExit("[ERROR] raw prices missing Ticker column")
           ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
           ticks = sorted(set([t for t in ticks if t]))
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
@@ -215,82 +217,90 @@ jobs:
           PY
           fi
 
-          # 1) features
-          python scripts/build_features.py --start-date "${TRAIN_START}"
+          # 1) features (레포에서 build_features.py가 --start-date 지원 불확실 -> 안전하게 기본 호출)
+          python scripts/build_features.py
 
-          # 2) labels (build_labels.py는 이 인자만 받는 게 로그로 확인됨)
+          # 2) labels (로그로 확인된 인자만)
           python scripts/build_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --start-date "${TRAIN_START}"
 
-          # ✅ tail labels: 반드시 --max-extend-days 필요
+          # 3) tail labels (필수 인자 포함)
           python scripts/build_tail_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # badexit/tau labels: 일단 tag만 (CLI 요구사항 모르면 보수적으로)
-          # (만약 여기서 required arg 뜨면, 그 에러 로그 기준으로 바로 맞춰줄게)
-          python scripts/build_badexit_labels.py || true
-          python scripts/build_tau_labels.py || true
-
-          # 3) CUT_DATE로 tag 스냅샷 만들기 (누수 방지)
+          # 4) CUT_DATE 누수 방지: (features_model/labels_model) 파일을 CUT_DATE 이하로 "교체"
           TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
           import os
           from pathlib import Path
           import pandas as pd
-          
+
           TAG = os.environ["TAG"]
           CUT = pd.to_datetime(os.environ["CUT_DATE"])
-          
+
           def read_any(parq, csv):
               if Path(parq).exists(): return pd.read_parquet(parq)
               if Path(csv).exists():  return pd.read_csv(csv)
               raise FileNotFoundError(f"missing {parq} or {csv}")
-          
+
           def write_parq(df, p):
               Path(p).parent.mkdir(parents=True, exist_ok=True)
               df.to_parquet(p, index=False)
-          
-          # features_model snapshot (cut)
+
+          # features_model cut + overwrite
           f = read_any("data/features/features_model.parquet", "data/features/features_model.csv")
           f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.tz_localize(None)
           f = f.dropna(subset=["Date"])
           f_cut = f[f["Date"] <= CUT].copy()
+          write_parq(f_cut, "data/features/features_model.parquet")
           write_parq(f_cut, f"data/features/features_model_{TAG}.parquet")
-          print("[SNAP] features_model ->", f"features_model_{TAG}.parquet", "rows=", len(f_cut))
-          
-          # labels_model snapshot (cut)
+          print("[CUT] features_model rows=", len(f_cut))
+
+          # labels_model cut + overwrite
           lm = read_any("data/labels/labels_model.parquet", "data/labels/labels_model.csv")
           lm["Date"] = pd.to_datetime(lm["Date"], errors="coerce").dt.tz_localize(None)
           lm = lm.dropna(subset=["Date"])
           lm_cut = lm[lm["Date"] <= CUT].copy()
+          write_parq(lm_cut, "data/labels/labels_model.parquet")
           write_parq(lm_cut, f"data/labels/labels_model_{TAG}.parquet")
-          print("[SNAP] labels_model ->", f"labels_model_{TAG}.parquet", "rows=", len(lm_cut))
+          print("[CUT] labels_model rows=", len(lm_cut))
           PY
 
-          # 4) train (레포 스크립트명 기준)
-          IFS=',' read -r H0 H1 H2 <<< "${TAU_H_MAP}"
+          # 5) train (레포 파일명: 사진 기준)
+          #    ⚠️ train_model/train_tail_model에 --H 같은 인자가 "없을 수" 있으니 넣지 않음.
+          echo "[TRAIN] train_model.py --tag ${TAG}"
+          python scripts/train_model.py --tag "${TAG}"
 
-          for H in "${H0}" "${H1}" "${H2}"; do
-            echo "[TRAIN] train_model tag=${TAG} H=${H}"
-            python scripts/train_model.py --tag "${TAG}" --H "${H}" || true
+          echo "[TRAIN] train_tail_model.py --tag ${TAG}"
+          python scripts/train_tail_model.py --tag "${TAG}" || true
 
-            echo "[TRAIN] train_tail_model tag=${TAG} H=${H}"
-            python scripts/train_tail_model.py --tag "${TAG}" --H "${H}" || true
-          done
+          echo "[TRAIN] train_badexit_model_wf_lite.py --tag ${TAG}"
+          python scripts/train_badexit_model_wf_lite.py --tag "${TAG}" || true
 
-          echo "[TRAIN] train_badexit_model tag=${TAG}"
-          python scripts/train_badexit_model.py --tag "${TAG}" || true
-
-          echo "[TRAIN] train_tau_model tag=${TAG}"
+          echo "[TRAIN] train_tau_model.py --tag ${TAG}"
           python scripts/train_tau_model.py --tag "${TAG}" || true
 
           echo "[TRAIN] produced app/:"
-          ls -la app | sed -n '1,200p'
+          ls -la app | sed -n '1,200p' || true
+
+          # 6) stage models for scoring (score_features가 MODEL_DIR에서 읽게)
+          mkdir -p "data/models/${TAG}"
+          shopt -s nullglob
+          for f in app/*.pkl; do
+            cp -v "$f" "data/models/${TAG}/" || true
+          done
+
+          echo "[TRAIN] staged data/models/${TAG}:"
+          ls -la "data/models/${TAG}" | sed -n '1,200p' || true
+
+          # gate 모델은 필수(없으면 score_features가 0.0 채움)
+          test -f "data/models/${TAG}/model.pkl"
+          test -f "data/models/${TAG}/scaler.pkl"
 
       # ============================================================
       # (B) WALKFORWARD (same period)
@@ -326,6 +336,9 @@ jobs:
           BADEXIT_MAXES: "1.00"
           MAX_LEVERAGE_PCT: "1.0"
 
+          # ✅ score_features / predict_gate가 모델을 찾을 수 있게 (네가 수정한 코드 전제)
+          MODEL_DIR: data/models/wf_${{ matrix.period }}
+
           # ---- set -u 터지는 애들: 무조건 세팅(빈 문자열 OK)
           EXCLUDE_TICKERS: ""
           REQUIRE_FILES: ""
@@ -346,6 +359,10 @@ jobs:
           OUT_DIR_BASE: data/signals/walkforward
           WF_TAG_BASE: wf
         run: |
+          # (확인) 모델이 staged 되어있는지 한 번 찍어두면 디버깅이 쉬움
+          echo "[RUN] MODEL_DIR=${MODEL_DIR}"
+          ls -la "${MODEL_DIR}" | sed -n '1,200p' || true
+
           chmod +x scripts/run_walkforward_halfyear.sh
           ./scripts/run_walkforward_halfyear.sh
 
