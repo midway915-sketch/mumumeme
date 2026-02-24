@@ -410,38 +410,43 @@ jobs:
           MAX_EXTEND_DAYS: "20"
         shell: bash
         run: |
-          set -euo pipefail
-
-          TAG="wf_${WF_PERIOD}"
-          MODEL_DIR="data/models/${TAG}"
-
-          echo "[BADEXIT] TAG=${TAG}"
-          echo "[BADEXIT] model_dir=${MODEL_DIR}"
-
-          echo "[DEBUG] pre-badexit signals tree:"
-          find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
+            set -euo pipefail
           
-          SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"
-          if [ ! -d "${SIGNALS_DIR}" ]; then
-            echo "[ERROR] signals_dir missing: ${SIGNALS_DIR}"
-            find data/signals -maxdepth 4 -type d | sed -n '1,200p' || true
-            exit 1
-          fi
-          echo "[BADEXIT] using signals_dir=${SIGNALS_DIR}"
-          ls -la "${SIGNALS_DIR}" | sed -n '1,200p' || true
-
-          EX_TAG="$(python - <<'PY'
-          import os
-          pt=float(os.environ["PROFIT_TARGET"])
-          h=int(os.environ["MAX_DAYS"])
-          sl=float(os.environ["STOP_LEVEL"])
-          ex=int(os.environ["MAX_EXTEND_DAYS"])
-          pt_i=int(round(pt*100))
-          sl_i=int(round(abs(sl)*100))
-          print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
-          PY
-          )"
-          echo "[BADEXIT] expected trades tag(EX_TAG)=${EX_TAG}"
+            TAG="wf_${WF_PERIOD}"
+            MODEL_DIR="data/models/${TAG}"
+          
+            echo "[BADEXIT] TAG=${TAG}"
+            echo "[BADEXIT] model_dir=${MODEL_DIR}"
+          
+            SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"
+          
+            echo "[DEBUG] pre-badexit signals tree:"
+            find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
+          
+            if [ ! -d "${SIGNALS_DIR}" ]; then
+              echo "[ERROR] signals_dir missing: ${SIGNALS_DIR}"
+              find data/signals -maxdepth 4 -type d | sed -n '1,200p' || true
+              exit 1
+            fi
+          
+            echo "[BADEXIT] using signals_dir=${SIGNALS_DIR}"
+            ls -la "${SIGNALS_DIR}" | sed -n '1,200p' || true
+          
+            echo "[DEBUG] trades files (depth 3):"
+            find "${SIGNALS_DIR}" -maxdepth 3 -type f \( -name 'sim_engine_trades_*.parquet' -o -name 'sim_engine_trades_*.csv' \) | sed -n '1,200p'
+          
+            EX_TAG="$(python - <<'PY'
+            import os
+            pt=float(os.environ["PROFIT_TARGET"])
+            h=int(os.environ["MAX_DAYS"])
+            sl=float(os.environ["STOP_LEVEL"])
+            ex=int(os.environ["MAX_EXTEND_DAYS"])
+            pt_i=int(round(pt*100))
+            sl_i=int(round(abs(sl)*100))
+            print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
+            PY
+            )"
+            echo "[BADEXIT] expected trades tag(EX_TAG)=${EX_TAG}"
 
           shopt -s nullglob
           made=0
