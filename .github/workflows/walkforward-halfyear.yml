@@ -528,7 +528,6 @@ jobs:
           test -f "${MODEL_DIR}/badexit_model.pkl"
           test -f "${MODEL_DIR}/badexit_scaler.pkl"
 
-        env:
           BADLBL: ${{ '' }}
 
       - name: Upload artifacts (this half-year)
