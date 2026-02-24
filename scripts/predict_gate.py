@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-APP_DIR = Path("app")
 DATA_DIR = Path("data")
 FEATURES_DIR = DATA_DIR / "features"
 
@@ -35,10 +35,9 @@ def read_table(parq: Path, csv: Path) -> pd.DataFrame:
 def _load_features(features_path: str) -> pd.DataFrame:
     if features_path:
         p = Path(features_path)
-        if p.exists():
-            df = pd.read_parquet(p) if p.suffix.lower() == ".parquet" else pd.read_csv(p)
-        else:
+        if not p.exists():
             raise FileNotFoundError(f"--features-path not found: {p}")
+        df = pd.read_parquet(p) if p.suffix.lower() == ".parquet" else pd.read_csv(p)
     else:
         p_parq = FEATURES_DIR / "features_scored.parquet"
         p_csv = FEATURES_DIR / "features_scored.csv"
@@ -54,21 +53,30 @@ def _load_features(features_path: str) -> pd.DataFrame:
     return df
 
 
-def _load_models():
-    model_p = APP_DIR / "model.pkl"
-    scaler_p = APP_DIR / "scaler.pkl"
+def _resolve_model_dir(model_dir_arg: str) -> Path:
+    md = (model_dir_arg or "").strip()
+    if not md:
+        md = os.getenv("MODEL_DIR", "").strip()
+    return Path(md) if md else Path("app")
+
+
+def _load_models(model_dir: Path):
+    import joblib
+
+    model_p = model_dir / "model.pkl"
+    scaler_p = model_dir / "scaler.pkl"
     if not model_p.exists() or not scaler_p.exists():
         raise FileNotFoundError(f"Missing model/scaler: {model_p} {scaler_p}")
-    import joblib
     return joblib.load(model_p), joblib.load(scaler_p)
 
 
-def _load_tail_models():
-    model_p = APP_DIR / "tail_model.pkl"
-    scaler_p = APP_DIR / "tail_scaler.pkl"
+def _load_tail_models(model_dir: Path):
+    import joblib
+
+    model_p = model_dir / "tail_model.pkl"
+    scaler_p = model_dir / "tail_scaler.pkl"
     if not model_p.exists() or not scaler_p.exists():
         raise FileNotFoundError(f"Missing tail model/scaler: {model_p} {scaler_p}")
-    import joblib
     return joblib.load(model_p), joblib.load(scaler_p)
 
 
@@ -95,11 +103,20 @@ def _get_feature_cols(df: pd.DataFrame) -> list[str]:
             pass
 
     drop = {
-        "Date","Ticker",
-        "p_success","p_tail","p_badexit",
-        "tau_H","tau_class","tau_pmax",
-        "ret_score","utility","utility_raw",
-        "tail_pen","utility_qpass","score",
+        "Date",
+        "Ticker",
+        "p_success",
+        "p_tail",
+        "p_badexit",
+        "tau_H",
+        "tau_class",
+        "tau_pmax",
+        "ret_score",
+        "utility",
+        "utility_raw",
+        "tail_pen",
+        "utility_qpass",
+        "score",
     }
     cols = [c for c in df.columns if c not in drop]
     out: list[str] = []
@@ -191,7 +208,7 @@ def _apply_regime_filter(
     return out, audit
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--profit-target", required=True, type=float)
@@ -224,56 +241,21 @@ def main():
     ap.add_argument("--regime-atr-max", default=1.30, type=float)
     ap.add_argument("--regime-leverage-mult", default=3.0, type=float)
 
-    # ✅ NEW: WF date filter
+    # WF date filter
     ap.add_argument("--date-from", default="", type=str, help="optional inclusive date filter YYYY-MM-DD")
     ap.add_argument("--date-to", default="", type=str, help="optional inclusive date filter YYYY-MM-DD")
 
-# --- (A) argparse에 추가 (main() 안에서) ---
-    parser.add_argument(
-    "--model-dir",
-    type=str,
-    default=os.getenv("MODEL_DIR", "").strip(),
-    help="Directory containing model/scaler files. If empty, falls back to app/.",
-)
-
-# --- (B) _load_models() 수정/교체 ---
-from pathlib import Path
-import os
-
-def _resolve_model_dir(args) -> Path:
-    md = (getattr(args, "model_dir", "") or "").strip()
-    if md:
-        return Path(md)
-    return Path("app")  # fallback (기존 동작)
-
-def _load_models(args):
-    model_dir = _resolve_model_dir(args)
-
-    model_p = model_dir / "model.pkl"
-    scaler_p = model_dir / "scaler.pkl"
-    tail_model_p = model_dir / "tail_model.pkl"
-    tail_scaler_p = model_dir / "tail_scaler.pkl"
-
-    # (기존대로) p_success 모델/scaler는 필수
-    if not model_p.exists() or not scaler_p.exists():
-        raise FileNotFoundError(f"Missing model/scaler: {model_p} {scaler_p}")
-
-    # tail 모델은 전략/모드에 따라 필요할 수 있으니 기존 로직 유지하되
-    # 없으면 여기서 예외를 내거나(엄격) / 나중에 fallback을 선택(완화)하면 됨.
-    if not tail_model_p.exists() or not tail_scaler_p.exists():
-        raise FileNotFoundError(f"Missing tail model/scaler: {tail_model_p} {tail_scaler_p}")
-
-    # 아래는 네가 원래 쓰던 로드 방식대로
-    import joblib
-    model = joblib.load(model_p)
-    scaler = joblib.load(scaler_p)
-    tail_model = joblib.load(tail_model_p)
-    tail_scaler = joblib.load(tail_scaler_p)
-
-    return model, scaler, tail_model, tail_scaler
+    # model directory override (also supports env MODEL_DIR)
+    ap.add_argument(
+        "--model-dir",
+        type=str,
+        default="",
+        help="Directory containing model/scaler files. If empty, uses env MODEL_DIR, else falls back to app/.",
+    )
 
     args = ap.parse_args()
 
+    # require-files fail-fast
     req = [x.strip() for x in str(args.require_files or "").split(",") if x.strip()]
     if req:
         missing = [p for p in req if not Path(p).exists()]
@@ -281,9 +263,11 @@ def _load_models(args):
             print(f"[ERROR] Missing required files: {missing}")
             sys.exit(2)
 
+    model_dir = _resolve_model_dir(args.model_dir)
+
     feats = _load_features(args.features_path)
 
-    # ✅ apply date range early
+    # apply date range early (inclusive)
     if str(args.date_from).strip():
         d0 = pd.to_datetime(args.date_from, errors="coerce")
         if pd.isna(d0):
@@ -295,15 +279,15 @@ def _load_models(args):
             raise ValueError(f"--date-to invalid: {args.date_to}")
         feats = feats[feats["Date"] <= d1].copy()
 
+    # ---- p_success
     use_scored_ps = _has_valid_numeric_col(feats, "p_success")
-    use_scored_pt = _has_valid_numeric_col(feats, "p_tail")
-
     if use_scored_ps:
         feats2 = feats.copy()
         feats2["p_success"] = pd.to_numeric(feats2["p_success"], errors="coerce").fillna(0.0).astype(float)
         scored_mode_ps = "use_features_col"
+        feat_cols: list[str] | None = None
     else:
-        model, scaler = _load_models()
+        model, scaler = _load_models(model_dir)
         feat_cols = _get_feature_cols(feats)
         feats2 = _coerce_numeric(feats, feat_cols)
         X = feats2[feat_cols].to_numpy(dtype=float)
@@ -312,27 +296,37 @@ def _load_models(args):
         feats2["p_success"] = (proba[:, 1] if proba.shape[1] >= 2 else proba[:, 0]).astype(float)
         scored_mode_ps = "model_predict"
 
+    # ---- p_tail
+    use_scored_pt = _has_valid_numeric_col(feats2, "p_tail")
+    need_tail = str(args.mode) in ("tail", "tail_utility")
     if use_scored_pt:
         feats2["p_tail"] = pd.to_numeric(feats2.get("p_tail"), errors="coerce").fillna(0.0).astype(float)
         scored_mode_pt = "use_features_col"
     else:
-        if "feat_cols" not in locals():
-            feat_cols = _get_feature_cols(feats2)
-            feats2 = _coerce_numeric(feats2, feat_cols)
-        X = feats2[feat_cols].to_numpy(dtype=float)
-        tail_model, tail_scaler = _load_tail_models()
-        Xt = tail_scaler.transform(X)
-        tproba = tail_model.predict_proba(Xt)
-        feats2["p_tail"] = (tproba[:, 1] if tproba.shape[1] >= 2 else tproba[:, 0]).astype(float)
-        scored_mode_pt = "model_predict"
+        if need_tail:
+            if feat_cols is None:
+                feat_cols = _get_feature_cols(feats2)
+                feats2 = _coerce_numeric(feats2, feat_cols)
+            X = feats2[feat_cols].to_numpy(dtype=float)
+            tail_model, tail_scaler = _load_tail_models(model_dir)
+            Xt = tail_scaler.transform(X)
+            tproba = tail_model.predict_proba(Xt)
+            feats2["p_tail"] = (tproba[:, 1] if tproba.shape[1] >= 2 else tproba[:, 0]).astype(float)
+            scored_mode_pt = "model_predict"
+        else:
+            feats2["p_tail"] = 0.0
+            scored_mode_pt = "filled_0_not_needed"
 
+    # exclude tickers
     if args.exclude_tickers:
         ex = [x.strip().upper() for x in args.exclude_tickers.split(",") if x.strip()]
         if ex:
             feats2 = feats2[~feats2["Ticker"].isin(ex)].copy()
 
+    # ps_min filter
     feats2 = feats2[feats2["p_success"] >= float(args.ps_min)].copy()
 
+    # regime filter
     feats2, regime_audit = _apply_regime_filter(
         feats2,
         mode=str(args.regime_mode),
@@ -360,6 +354,7 @@ def _load_models(args):
                     "regime": regime_audit,
                     "p_success_source": scored_mode_ps,
                     "p_tail_source": scored_mode_pt,
+                    "model_dir": str(model_dir),
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -377,9 +372,11 @@ def _load_models(args):
     feats2["ret_score"] = feats2.get("ret_score", np.nan)
     feats2["utility_raw"] = feats2.get("utility", np.nan)
 
+    # fallback utility
     if "utility" not in feats2.columns or feats2["utility_raw"].isna().all():
         feats2["utility_raw"] = feats2["p_success"].astype(float)
 
+    # tail penalty (only matters for tail modes; harmless otherwise)
     feats2["tail_pen"] = np.maximum(0.0, feats2["p_tail"] - tmax)
 
     qv = feats2["utility_raw"].quantile(uq) if np.isfinite(uq) else feats2["utility_raw"].min()
@@ -417,6 +414,7 @@ def _load_models(args):
         .copy()
     )
 
+    # output: only Date,Ticker (as you intended)
     picks[["Date", "Ticker"]].to_csv(picks_path, index=False)
 
     dbg = {
@@ -440,6 +438,7 @@ def _load_models(args):
         "p_tail_source": scored_mode_pt,
         "date_from": args.date_from,
         "date_to": args.date_to,
+        "model_dir": str(model_dir),
     }
     debug_path.write_text(json.dumps(dbg, ensure_ascii=False, indent=2), encoding="utf-8")
 
