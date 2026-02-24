@@ -267,13 +267,11 @@ jobs:
             out="data/signals/walkforward/${period}"
             mkdir -p "$out"
             echo "[INFO] stage ${base} -> ${out}"
-            # copy contents of artifact folder into the period folder
             rsync -a "${d}/" "${out}/"
           done
 
           echo "[INFO] final tree:"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
-          # sanity: at least one period dir exists
           test "$(find data/signals/walkforward -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
 
       - name: Aggregate metrics across periods
@@ -286,9 +284,21 @@ jobs:
           ls -la data/signals/walkforward | sed -n '1,200p'
           test -f data/signals/walkforward/_summary_walkforward.csv
 
+      - name: Analyze summary (rank configs)
+        run: |
+          set -euo pipefail
+          python scripts/analyze_walkforward_summary.py \
+            --summary data/signals/walkforward/_summary_walkforward.csv \
+            --out data/signals/walkforward/_analysis_walkforward.csv
+
+          ls -la data/signals/walkforward | sed -n '1,200p'
+          test -f data/signals/walkforward/_analysis_walkforward.csv
+
       - name: Upload artifact (walkforward summary)
         uses: actions/upload-artifact@v4
         with:
           name: walkforward_summary
-          path: data/signals/walkforward/_summary_walkforward.csv
+          path: |
+            data/signals/walkforward/_summary_walkforward.csv
+            data/signals/walkforward/_analysis_walkforward.csv
           if-no-files-found: error
