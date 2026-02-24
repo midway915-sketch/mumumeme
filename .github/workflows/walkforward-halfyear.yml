@@ -395,7 +395,7 @@ jobs:
           ./scripts/run_walkforward_halfyear.sh
 
       # ============================================================
-      # (C) BADEXIT (signals 생성 후) - label col 자동탐지 + 단일클래스 안전학습
+      # (C) BADEXIT (signals 생성 후) - one-class 방지 + EX_TAG 호환복사
       # ============================================================
       - name: Build+Train badexit model (post-walkforward, required)
         env:
@@ -436,7 +436,7 @@ jobs:
           )"
           echo "[BADEXIT] expected trades tag(EX_TAG)=${EX_TAG}"
 
-          # 호환 복사본 생성 (EX_TAG 포함)
+          # 호환 복사본 생성 (EX_TAG 포함) - build_badexit_labels.py가 tag 기반으로 찾을 수 있게
           shopt -s nullglob
           made=0
           for f in "${SIGNALS_DIR}"/sim_engine_trades_*.csv "${SIGNALS_DIR}"/sim_engine_trades_*.parquet; do
@@ -464,18 +464,17 @@ jobs:
             echo "${f}"
           }
 
-          # parquet 우선 + EX_TAG 우선
-          badlbl="$(pick_one "data/labels/labels_badexit_${TAG}.parquet data/labels/labels_badexit_${TAG}.csv data/labels/labels_badexit_${EX_TAG}.parquet data/labels/labels_badexit_${EX_TAG}.csv data/labels/*badexit*.parquet data/labels/*badexit*.csv")"
+          # 우선순위: TAG -> EX_TAG -> any
+          badlbl="$(pick_one "data/labels/labels_badexit_${TAG}.parquet data/labels/labels_badexit_${TAG}.csv data/labels/labels_badexit_${EX_TAG}.parquet data/labels/labels_badexit_${EX_TAG}.csv data/labels/labels_badexit_*.parquet data/labels/labels_badexit_*.csv")"
           if [ -z "${badlbl}" ]; then
             echo "[ERROR] badexit labels not found after build_badexit_labels.py"
             ls -la data/labels | sed -n '1,200p' || true
             exit 1
           fi
           echo "[BADEXIT] labels=${badlbl}"
-          export BADLBL="${badlbl}"
 
-          # 라벨 컬럼 자동 탐지
-          LABEL_COL="$(python - <<'PY'
+          # 라벨 컬럼 탐지
+          LABEL_COL="$(BADLBL="${badlbl}" python - <<'PY'
           import os
           import pandas as pd
           from pathlib import Path
@@ -486,17 +485,17 @@ jobs:
           cols = list(df.columns)
           candidates = ["y_badexit", "BadExit", "badexit", "is_badexit", "label", "target"]
           for c in candidates:
-            if c in cols:
-              print(c)
-              raise SystemExit(0)
+              if c in cols:
+                  print(c)
+                  raise SystemExit(0)
 
           print("__MISSING__")
           print("COLS=" + ",".join(cols))
           PY
           )"
           if [ "${LABEL_COL}" = "__MISSING__" ]; then
-            echo "[ERROR] could not find badexit label column in ${BADLBL}"
-            python - <<'PY'
+            echo "[ERROR] could not find badexit label column in ${badlbl}"
+            BADLBL="${badlbl}" python - <<'PY'
           import os
           import pandas as pd
           from pathlib import Path
@@ -508,120 +507,71 @@ jobs:
             exit 1
           fi
           echo "[BADEXIT] detected label_col=${LABEL_COL}"
-          export LABEL_COL="${LABEL_COL}"
 
-          # 2클래스 여부 확인
-          N_CLASSES="$(python - <<'PY'
+          # one-class면 2-class 되도록 synthetic 1 row 추가 (원본을 건드리지 않고 tmp로 학습)
+          TMP_BADLBL="data/labels/_tmp_badexit_train_${TAG}.csv"
+          BADLBL="${badlbl}" LABEL_COL="${LABEL_COL}" OUT="${TMP_BADLBL}" python - <<'PY'
           import os
-          from pathlib import Path
+          import numpy as np
           import pandas as pd
+          from pathlib import Path
 
           p = Path(os.environ["BADLBL"])
           label_col = os.environ["LABEL_COL"]
+          out = Path(os.environ["OUT"])
+
           df = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
+          if label_col not in df.columns:
+              raise SystemExit(f"[BADEXIT][ERROR] label_col missing: {label_col}")
 
-          y = df[label_col].dropna()
-          try:
-            y = y.astype(int)
-          except Exception:
-            y = y.astype(str)
-
-          print(y.nunique())
-          PY
-          )"
-          echo "[BADEXIT] n_classes=${N_CLASSES} (label_col=${LABEL_COL})"
-
-          if [ "${N_CLASSES}" -lt 2 ]; then
-            echo "[BADEXIT][WARN] only 1 class -> train safe LR with 1 synthetic opposite sample (tiny weight)"
-
-            TAG="${TAG}" python - <<'PY'
-          import os, json
-          from pathlib import Path
-          import numpy as np
-          import pandas as pd
-          from sklearn.preprocessing import StandardScaler
-          from sklearn.linear_model import LogisticRegression
-          import joblib
-
-          badlbl = Path(os.environ["BADLBL"])
-          label_col = os.environ["LABEL_COL"]
-          tag = os.environ["TAG"]
-
-          df = pd.read_parquet(badlbl) if badlbl.suffix == ".parquet" else pd.read_csv(badlbl)
-
-          # feature cols: SSOT 우선, 없으면 label/date/ticker류 제외
-          feature_cols_path = Path("data/meta/feature_cols.json")
-          if feature_cols_path.exists():
-            cols = json.loads(feature_cols_path.read_text())
-            feature_cols = [c for c in cols if c in df.columns]
-            src = "SSOT"
+          # feature cols: SSOT 우선, 없으면 Date/Ticker/label 제외 전부
+          ssot = Path("data/meta/feature_cols.json")
+          if ssot.exists():
+              import json
+              cols = json.loads(ssot.read_text())
+              feat_cols = [c for c in cols if c in df.columns]
           else:
-            drop = {label_col, "Date", "Ticker", "date", "ticker"}
-            feature_cols = [c for c in df.columns if c not in drop]
-            src = "fallback_from_data"
+              drop = {"Date", "Ticker", label_col}
+              feat_cols = [c for c in df.columns if c not in drop]
 
-          if not feature_cols:
-            raise SystemExit(f"[BADEXIT][ERROR] no feature cols found. columns={list(df.columns)}")
+          if not feat_cols:
+              raise SystemExit(f"[BADEXIT][ERROR] no feature cols found. columns={list(df.columns)}")
 
-          X = df[feature_cols].copy()
-          y = df[label_col].copy()
+          y = df[label_col].astype(int)
+          n_classes = y.nunique(dropna=True)
 
-          # y 정규화
-          try:
-            y = y.astype(int).values
-          except Exception:
-            ys = y.astype(str).values
-            y = np.array([1 if v in ("1","True","true","TRUE","yes","Y","y") else 0 for v in ys], dtype=int)
+          print(f"[BADEXIT] n_classes={n_classes} (label_col={label_col})")
+          if n_classes >= 2:
+              out.parent.mkdir(parents=True, exist_ok=True)
+              df.to_csv(out, index=False)
+              print(f"[BADEXIT] wrote tmp train file (no change): {out}")
+              raise SystemExit(0)
 
-          X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float).values
-
-          scaler = StandardScaler()
-          Xs = scaler.fit_transform(X)
-
-          uniq = np.unique(y)
-          if uniq.size != 1:
-            raise SystemExit("[BADEXIT][ERROR] expected single-class here")
-
-          only = int(uniq[0])
+          # one-class -> add one opposite sample with tiny noise and tiny weight via row duplication (no sample_weight support)
+          only = int(y.iloc[0])
           opp = 1 - only
 
-          x_mean = Xs.mean(axis=0, keepdims=True)
-          Xs2 = np.vstack([Xs, x_mean])
-          y2 = np.concatenate([y, np.array([opp], dtype=int)])
+          row = df.iloc[[0]].copy()
+          row[label_col] = opp
 
-          w = np.ones(len(y2), dtype=float)
-          w[-1] = 1e-6
+          # tiny noise on numeric feature cols to avoid identical rows edge cases
+          for c in feat_cols:
+              if pd.api.types.is_numeric_dtype(df[c]):
+                  v = float(row[c].iloc[0]) if pd.notna(row[c].iloc[0]) else 0.0
+                  row[c] = v + 1e-9
 
-          model = LogisticRegression(max_iter=500)
-          model.fit(Xs2, y2, sample_weight=w)
-
-          Path("app").mkdir(parents=True, exist_ok=True)
-          joblib.dump(model, f"app/badexit_model_{tag}.pkl")
-          joblib.dump(scaler, f"app/badexit_scaler_{tag}.pkl")
-
-          Path("data/meta").mkdir(parents=True, exist_ok=True)
-          Path(f"data/meta/train_badexit_report_{tag}.json").write_text(json.dumps({
-            "mode": "single_class_safe_lr_with_synthetic_sample",
-            "label_col": label_col,
-            "only_class": only,
-            "synthetic_opposite_class": opp,
-            "n_rows": int(len(df)),
-            "n_features": int(len(feature_cols)),
-            "feature_cols_source": src,
-          }, ensure_ascii=False, indent=2))
-
-          print("[BADEXIT][DONE] wrote app/badexit_model_{tag}.pkl and app/badexit_scaler_{tag}.pkl")
+          df2 = pd.concat([df, row], ignore_index=True)
+          out.parent.mkdir(parents=True, exist_ok=True)
+          df2.to_csv(out, index=False)
+          print(f"[BADEXIT][WARN] only 1 class -> appended 1 synthetic opposite row. wrote: {out}")
           PY
 
-          else
-            echo "[BADEXIT] 2+ classes -> use official trainer"
-            python scripts/train_badexit_model_wf_lite.py \
-              --data-path "${BADLBL}" \
-              --label-col "${LABEL_COL}" \
-              --out-model "app/badexit_model_${TAG}.pkl" \
-              --out-scaler "app/badexit_scaler_${TAG}.pkl" \
-              --out-report "data/meta/train_badexit_report_${TAG}.json"
-          fi
+          python scripts/train_badexit_model_wf_lite.py \
+            --data-path "${TMP_BADLBL}" \
+            --label-col "${LABEL_COL}" \
+            --out-model "app/badexit_model_${TAG}.pkl" \
+            --out-scaler "app/badexit_scaler_${TAG}.pkl" \
+            --out-report "data/meta/train_badexit_report_${TAG}.json"
 
           test -f "app/badexit_model_${TAG}.pkl"
           test -f "app/badexit_scaler_${TAG}.pkl"
