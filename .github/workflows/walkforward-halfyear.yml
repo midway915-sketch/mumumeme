@@ -337,9 +337,9 @@ jobs:
           echo "[TRAIN DONE] gate/tail/tau ready in ${MODEL_DIR}"
 
       # ============================================================
-      # (B) WALKFORWARD
+      # (B) WALKFORWARD (1st pass)
       # ============================================================
-      - name: Walkforward run (one half-year)
+      - name: Walkforward run (one half-year, 1st pass)
         env:
           WF_PERIOD: ${{ matrix.period }}
           TRAIN_START: ${{ matrix.TRAIN_START }}
@@ -364,7 +364,7 @@ jobs:
           ENABLE_TRAILING: "true"
           TOPK_CONFIGS: "1|1.0"
           PS_MINS: "0.00"
-          BADEXIT_MAXES: "1.00"
+          BADEXIT_MAXES: "1.00"  # 1st pass: effectively no badexit gating
           MAX_LEVERAGE_PCT: "1.0"
 
           MODEL_DIR: data/models/wf_${{ matrix.period }}
@@ -386,18 +386,18 @@ jobs:
           OUT_DIR_BASE: data/signals/walkforward
           WF_TAG_BASE: wf
         run: |
-          echo "[RUN] MODEL_DIR=${MODEL_DIR}"
+          echo "[RUN-1] MODEL_DIR=${MODEL_DIR}"
           ls -la "${MODEL_DIR}" | sed -n '1,200p'
 
           chmod +x scripts/run_walkforward_halfyear.sh
           ./scripts/run_walkforward_halfyear.sh
 
-          echo "[DEBUG] after walkforward, signals tree:"
+          echo "[DEBUG] after walkforward-1, signals tree:"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
           ls -la "data/signals/walkforward/${WF_PERIOD}" | sed -n '1,200p' || true
 
       # ============================================================
-      # (C) BADEXIT (signals 생성 후)
+      # (C) BADEXIT (build labels + train + stage)
       # ============================================================
       - name: Build+Train badexit model (post-walkforward, required)
         env:
@@ -431,7 +431,7 @@ jobs:
           ls -la "${SIGNALS_DIR}" | sed -n '1,200p' || true
 
           echo "[DEBUG] trades files (depth 3):"
-          # NOTE: avoid bash parsing issues with '(' by using multiple -name and -o without grouping
+          # NOTE: avoid bash parsing issues with '(' by using separate finds
           find "${SIGNALS_DIR}" -maxdepth 3 -type f -name 'sim_engine_trades_*.parquet' -print | sed -n '1,200p' || true
           find "${SIGNALS_DIR}" -maxdepth 3 -type f -name 'sim_engine_trades_*.csv' -print | sed -n '1,200p' || true
 
@@ -534,11 +534,104 @@ jobs:
           test -f "${MODEL_DIR}/badexit_model.pkl"
           test -f "${MODEL_DIR}/badexit_scaler.pkl"
 
-      - name: Upload artifacts (this half-year)
+      # ============================================================
+      # (D) WALKFORWARD (2nd pass, with badexit)
+      #  - IMPORTANT: rescore features so p_badexit gets attached
+      # ============================================================
+      - name: Rescore features (2nd pass prep: attach p_badexit)
+        env:
+          WF_PERIOD: ${{ matrix.period }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="wf_${WF_PERIOD}"
+          MODEL_DIR="data/models/${TAG}"
+
+          echo "[WF-2 PREP] TAG=${TAG} MODEL_DIR=${MODEL_DIR}"
+          ls -la "${MODEL_DIR}" | sed -n '1,200p'
+
+          # Force re-score so newly staged badexit_model is used
+          rm -f data/features/features_scored.parquet data/features/features_scored.csv || true
+
+          # score_features.py should look into MODEL_DIR (includes badexit_model/scaler now)
+          python scripts/score_features.py --tag "${TAG}" --model-dir "${MODEL_DIR}"
+
+          # sanity
+          ls -la data/features | sed -n '1,200p'
+
+      - name: Walkforward run (one half-year, 2nd pass with badexit)
+        env:
+          WF_PERIOD: ${{ matrix.period }}
+          TRAIN_START: ${{ matrix.TRAIN_START }}
+          TRAIN_END: ${{ matrix.TRAIN_END }}
+          VALID_START: ${{ matrix.VALID_START }}
+          VALID_END: ${{ matrix.VALID_END }}
+          TEST_START: ${{ matrix.TEST_START }}
+          TEST_END: ${{ matrix.TEST_END }}
+          CUT_DATE: ${{ matrix.CUT_DATE }}
+
+          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
+          MAX_DAYS: ${{ inputs.MAX_DAYS }}
+          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
+
+          P_TAIL_THRESHOLDS: "0.10,0.20,0.30"
+          UTILITY_QUANTILES: "0.60,0.75,0.90"
+          RANK_METRICS: "utility"
+          LAMBDA_TAIL: "1.0"
+          GATE_MODES: "tail_utility"
+          TRAIL_STOPS: "0.10"
+          TP1_FRAC: "0.50"
+          ENABLE_TRAILING: "true"
+          TOPK_CONFIGS: "1|1.0"
+          PS_MINS: "0.00"
+
+          # 2nd pass: actually gate by badexit (tune as you like)
+          BADEXIT_MAXES: "0.20"
+          MAX_LEVERAGE_PCT: "1.0"
+
+          MODEL_DIR: data/models/wf_${{ matrix.period }}
+
+          # Require badexit model/scaler too
+          REQUIRE_FILES: "data/models/wf_${{ matrix.period }}/model.pkl,data/models/wf_${{ matrix.period }}/scaler.pkl,data/models/wf_${{ matrix.period }}/tail_model.pkl,data/models/wf_${{ matrix.period }}/tail_scaler.pkl,data/models/wf_${{ matrix.period }}/tau_model.pkl,data/models/wf_${{ matrix.period }}/tau_scaler.pkl,data/models/wf_${{ matrix.period }}/badexit_model.pkl,data/models/wf_${{ matrix.period }}/badexit_scaler.pkl"
+
+          EXCLUDE_TICKERS: ""
+
+          REGIME_MODE: "off"
+          REGIME_DD_MAX: "0.20"
+          REGIME_RET20_MIN: "0.00"
+          REGIME_ATR_MAX: "1.30"
+          REGIME_LEVERAGE_MULT: "3.0"
+
+          TAU_SPLIT: ""
+          USE_TAU_H: "false"
+          ENABLE_DCA: "false"
+
+          # write to a separate folder so 1st pass results aren't mixed
+          OUT_DIR_BASE: data/signals/walkforward2
+          WF_TAG_BASE: wf2
+        run: |
+          echo "[RUN-2] MODEL_DIR=${MODEL_DIR}"
+          ls -la "${MODEL_DIR}" | sed -n '1,200p'
+
+          chmod +x scripts/run_walkforward_halfyear.sh
+          ./scripts/run_walkforward_halfyear.sh
+
+          echo "[DEBUG] after walkforward-2, signals tree:"
+          find data/signals/walkforward2 -maxdepth 2 -type d | sed -n '1,200p'
+          ls -la "data/signals/walkforward2/${WF_PERIOD}" | sed -n '1,200p' || true
+
+      - name: Upload artifacts (this half-year, 1st pass)
         uses: actions/upload-artifact@v4
         with:
           name: walkforward_${{ matrix.period }}
           path: data/signals/walkforward/${{ matrix.period }}
+          if-no-files-found: warn
+
+      - name: Upload artifacts (this half-year, 2nd pass)
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward2_${{ matrix.period }}
+          path: data/signals/walkforward2/${{ matrix.period }}
           if-no-files-found: warn
 
   aggregate:
@@ -558,19 +651,25 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install -U pandas pyarrow
 
-      - name: Download all walkforward artifacts
+      - name: Download all walkforward artifacts (1st pass)
         uses: actions/download-artifact@v4
         with:
           pattern: walkforward_*
           path: _wf_artifacts
 
-      - name: Rebuild expected folder structure
+      - name: Download all walkforward artifacts (2nd pass)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: walkforward2_*
+          path: _wf2_artifacts
+
+      - name: Rebuild expected folder structure (1st pass)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p data/signals/walkforward
 
-          echo "[INFO] downloaded artifacts:"
+          echo "[INFO] downloaded artifacts (wf):"
           ls -la _wf_artifacts | sed -n '1,200p'
 
           shopt -s nullglob
@@ -583,11 +682,33 @@ jobs:
             rsync -a "${d}/" "${out}/"
           done
 
-          echo "[INFO] final tree:"
+          echo "[INFO] final tree (wf):"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
           test "$(find data/signals/walkforward -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
 
-      - name: Aggregate metrics across periods
+      - name: Rebuild expected folder structure (2nd pass)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/signals/walkforward2
+
+          echo "[INFO] downloaded artifacts (wf2):"
+          ls -la _wf2_artifacts | sed -n '1,200p'
+
+          shopt -s nullglob
+          for d in _wf2_artifacts/walkforward2_*; do
+            base="$(basename "$d")"
+            period="${base#walkforward2_}"
+            out="data/signals/walkforward2/${period}"
+            mkdir -p "$out"
+            echo "[INFO] stage ${base} -> ${out}"
+            rsync -a "${d}/" "${out}/"
+          done
+
+          echo "[INFO] final tree (wf2):"
+          find data/signals/walkforward2 -maxdepth 2 -type d | sed -n '1,200p' || true
+
+      - name: Aggregate metrics across periods (1st pass)
         run: |
           set -euo pipefail
           python scripts/aggregate_walkforward_halfyear.py \
@@ -597,7 +718,7 @@ jobs:
           ls -la data/signals/walkforward | sed -n '1,200p'
           test -f data/signals/walkforward/_summary_walkforward.csv
 
-      - name: Analyze summary (rank configs)
+      - name: Analyze summary (rank configs) (1st pass)
         run: |
           set -euo pipefail
           python scripts/analyze_walkforward_summary.py \
@@ -607,11 +728,33 @@ jobs:
           ls -la data/signals/walkforward | sed -n '1,200p'
           test -f data/signals/walkforward/_analysis_walkforward.csv
 
-      - name: Upload artifact (walkforward summary)
+      - name: Aggregate metrics across periods (2nd pass)
+        run: |
+          set -euo pipefail
+          python scripts/aggregate_walkforward_halfyear.py \
+            --root data/signals/walkforward2 \
+            --out data/signals/walkforward2/_summary_walkforward2.csv
+
+          ls -la data/signals/walkforward2 | sed -n '1,200p'
+          test -f data/signals/walkforward2/_summary_walkforward2.csv
+
+      - name: Analyze summary (rank configs) (2nd pass)
+        run: |
+          set -euo pipefail
+          python scripts/analyze_walkforward_summary.py \
+            --summary data/signals/walkforward2/_summary_walkforward2.csv \
+            --out data/signals/walkforward2/_analysis_walkforward2.csv
+
+          ls -la data/signals/walkforward2 | sed -n '1,200p'
+          test -f data/signals/walkforward2/_analysis_walkforward2.csv
+
+      - name: Upload artifact (walkforward summaries)
         uses: actions/upload-artifact@v4
         with:
           name: walkforward_summary
           path: |
             data/signals/walkforward/_summary_walkforward.csv
             data/signals/walkforward/_analysis_walkforward.csv
+            data/signals/walkforward2/_summary_walkforward2.csv
+            data/signals/walkforward2/_analysis_walkforward2.csv
           if-no-files-found: error
