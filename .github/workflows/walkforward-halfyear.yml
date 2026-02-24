@@ -202,10 +202,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           chmod +x scripts/run_walkforward_halfyear.sh
 
           echo "$MATRIX_JSON" > /tmp/matrix.json
+
           python - <<'PY'
           import json
           m=json.load(open("/tmp/matrix.json","r"))
@@ -269,7 +269,6 @@ jobs:
           }
 
           cut_file_inplace_by_date () {
-            # args: IN_PATH CUT_DATE OUT_COPY(optional)
             local p="$1"
             local cut="$2"
             local copy="${3:-}"
@@ -320,6 +319,7 @@ jobs:
 
           summarize_labels () {
             TAG="$1"
+            export TAG
             python - <<'PY'
           import os, glob
           from pathlib import Path
@@ -396,7 +396,6 @@ jobs:
             echo "[WARN] no features_scored.(csv|parquet) in ${dir}"
           }
 
-          # matrix -> TSV for bash loop
           python - <<'PY' > /tmp/periods.tsv
           import json
           m=json.load(open("/tmp/matrix.json","r"))["include"]
@@ -416,7 +415,9 @@ jobs:
           while IFS=$'\t' read -r WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE; do
             idx=$((idx+1))
             TAG="wf_${WF_PERIOD}"
+            export TAG
             MODEL_DIR="data/models/${TAG}"
+            mkdir -p "${MODEL_DIR}"
 
             echo ""
             echo "===================="
@@ -425,23 +426,17 @@ jobs:
             echo "[PERIOD] TAG=${TAG}"
             echo "[PERIOD] train=${TRAIN_START}..${TRAIN_END} cut=${CUT_DATE} test=${TEST_START}..${TEST_END}"
 
-            mkdir -p "${MODEL_DIR}"
-
             ensure_universe
 
-            # Build features (workspace shared)
             python scripts/build_features.py
 
-            # ------------------------------------------------------------
-            # Gate (rolling): build labels from TRAIN_START then cut <= CUT_DATE
-            # ------------------------------------------------------------
+            # Gate rolling
             python scripts/build_labels.py \
               --profit-target "${PROFIT_TARGET}" \
               --max-days "${MAX_DAYS}" \
               --stop-level "${STOP_LEVEL}" \
               --start-date "${TRAIN_START}"
 
-            # Cut gate features/labels to CUT_DATE + keep tagged copies
             TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
           import os
           from pathlib import Path
@@ -476,9 +471,7 @@ jobs:
           print("[CUT] labels_model rows=", len(lm_cut))
           PY
 
-            # ------------------------------------------------------------
-            # Tail (expanding): build full then cut <= CUT_DATE
-            # ------------------------------------------------------------
+            # Tail expanding then cut
             python scripts/build_tail_labels.py \
               --profit-target "${PROFIT_TARGET}" \
               --max-days "${MAX_DAYS}" \
@@ -498,21 +491,12 @@ jobs:
             )"
             echo "[TAIL] labels_path=${TL}"
             if [ -n "${TL}" ] && [ -f "${TL}" ]; then
-              ext="$(python - <<'PY'
-          import os
-          p=os.environ["TL"]
-          print(".parquet" if p.endswith(".parquet") else ".csv")
-          PY
-              TL="${TL}" )"
-              # (bash var TL already set; above PY reads env, so export)
-              export TL
+              if [[ "${TL}" == *.parquet ]]; then ext=".parquet"; else ext=".csv"; fi
               out_copy="data/labels/labels_tail_${TAG}${ext}"
               cut_file_inplace_by_date "${TL}" "${CUT_DATE}" "${out_copy}"
             fi
 
-            # ------------------------------------------------------------
-            # Tau (expanding): build tagged then cut <= CUT_DATE
-            # ------------------------------------------------------------
+            # Tau expanding tagged then cut
             python scripts/build_tau_labels.py \
               --tag "${TAG}" \
               --profit-target "${PROFIT_TARGET}" \
@@ -534,25 +518,13 @@ jobs:
             )"
             echo "[TAU] labels_path=${TAUL}"
             if [ -n "${TAUL}" ] && [ -f "${TAUL}" ]; then
-              ext="$(python - <<'PY'
-          import os
-          p=os.environ["TAUL"]
-          print(".parquet" if p.endswith(".parquet") else ".csv")
-          PY
-              TAUL="${TAUL}" )"
-              export TAUL
+              if [[ "${TAUL}" == *.parquet ]]; then ext=".parquet"; else ext=".csv"; fi
               out_copy="data/labels/labels_tau_${TAG}${ext}"
               cut_file_inplace_by_date "${TAUL}" "${CUT_DATE}" "${out_copy}"
             fi
 
-            # ------------------------------------------------------------
-            # Sanity logs (Gate/Tail/Tau)
-            # ------------------------------------------------------------
-            TAG="${TAG}" summarize_labels "${TAG}"
+            summarize_labels "${TAG}"
 
-            # ------------------------------------------------------------
-            # Train Gate (rolling), Tail (expanding<=CUT), Tau (expanding<=CUT)
-            # ------------------------------------------------------------
             echo "[TRAIN] python scripts/train_model.py --tag ${TAG}"
             python scripts/train_model.py --tag "${TAG}"
 
@@ -591,9 +563,7 @@ jobs:
             echo "[TRAIN] staged in ${MODEL_DIR}:"
             ls -la "${MODEL_DIR}" | sed -n '1,200p'
 
-            # ------------------------------------------------------------
-            # Walkforward #1 (no badexit for current period)
-            # ------------------------------------------------------------
+            # Walkforward #1
             export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
             export PROFIT_TARGET MAX_DAYS STOP_LEVEL
             export P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL GATE_MODES TRAIL_STOPS TP1_FRAC ENABLE_TRAILING TOPK_CONFIGS PS_MINS BADEXIT_MAXES MAX_LEVERAGE_PCT
@@ -610,13 +580,10 @@ jobs:
             echo "[RUN1] done. signals:"
             ls -la "data/signals/walkforward/${WF_PERIOD}" | sed -n '1,200p' || true
 
-            # ------------------------------------------------------------
-            # BadExit expanding (past-only pool)
-            # ------------------------------------------------------------
+            # BadExit expanding past-only pool
             POOL="data/badexit_pool"
             mkdir -p "${POOL}"
             pool_files="$(find "${POOL}" -type f -name 'sim_engine_trades_*' | wc -l | tr -d ' ')"
-            echo "[BADEXIT-EXP] pool dir=${POOL}"
             echo "[BADEXIT-EXP] pool files count=${pool_files}"
 
             BADEXIT_AVAILABLE="false"
@@ -624,35 +591,6 @@ jobs:
               BADEXIT_AVAILABLE="true"
               EX_TAG="$(ex_tag)"
               echo "[BADEXIT-EXP] EX_TAG=${EX_TAG}"
-
-              # CHECK-1C (pool matched only)
-              SIGNALS_DIR="${POOL}" EX_TAG="${EX_TAG}" python - <<'PY'
-          import os, glob
-          import pandas as pd
-          d=os.environ["SIGNALS_DIR"]
-          ex=os.environ["EX_TAG"]
-          files=sorted(set(
-              glob.glob(os.path.join(d, f"sim_engine_trades_{ex}__*.parquet")) +
-              glob.glob(os.path.join(d, f"sim_engine_trades_{ex}__*.csv"))
-          ))
-          print(f"[CHECK-1C] SIGNALS_DIR={d}")
-          print(f"[CHECK-1C] EX_TAG={ex}")
-          print(f"[CHECK-1C] matched files={len(files)}")
-          total=0
-          shown=0
-          for f in files:
-              try:
-                  df=pd.read_parquet(f) if f.endswith(".parquet") else pd.read_csv(f)
-                  n=len(df)
-              except Exception as e:
-                  print(f"[CHECK-1C] read_fail file={f} err={e}")
-                  continue
-              total += n
-              if shown < 10:
-                  print(f"[CHECK-1C] rows={n} file={f}")
-                  shown += 1
-          print(f"[CHECK-1C] matched rows total={total}")
-          PY
 
               python scripts/build_badexit_labels.py \
                 --profit-target "${PROFIT_TARGET}" \
@@ -688,31 +626,6 @@ jobs:
                 echo "[ERROR] badexit label col missing in ${badlbl}"
                 exit 1
               fi
-              echo "[BADEXIT] detected label_col=${LABEL_COL}"
-
-              # CHECK-2B
-              BADLBL="${badlbl}" LABEL_COL="${LABEL_COL}" python - <<'PY'
-          import os
-          import pandas as pd
-          from pathlib import Path
-          p=Path(os.environ["BADLBL"]); lab=os.environ["LABEL_COL"]
-          df=pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
-          print(f"[CHECK-2B] labels_path={p}")
-          print(f"[CHECK-2B] rows={len(df)} cols={len(df.columns)}")
-          if "Ticker" in df.columns:
-              print(f"[CHECK-2B] nunique(Ticker)={df['Ticker'].nunique()}")
-          if "Date" in df.columns:
-              print(f"[CHECK-2B] nunique(Date)={df['Date'].nunique()}")
-          vc=df[lab].value_counts(dropna=False)
-          print(f"[CHECK-2B] value_counts for {lab}")
-          print(vc.to_string())
-          try:
-              s=pd.to_numeric(df[lab], errors="coerce")
-              if s.notna().all() and set(s.unique()).issubset({0,1}):
-                  print(f"[CHECK-2B] pos_rate={float(s.mean()):.6f}")
-          except Exception:
-              pass
-          PY
 
               python scripts/train_badexit_model_wf_lite.py \
                 --data-path "${badlbl}" \
@@ -725,40 +638,27 @@ jobs:
               test -f "app/badexit_scaler_${TAG}.pkl"
               cp -v "app/badexit_model_${TAG}.pkl" "${MODEL_DIR}/badexit_model.pkl"
               cp -v "app/badexit_scaler_${TAG}.pkl" "${MODEL_DIR}/badexit_scaler.pkl"
-              echo "[BADEXIT] staged in ${MODEL_DIR}:"
-              ls -la "${MODEL_DIR}" | sed -n '1,200p'
             else
-              echo "[BADEXIT-EXP] pool empty -> skip badexit training for ${TAG} (no lookahead)."
+              echo "[BADEXIT-EXP] pool empty -> skip badexit training (no lookahead)."
             fi
 
-            # ------------------------------------------------------------
-            # Walkforward #2 (with badexit) if available, else copy wf1 -> wf2
-            # ------------------------------------------------------------
+            # Walkforward #2
             if [ "${BADEXIT_AVAILABLE}" != "true" ]; then
-              echo "[RUN2] skip (no badexit model). Copy walkforward -> walkforward2 for ${WF_PERIOD}"
+              echo "[RUN2] skip (no badexit). copy wf1 -> wf2"
               mkdir -p "data/signals/walkforward2/${WF_PERIOD}"
               rsync -a "data/signals/walkforward/${WF_PERIOD}/" "data/signals/walkforward2/${WF_PERIOD}/" || true
             else
               export REQUIRE_FILES="data/models/${TAG}/model.pkl,data/models/${TAG}/scaler.pkl,data/models/${TAG}/tail_model.pkl,data/models/${TAG}/tail_scaler.pkl,data/models/${TAG}/tau_model.pkl,data/models/${TAG}/tau_scaler.pkl,data/models/${TAG}/badexit_model.pkl,data/models/${TAG}/badexit_scaler.pkl"
               export OUT_DIR_BASE="data/signals/walkforward2"
-              echo "[RUN2] MODEL_DIR=${MODEL_DIR}"
-              ls -la "${MODEL_DIR}" | sed -n '1,200p'
               ./scripts/run_walkforward_halfyear.sh
             fi
 
-            echo "[RUN2] done. signals:"
-            ls -la "data/signals/walkforward2/${WF_PERIOD}" | sed -n '1,200p' || true
-
-            # Ensure features_scored.csv in both outputs
             ensure_features_scored_csv "data/signals/walkforward/${WF_PERIOD}/_inputs"
             ensure_features_scored_csv "data/signals/walkforward2/${WF_PERIOD}/_inputs"
 
-            # ------------------------------------------------------------
-            # Add CURRENT period wf1 trades into pool for NEXT periods (past-only)
-            # ------------------------------------------------------------
+            # Add CURRENT wf1 trades to pool for NEXT periods
             EX_TAG="$(ex_tag)"
             SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"
-            echo "[POOL] add wf1 trades of ${WF_PERIOD} to pool (for next periods), EX_TAG=${EX_TAG}"
             shopt -s nullglob
             n=0
             for f in "${SIGNALS_DIR}"/sim_engine_trades_*.csv "${SIGNALS_DIR}"/sim_engine_trades_*.parquet; do
@@ -774,9 +674,7 @@ jobs:
           done < /tmp/periods.tsv
 
           echo "[DONE] all periods processed."
-          echo "[TREE] signals walkforward:"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p' || true
-          echo "[TREE] signals walkforward2:"
           find data/signals/walkforward2 -maxdepth 2 -type d | sed -n '1,200p' || true
 
       - name: Upload artifact (walkforward all)
@@ -833,7 +731,6 @@ jobs:
           set -euo pipefail
           mkdir -p data/signals/walkforward
           rsync -a "_wf_all/" "data/signals/walkforward/"
-          echo "[INFO] final tree:"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
           test "$(find data/signals/walkforward -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
 
@@ -843,8 +740,6 @@ jobs:
           python scripts/aggregate_walkforward_halfyear.py \
             --root data/signals/walkforward \
             --out data/signals/walkforward/_summary_walkforward.csv
-
-          ls -la data/signals/walkforward | sed -n '1,200p'
           test -f data/signals/walkforward/_summary_walkforward.csv
 
       - name: Analyze summary (rank configs)
@@ -853,8 +748,6 @@ jobs:
           python scripts/analyze_walkforward_summary.py \
             --summary data/signals/walkforward/_summary_walkforward.csv \
             --out data/signals/walkforward/_analysis_walkforward.csv
-
-          ls -la data/signals/walkforward | sed -n '1,200p'
           test -f data/signals/walkforward/_analysis_walkforward.csv
 
       - name: Upload artifact (walkforward summary)
