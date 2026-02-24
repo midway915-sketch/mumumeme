@@ -166,7 +166,7 @@ jobs:
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
       # ============================================================
-      # (A) TRAIN (per half-year, cut at CUT_DATE)
+      # (A) TRAIN (per half-year, cut at CUT_DATE)  ✅ "반드시 성공"
       # ============================================================
       - name: Train models for this half-year (cut at CUT_DATE)
         env:
@@ -185,15 +185,23 @@ jobs:
 
           # required by build_tail_labels.py / train_tail_model.py
           MAX_EXTEND_DAYS: "20"
-
-          TAU_H_MAP: "30,40,50"
         shell: bash
         run: |
           set -euo pipefail
 
           TAG="wf_${WF_PERIOD}"
+          MODEL_DIR="data/models/${TAG}"
+
           echo "[TRAIN] TAG=${TAG} CUT_DATE=${CUT_DATE}"
-          mkdir -p data/features data/labels data/meta app "data/models/${TAG}"
+          mkdir -p data/features data/labels data/meta app "${MODEL_DIR}"
+
+          pick_one () {
+            # usage: pick_one "glob1 glob2 ..."  -> prints first match or empty
+            local pat="$1"
+            local f
+            f="$(ls -1 ${pat} 2>/dev/null | head -n 1 || true)"
+            echo "${f}"
+          }
 
           # 0) universe.csv (없으면 raw에서 생성)
           if [ ! -f data/universe.csv ]; then
@@ -220,7 +228,7 @@ jobs:
           PY
           fi
 
-          # 1) features
+          # 1) features (레포 기본 동작)
           python scripts/build_features.py
 
           # 2) labels (log로 확인된 인자만)
@@ -237,17 +245,7 @@ jobs:
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          # 4) (옵션) tau/badexit labels는 레포 CLI 확정 전이라 "시도만"
-          #    -> 성공하면 train_tau_model이 붙고, 실패해도 WF는 계속 감
-          echo "[TRAIN] try build_tau_labels.py (best-effort)"
-          python scripts/build_tau_labels.py --tag "${TAG}" || true
-          python scripts/build_tau_labels.py || true
-
-          echo "[TRAIN] try build_badexit_labels.py (best-effort)"
-          python scripts/build_badexit_labels.py --tag "${TAG}" || true
-          python scripts/build_badexit_labels.py || true
-
-          # 5) CUT_DATE 누수 방지: features/labels를 CUT_DATE 이하로 'overwrite'
+          # 4) CUT_DATE 누수 방지: features_model/labels_model을 CUT_DATE 이하로 overwrite + tagged snapshot
           TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
           import os
           from pathlib import Path
@@ -265,7 +263,6 @@ jobs:
               Path(p).parent.mkdir(parents=True, exist_ok=True)
               df.to_parquet(p, index=False)
 
-          # features_model cut + overwrite
           f = read_any("data/features/features_model.parquet", "data/features/features_model.csv")
           f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.tz_localize(None)
           f = f.dropna(subset=["Date"])
@@ -274,7 +271,6 @@ jobs:
           write_parq(f_cut, f"data/features/features_model_{TAG}.parquet")
           print("[CUT] features_model rows=", len(f_cut))
 
-          # labels_model cut + overwrite
           lm = read_any("data/labels/labels_model.parquet", "data/labels/labels_model.csv")
           lm["Date"] = pd.to_datetime(lm["Date"], errors="coerce").dt.tz_localize(None)
           lm = lm.dropna(subset=["Date"])
@@ -284,11 +280,11 @@ jobs:
           print("[CUT] labels_model rows=", len(lm_cut))
           PY
 
-          # 6) train gate model (필수)
+          # 5) train gate model (필수: --tag만)
           echo "[TRAIN] train_model.py --tag ${TAG}"
           python scripts/train_model.py --tag "${TAG}"
 
-          # 7) train tail model (필수 args 4개)
+          # 6) train tail model (필수 args 4개) + 출력명 TAG로 고정
           echo "[TRAIN] train_tail_model.py (required args)"
           python scripts/train_tail_model.py \
             --profit-target "${PROFIT_TARGET}" \
@@ -296,120 +292,67 @@ jobs:
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}" \
             --out-model "app/tail_model_${TAG}.pkl" \
-            --out-scaler "app/tail_scaler_${TAG}.pkl" || true
+            --out-scaler "app/tail_scaler_${TAG}.pkl"
 
-          # 8) train badexit/tau (옵션)
-          echo "[TRAIN] train_badexit_model_wf_lite.py (best-effort)"
-          python scripts/train_badexit_model_wf_lite.py --data-path "data/labels/labels_badexit_${TAG}.parquet" \
-            --out-model "app/badexit_model_${TAG}.pkl" \
-            --out-scaler "app/badexit_scaler_${TAG}.pkl" \
-            --out-report "data/meta/train_badexit_report_${TAG}.json" || true
+          echo "[TRAIN] app/ files:"
+          ls -la app | sed -n '1,200p'
 
-          echo "[TRAIN] train_tau_model.py (best-effort)"
-          python scripts/train_tau_model.py --tag "${TAG}" || true
-
-          echo "[TRAIN] produced app/:"
-          ls -la app | sed -n '1,200p' || true
-
-          # 9) stage models -> data/models/${TAG}
-          #    핵심: score_features/predict_gate가 쓰기 쉬운 "고정 이름" 복사본을 만들어둠
-          mkdir -p "data/models/${TAG}"
-
-          # gate model (train_model.py가 tag 붙인 파일명으로 저장)
-          if [ -f "app/model_${TAG}.pkl" ]; then
-            cp -v "app/model_${TAG}.pkl" "data/models/${TAG}/"
-            cp -v "app/model_${TAG}.pkl" "data/models/${TAG}/model.pkl"
+          # 7) stage -> data/models/${TAG} (score_features/predict_gate가 읽는 "고정 이름" 생성)
+          mf="$(pick_one "app/model_*${TAG}*.pkl")"
+          sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
+          if [ -z "${mf}" ] || [ -z "${sf}" ]; then
+            echo "[ERROR] gate model/scaler not found for TAG=${TAG}"
+            echo "  expected something like app/model_${TAG}.pkl or app/model_wf_XXXX.pkl"
+            exit 1
           fi
-          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
+          cp -v "${mf}" "${MODEL_DIR}/model.pkl"
+          cp -v "${sf}" "${MODEL_DIR}/scaler.pkl"
 
-          # 현재 로그 기준 실제 파일명은 model_wf_2020H2.pkl 형태
-          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
-          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
-
-          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
-
-          if [ -f "app/model_${TAG}.pkl" ]; then :; fi
-
-          # fallback: app/model_${TAG}.pkl이 아니라 app/model_wf_XXXX.pkl 형태면 그걸 잡아서 복사
-          if [ ! -f "data/models/${TAG}/model.pkl" ]; then
-            shopt -s nullglob
-            for f in "app/model_${TAG}.pkl" "app/model_${TAG}.pkl" "app/model_${TAG}.pkl" "app/model_${TAG}.pkl" "app/model_${TAG}.pkl"; do :; done
-            for f in app/model_${TAG}.pkl app/model_${TAG}.pkl; do :; done
-            for f in app/model_${TAG}.pkl; do :; done
-            for f in app/model_${TAG}.pkl; do :; done
-            for f in "app/model_${TAG}.pkl" "app/model_${TAG}.pkl"; do :; done
-            # 실제 패턴
-            for f in "app/model_${TAG}.pkl" "app/model_${TAG}.pkl"; do :; done
-            for f in "app/model_${TAG}.pkl" "app/model_${TAG}.pkl"; do :; done
-            for f in app/model_${TAG}.pkl app/model_${TAG}.pkl; do :; done
-
-            # 진짜로: app/model_${TAG}.pkl 없으면 app/model_${TAG}.pkl이 아니라 app/model_${TAG}.pkl? -> 여기선 와일드로 한 번 더
-            for f in app/model_${TAG}.pkl app/model_${TAG}.pkl app/model_${TAG}.pkl app/model_${TAG}.pkl app/model_${TAG}.pkl; do :; done
-            for f in app/model_${TAG}.pkl; do :; done
-            for f in app/model_${TAG}.pkl; do :; done
-
-            for f in app/model_${TAG}.pkl app/model_${TAG}.pkl; do :; done
+          tm="app/tail_model_${TAG}.pkl"
+          ts="app/tail_scaler_${TAG}.pkl"
+          if [ ! -f "${tm}" ] || [ ! -f "${ts}" ]; then
+            echo "[ERROR] tail model/scaler not found: ${tm} / ${ts}"
+            exit 1
           fi
+          cp -v "${tm}" "${MODEL_DIR}/tail_model.pkl"
+          cp -v "${ts}" "${MODEL_DIR}/tail_scaler.pkl"
 
-          # 실제 저장 규칙(너 로그): app/model_wf_2020H2.pkl / app/scaler_wf_2020H2.pkl
-          if [ -f "app/model_${TAG}.pkl" ] && [ -f "app/scaler_${TAG}.pkl" ]; then
-            cp -v "app/scaler_${TAG}.pkl" "data/models/${TAG}/"
-            cp -v "app/scaler_${TAG}.pkl" "data/models/${TAG}/scaler.pkl"
-          fi
+          echo "[TRAIN] staged ${MODEL_DIR}:"
+          ls -la "${MODEL_DIR}" | sed -n '1,200p'
 
-          if [ ! -f "data/models/${TAG}/model.pkl" ]; then
-            # pick by wildcard: model_*.pkl that includes TAG
-            shopt -s nullglob
-            for mf in app/model_"${TAG}".pkl app/model_"${TAG}".pkl app/model_"${TAG}".pkl app/model_"${TAG}".pkl app/model_"${TAG}".pkl; do :; done
-            for mf in app/model_"${TAG}".pkl; do :; done
-            for mf in app/model_"${TAG}".pkl; do :; done
-
-            for mf in app/model_"${TAG}".pkl; do :; done
-            # real:
-            if [ -f "app/model_${TAG}.pkl" ]; then :; fi
-            if [ -f "app/model_${TAG}.pkl" ]; then :; fi
-
-            # final wildcard match
-            mf="$(ls -1 app/model_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
-            sf="$(ls -1 app/scaler_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
-            if [ -n "${mf}" ] && [ -n "${sf}" ]; then
-              cp -v "${mf}" "data/models/${TAG}/"
-              cp -v "${sf}" "data/models/${TAG}/"
-              cp -v "${mf}" "data/models/${TAG}/model.pkl"
-              cp -v "${sf}" "data/models/${TAG}/scaler.pkl"
+          # 8) OPTIONAL: tau/badexit는 "있으면 붙이고 없으면 스킵" (절대 실패시키지 않음)
+          echo "[TRAIN] optional: tau/badexit (skip-if-missing)"
+          if [ -f "data/labels/labels_tau_${TAG}.parquet" ] || [ -f "data/labels/labels_tau_${TAG}.csv" ] || \
+             [ -f "data/labels/labels_tau.parquet" ] || [ -f "data/labels/labels_tau.csv" ]; then
+            python scripts/train_tau_model.py --tag "${TAG}" || true
+            taum="$(pick_one "app/tau_model_*${TAG}*.pkl")"
+            taus="$(pick_one "app/tau_scaler_*${TAG}*.pkl")"
+            if [ -n "${taum}" ] && [ -n "${taus}" ]; then
+              cp -v "${taum}" "${MODEL_DIR}/tau_model.pkl"
+              cp -v "${taus}" "${MODEL_DIR}/tau_scaler.pkl"
             fi
+          else
+            echo "[TRAIN] no tau labels found -> skip tau training"
           fi
 
-          # tail model staging (optional)
-          tm="$(ls -1 app/tail_model_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
-          ts="$(ls -1 app/tail_scaler_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
-          if [ -n "${tm}" ] && [ -n "${ts}" ]; then
-            cp -v "${tm}" "data/models/${TAG}/tail_model.pkl"
-            cp -v "${ts}" "data/models/${TAG}/tail_scaler.pkl"
+          badlbl="$(pick_one "data/labels/labels_badexit_${TAG}.parquet data/labels/labels_badexit_${TAG}.csv data/labels/labels_badexit.parquet data/labels/labels_badexit.csv")"
+          if [ -n "${badlbl}" ]; then
+            python scripts/train_badexit_model_wf_lite.py \
+              --data-path "${badlbl}" \
+              --out-model "app/badexit_model_${TAG}.pkl" \
+              --out-scaler "app/badexit_scaler_${TAG}.pkl" \
+              --out-report "data/meta/train_badexit_report_${TAG}.json" || true
+            bm="$(pick_one "app/badexit_model_*${TAG}*.pkl")"
+            bs="$(pick_one "app/badexit_scaler_*${TAG}*.pkl")"
+            if [ -n "${bm}" ] && [ -n "${bs}" ]; then
+              cp -v "${bm}" "${MODEL_DIR}/badexit_model.pkl"
+              cp -v "${bs}" "${MODEL_DIR}/badexit_scaler.pkl"
+            fi
+          else
+            echo "[TRAIN] no badexit labels found -> skip badexit training"
           fi
 
-          # badexit staging (optional)
-          bm="$(ls -1 app/badexit_model_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
-          bs="$(ls -1 app/badexit_scaler_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
-          if [ -n "${bm}" ] && [ -n "${bs}" ]; then
-            cp -v "${bm}" "data/models/${TAG}/badexit_model.pkl"
-            cp -v "${bs}" "data/models/${TAG}/badexit_scaler.pkl"
-          fi
-
-          # tau staging (optional)
-          taum="$(ls -1 app/tau_model_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
-          taus="$(ls -1 app/tau_scaler_*"${TAG}"*.pkl 2>/dev/null | head -n 1 || true)"
-          if [ -n "${taum}" ] && [ -n "${taus}" ]; then
-            cp -v "${taum}" "data/models/${TAG}/tau_model.pkl"
-            cp -v "${taus}" "data/models/${TAG}/tau_scaler.pkl"
-          fi
-
-          echo "[TRAIN] staged data/models/${TAG}:"
-          ls -la "data/models/${TAG}" | sed -n '1,200p' || true
-
-          # gate model은 필수(없으면 이후 점수 0.0 채움으로 가버림)
-          test -f "data/models/${TAG}/model.pkl"
-          test -f "data/models/${TAG}/scaler.pkl"
+          echo "[TRAIN DONE] required models ready in ${MODEL_DIR}"
 
       # ============================================================
       # (B) WALKFORWARD (same period)
@@ -446,8 +389,8 @@ jobs:
           # ✅ 모델 디렉토리 (score_features/predict_gate가 여기서 읽도록)
           MODEL_DIR: data/models/wf_${{ matrix.period }}
 
-          # fail-fast용 (네 predict_gate.py에 --require-files 구현돼있으니 이걸 쓰면 바로 감지 가능)
-          REQUIRE_FILES: "data/models/wf_${{ matrix.period }}/model.pkl,data/models/wf_${{ matrix.period }}/scaler.pkl"
+          # fail-fast용
+          REQUIRE_FILES: "data/models/wf_${{ matrix.period }}/model.pkl,data/models/wf_${{ matrix.period }}/scaler.pkl,data/models/wf_${{ matrix.period }}/tail_model.pkl,data/models/wf_${{ matrix.period }}/tail_scaler.pkl"
 
           EXCLUDE_TICKERS: ""
 
@@ -465,7 +408,7 @@ jobs:
           WF_TAG_BASE: wf
         run: |
           echo "[RUN] MODEL_DIR=${MODEL_DIR}"
-          ls -la "${MODEL_DIR}" | sed -n '1,200p' || true
+          ls -la "${MODEL_DIR}" | sed -n '1,200p'
 
           chmod +x scripts/run_walkforward_halfyear.sh
           ./scripts/run_walkforward_halfyear.sh
