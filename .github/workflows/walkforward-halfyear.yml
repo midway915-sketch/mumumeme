@@ -104,26 +104,26 @@ jobs:
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-          
+
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-          
+
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-          
+
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-          
+
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
-          
+
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
@@ -164,22 +164,22 @@ jobs:
           python - <<'PY' > /tmp/matrix.json
           import json, re
           from datetime import date, timedelta
-          
+
           wf_start = "${{ inputs.wf_start }}".strip()
           wf_end   = "${{ inputs.wf_end }}".strip()
           train_years = int("${{ inputs.train_years }}")
-          
+
           m = re.fullmatch(r"(\d{4})H([12])", wf_start)
           n = re.fullmatch(r"(\d{4})H([12])", wf_end)
           if not m or not n:
               raise SystemExit("wf_start/wf_end must be like 2018H1")
-          
+
           sy, sh = int(m.group(1)), int(m.group(2))
           ey, eh = int(n.group(1)), int(n.group(2))
-          
+
           def half_start(y,h): return date(y,1,1) if h==1 else date(y,7,1)
           def half_end(y,h):   return date(y,6,30) if h==1 else date(y,12,31)
-          
+
           items=[]
           y,h=sy,sh
           while True:
@@ -203,7 +203,7 @@ jobs:
               if y==ey and h==eh: break
               if h==1: h=2
               else: y+=1; h=1
-          
+
           print(json.dumps({"include":items}, ensure_ascii=False))
           PY
 
@@ -379,19 +379,19 @@ jobs:
           import os
           from pathlib import Path
           import pandas as pd
-          
+
           TAG=os.environ["TAG"]
           CUT=pd.to_datetime(os.environ["CUT_DATE"])
-          
+
           def read_any(parq, csv):
               if Path(parq).exists(): return pd.read_parquet(parq)
               if Path(csv).exists():  return pd.read_csv(csv)
               raise FileNotFoundError(f"missing {parq} or {csv}")
-          
+
           def write_parq(df, p):
               Path(p).parent.mkdir(parents=True, exist_ok=True)
               df.to_parquet(p, index=False)
-          
+
           f = read_any("data/features/features_model.parquet", "data/features/features_model.csv")
           f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.tz_localize(None)
           f = f.dropna(subset=["Date"])
@@ -399,7 +399,7 @@ jobs:
           write_parq(f_cut, "data/features/features_model.parquet")
           write_parq(f_cut, f"data/features/features_model_{TAG}.parquet")
           print("[CUT] features_model rows=", len(f_cut))
-          
+
           lm = read_any("data/labels/labels_model.parquet", "data/labels/labels_model.csv")
           lm["Date"] = pd.to_datetime(lm["Date"], errors="coerce").dt.tz_localize(None)
           lm = lm.dropna(subset=["Date"])
@@ -435,32 +435,32 @@ jobs:
           import os
           import pandas as pd
           from pathlib import Path
-          
+
           p = Path(os.environ["IN_PATH"])
           cut = pd.to_datetime(os.environ["CUT_DATE"])
           out_copy = os.environ.get("OUT_COPY","").strip()
-          
+
           df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
-          
+
           if "Date" not in df.columns:
               print(f"[CUT] no Date column -> skip: {p}")
               raise SystemExit(0)
-          
+
           dt = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
           df = df.loc[dt.notna()].copy()
           df["Date"] = dt.loc[dt.notna()].values
-          
+
           before=len(df)
           df = df[df["Date"] <= cut].copy()
           after=len(df)
-          
+
           if p.suffix==".parquet":
               df.to_parquet(p, index=False)
           else:
               df.to_csv(p, index=False)
-          
+
           print(f"[CUT] {p}: {before} -> {after} (<= {cut.date()})")
-          
+
           if out_copy:
               cp = Path(out_copy)
               cp.parent.mkdir(parents=True, exist_ok=True)
@@ -500,32 +500,32 @@ jobs:
           import os
           import pandas as pd
           from pathlib import Path
-          
+
           p = Path(os.environ["IN_PATH"])
           cut = pd.to_datetime(os.environ["CUT_DATE"])
           out_copy = os.environ.get("OUT_COPY","").strip()
-          
+
           df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
-          
+
           if "Date" not in df.columns:
               print(f"[CUT] no Date column -> skip: {p}")
               raise SystemExit(0)
-          
+
           dt = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
           df = df.loc[dt.notna()].copy()
           df["Date"] = dt.loc[dt.notna()].values
-          
+
           before=len(df)
           df = df[df["Date"] <= cut].copy()
           after=len(df)
-          
+
           if p.suffix==".parquet":
               df.to_parquet(p, index=False)
           else:
               df.to_csv(p, index=False)
-          
+
           print(f"[CUT] {p}: {before} -> {after} (<= {cut.date()})")
-          
+
           if out_copy:
               cp = Path(out_copy)
               cp.parent.mkdir(parents=True, exist_ok=True)
@@ -620,11 +620,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "[DEBUG] features-base artifact tree:"
-          find _artifacts/features-base -maxdepth 4 -type f | sed -n '1,200p' || true
-
           mkdir -p data/features data/meta data
-
           if [ -d _artifacts/features-base/features ]; then
             rsync -a "_artifacts/features-base/features/" "data/features/"
           fi
@@ -637,7 +633,6 @@ jobs:
 
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             echo "[FALLBACK] features_model missing -> rebuilding features locally"
-            mkdir -p data/features data/meta
             python scripts/build_features.py
           fi
 
@@ -646,26 +641,18 @@ jobs:
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-
-          ticks = (
-              df["Ticker"].astype(str).str.upper().str.strip()
-                .dropna().unique().tolist()
-          )
+          ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
           ticks = sorted(set([t for t in ticks if t]))
-
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
@@ -676,39 +663,54 @@ jobs:
           test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
 
-      - name: Download models_* artifacts
+      # ✅ 중요: merge-multiple 사용 금지 (폴더 구조 보존)
+      - name: Download models_* artifacts (keep per-artifact dirs)
         uses: actions/download-artifact@v4
         with:
           pattern: models_*
           path: _wf1_artifacts/models
-          merge-multiple: true
 
-      - name: Download walkforward_* artifacts
+      - name: Download walkforward_* artifacts (keep per-artifact dirs)
         uses: actions/download-artifact@v4
         with:
           pattern: walkforward_*
           path: _wf1_artifacts/walkforward
-          merge-multiple: true
 
-      - name: Restore data/ tree from wf1 artifacts (robust)
+      - name: Rebuild wf1 structure from per-artifact dirs (robust)
         shell: bash
         run: |
           set -euo pipefail
-          echo "[DEBUG] wf1 models artifact tree (top 200):"
-          find _wf1_artifacts/models -maxdepth 6 -type f | sed -n '1,200p' || true
-          echo "[DEBUG] wf1 walkforward artifact tree (top 200):"
-          find _wf1_artifacts/walkforward -maxdepth 8 -type f | sed -n '1,200p' || true
+          mkdir -p data/models data/signals/walkforward data/signals/walkforward2 data/badexit_pool data/labels data/meta app
+          shopt -s nullglob
 
-          # Most robust: artifacts typically contain full relative paths like data/models/... or data/signals/...
-          rsync -a "_wf1_artifacts/models/" "./"
-          rsync -a "_wf1_artifacts/walkforward/" "./"
+          echo "[DEBUG] models artifacts tree (top 200):"
+          find _wf1_artifacts/models -maxdepth 4 -type d | sed -n '1,200p' || true
+          echo "[DEBUG] walkforward artifacts tree (top 200):"
+          find _wf1_artifacts/walkforward -maxdepth 4 -type d | sed -n '1,200p' || true
 
-          echo "[DEBUG] after restore, data/models dirs:"
+          # models_${period} -> data/models/wf_${period}
+          for d in _wf1_artifacts/models/models_*; do
+            base="$(basename "$d")"
+            period="${base#models_}"
+            out="data/models/wf_${period}"
+            mkdir -p "$out"
+            rsync -a "${d}/" "${out}/"
+          done
+
+          # walkforward_${period} -> data/signals/walkforward/${period}
+          for d in _wf1_artifacts/walkforward/walkforward_*; do
+            base="$(basename "$d")"
+            period="${base#walkforward_}"
+            out="data/signals/walkforward/${period}"
+            mkdir -p "$out"
+            rsync -a "${d}/" "${out}/"
+          done
+
+          echo "[DEBUG] after rebuild, data/models dirs:"
           find data/models -maxdepth 2 -type d | sed -n '1,200p' || true
-          echo "[DEBUG] after restore, data/signals/walkforward dirs:"
+          echo "[DEBUG] after rebuild, data/signals/walkforward dirs:"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p' || true
 
-          # Hard checks (must exist at least one period)
           test "$(find data/models -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
           test "$(find data/signals/walkforward -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
 
