@@ -596,41 +596,41 @@ jobs:
           echo "$MATRIX_JSON" > /tmp/matrix.json
 
           python - <<'PY' > /tmp/periods.tsv
-import json
-m=json.load(open("/tmp/matrix.json","r"))["include"]
-for it in m:
-    print("\t".join([
-        it["period"],
-        it["TRAIN_START"], it["TRAIN_END"],
-        it["VALID_START"], it["VALID_END"],
-        it["TEST_START"], it["TEST_END"],
-        it["CUT_DATE"],
-    ]))
-PY
+          import json
+          m=json.load(open("/tmp/matrix.json","r"))["include"]
+          for it in m:
+              print("\t".join([
+                  it["period"],
+                  it["TRAIN_START"], it["TRAIN_END"],
+                  it["VALID_START"], it["VALID_END"],
+                  it["TEST_START"], it["TEST_END"],
+                  it["CUT_DATE"],
+              ]))
+          PY
 
           ex_tag () {
             python -c '
-import os
-pt=float(os.environ["PROFIT_TARGET"])
-h=int(os.environ["MAX_DAYS"])
-sl=float(os.environ["STOP_LEVEL"])
-ex=int(os.environ["MAX_EXTEND_DAYS"])
-pt_i=int(round(pt*100))
-sl_i=int(round(abs(sl)*100))
-print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
-'
+          import os
+          pt=float(os.environ["PROFIT_TARGET"])
+          h=int(os.environ["MAX_DAYS"])
+          sl=float(os.environ["STOP_LEVEL"])
+          ex=int(os.environ["MAX_EXTEND_DAYS"])
+          pt_i=int(round(pt*100))
+          sl_i=int(round(abs(sl)*100))
+          print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
+          '
           }
 
           ensure_features_scored_csv () {
             local dir="$1"
             if [ -d "${dir}" ] && [ ! -f "${dir}/features_scored.csv" ] && [ -f "${dir}/features_scored.parquet" ]; then
               python -c '
-import os, pandas as pd
-d=os.environ["DIR"]
-df=pd.read_parquet(f"{d}/features_scored.parquet")
-df.to_csv(f"{d}/features_scored.csv", index=False)
-print("[DONE] wrote", f"{d}/features_scored.csv", "rows=", len(df))
-' DIR="${dir}"
+          import os, pandas as pd
+          d=os.environ["DIR"]
+          df=pd.read_parquet(f"{d}/features_scored.parquet")
+          df.to_csv(f"{d}/features_scored.csv", index=False)
+          print("[DONE] wrote", f"{d}/features_scored.csv", "rows=", len(df))
+          ' DIR="${dir}"
             fi
           }
 
@@ -679,18 +679,18 @@ print("[DONE] wrote", f"{d}/features_scored.csv", "rows=", len(df))
               echo "[BADEXIT] labels=${badlbl}"
 
               LABEL_COL="$(python -c '
-import os
-import pandas as pd
-from pathlib import Path
-p=Path(os.environ["BADLBL"])
-df=pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
-cols=list(df.columns)
-for c in ["y_badexit","BadExit","badexit","is_badexit","label","target"]:
-    if c in cols:
-        print(c)
-        raise SystemExit(0)
-print("__MISSING__")
-' BADLBL="${badlbl}")"
+          import os
+          import pandas as pd
+          from pathlib import Path
+          p=Path(os.environ["BADLBL"])
+          df=pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
+          cols=list(df.columns)
+          for c in ["y_badexit","BadExit","badexit","is_badexit","label","target"]:
+              if c in cols:
+                  print(c)
+                  raise SystemExit(0)
+          print("__MISSING__")
+          ' BADLBL="${badlbl}")"
 
               if [ "${LABEL_COL}" = "__MISSING__" ]; then
                 echo "[ERROR] badexit label col missing"
