@@ -92,17 +92,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: raw-data
-          path: _artifacts/raw-data
-
-      - name: Unpack raw-data into repo
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/raw
-          rsync -a "_artifacts/raw-data/" "data/raw/"
-          echo "[DEBUG] raw-data tree:"
-          find data/raw -maxdepth 2 -type f | sed -n '1,200p'
-          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
+          path: data/raw
 
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
@@ -244,17 +234,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: raw-data
-          path: _artifacts/raw-data
-
-      - name: Unpack raw-data into repo
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/raw
-          rsync -a "_artifacts/raw-data/" "data/raw/"
-          echo "[DEBUG] raw-data tree:"
-          find data/raw -maxdepth 2 -type f | sed -n '1,200p'
-          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
+          path: data/raw
 
       - name: Download features-base artifact
         uses: actions/download-artifact@v4
@@ -262,93 +242,75 @@ jobs:
           name: features-base
           path: _artifacts/features-base
 
-      - name: Unpack features-base into repo (robust)
+      - name: Unpack features-base into data/ (fast, correct mapping)
         shell: bash
         run: |
           set -euo pipefail
-
           echo "[DEBUG] features-base artifact tree:"
-          find _artifacts/features-base -maxdepth 6 -type f | sed -n '1,200p' || true
+          find _artifacts/features-base -maxdepth 4 -type f | sed -n '1,200p' || true
 
-          # Find a parent dir that contains data/features or data/universe.csv, then rsync that parent into repo root.
-          base=""
-          hit="$(find _artifacts/features-base -maxdepth 6 -type d -path '*/data/features' | head -n 1 || true)"
-          if [ -n "${hit}" ]; then
-            base="${hit%/data/features}"
-          else
-            hit2="$(find _artifacts/features-base -maxdepth 6 -type f -path '*/data/universe.csv' | head -n 1 || true)"
-            if [ -n "${hit2}" ]; then
-              base="${hit2%/data/universe.csv}"
-            fi
+          mkdir -p data/features data/meta data
+
+          # upload-artifact(data/features) => artifact contains "features/*" (not "data/features/*")
+          if [ -d _artifacts/features-base/features ]; then
+            rsync -a "_artifacts/features-base/features/" "data/features/"
+          fi
+          if [ -d _artifacts/features-base/meta ]; then
+            rsync -a "_artifacts/features-base/meta/" "data/meta/"
+          fi
+          if [ -f _artifacts/features-base/universe.csv ]; then
+            cp -v "_artifacts/features-base/universe.csv" "data/universe.csv"
           fi
 
-          if [ -n "${base}" ]; then
-            echo "[INFO] unpack features-base from base=${base}"
-            rsync -a "${base}/" "./"
-          else
-            echo "[WARN] could not locate data/features in features-base artifact; will fallback to rebuild features."
-          fi
-
-          echo "[DEBUG] after unpack, repo data tree:"
+          echo "[DEBUG] after unpack:"
           find data -maxdepth 3 -type f | sed -n '1,200p' || true
 
-          # Fallback: if still missing, rebuild here (should be rare)
+          # Fallbacks (should be rare)
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             echo "[FALLBACK] features_model missing -> rebuilding features locally"
             mkdir -p data/features data/meta
             python scripts/build_features.py
           fi
 
-          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
-          test -f data/universe.csv
-
-      - name: Ensure universe.csv (from raw if missing)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data
           if [ ! -f data/universe.csv ]; then
-            echo "[INFO] data/universe.csv missing -> generating from raw prices"
+            echo "[FALLBACK] universe.csv missing -> generating from raw prices"
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-          
+
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-          
+
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-          
+
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-          
+
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
-          
+
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
           PY
           fi
-          ls -la data | sed -n '1,200p'
+
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
 
       - name: Verify inputs
         shell: bash
         run: |
           set -euo pipefail
-          echo "[DEBUG] verify listing:"
-          ls -la data | sed -n '1,200p'
-          ls -la data/features | sed -n '1,200p' || true
-          ls -la data/raw | sed -n '1,200p' || true
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
           test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
@@ -648,17 +610,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: raw-data
-          path: _artifacts/raw-data
-
-      - name: Unpack raw-data into repo
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/raw
-          rsync -a "_artifacts/raw-data/" "data/raw/"
-          echo "[DEBUG] raw-data tree:"
-          find data/raw -maxdepth 2 -type f | sed -n '1,200p'
-          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
+          path: data/raw
 
       - name: Download features-base artifact
         uses: actions/download-artifact@v4
@@ -666,33 +618,26 @@ jobs:
           name: features-base
           path: _artifacts/features-base
 
-      - name: Unpack features-base into repo (robust)
+      - name: Unpack features-base into data/ (fast, correct mapping)
         shell: bash
         run: |
           set -euo pipefail
-
           echo "[DEBUG] features-base artifact tree:"
-          find _artifacts/features-base -maxdepth 6 -type f | sed -n '1,200p' || true
+          find _artifacts/features-base -maxdepth 4 -type f | sed -n '1,200p' || true
 
-          base=""
-          hit="$(find _artifacts/features-base -maxdepth 6 -type d -path '*/data/features' | head -n 1 || true)"
-          if [ -n "${hit}" ]; then
-            base="${hit%/data/features}"
-          else
-            hit2="$(find _artifacts/features-base -maxdepth 6 -type f -path '*/data/universe.csv' | head -n 1 || true)"
-            if [ -n "${hit2}" ]; then
-              base="${hit2%/data/universe.csv}"
-            fi
+          mkdir -p data/features data/meta data
+
+          if [ -d _artifacts/features-base/features ]; then
+            rsync -a "_artifacts/features-base/features/" "data/features/"
+          fi
+          if [ -d _artifacts/features-base/meta ]; then
+            rsync -a "_artifacts/features-base/meta/" "data/meta/"
+          fi
+          if [ -f _artifacts/features-base/universe.csv ]; then
+            cp -v "_artifacts/features-base/universe.csv" "data/universe.csv"
           fi
 
-          if [ -n "${base}" ]; then
-            echo "[INFO] unpack features-base from base=${base}"
-            rsync -a "${base}/" "./"
-          else
-            echo "[WARN] could not locate data/features in features-base artifact; will fallback to rebuild features."
-          fi
-
-          echo "[DEBUG] after unpack, repo data tree:"
+          echo "[DEBUG] after unpack:"
           find data -maxdepth 3 -type f | sed -n '1,200p' || true
 
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
@@ -701,46 +646,39 @@ jobs:
             python scripts/build_features.py
           fi
 
-          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
-          test -f data/universe.csv
-
-      - name: Ensure universe.csv (from raw if missing)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data
           if [ ! -f data/universe.csv ]; then
-            echo "[INFO] data/universe.csv missing -> generating from raw prices"
+            echo "[FALLBACK] universe.csv missing -> generating from raw prices"
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-          
+
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-          
+
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-          
+
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-          
+
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
-          
+
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
           PY
           fi
-          ls -la data | sed -n '1,200p'
+
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
 
       - name: Download models_* artifacts
