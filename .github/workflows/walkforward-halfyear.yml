@@ -251,7 +251,6 @@ jobs:
 
           mkdir -p data/features data/meta data
 
-          # upload-artifact(data/features) => artifact contains "features/*" (not "data/features/*")
           if [ -d _artifacts/features-base/features ]; then
             rsync -a "_artifacts/features-base/features/" "data/features/"
           fi
@@ -265,7 +264,6 @@ jobs:
           echo "[DEBUG] after unpack:"
           find data -maxdepth 3 -type f | sed -n '1,200p' || true
 
-          # Fallbacks (should be rare)
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             echo "[FALLBACK] features_model missing -> rebuilding features locally"
             mkdir -p data/features data/meta
@@ -637,9 +635,6 @@ jobs:
             cp -v "_artifacts/features-base/universe.csv" "data/universe.csv"
           fi
 
-          echo "[DEBUG] after unpack:"
-          find data -maxdepth 3 -type f | sed -n '1,200p' || true
-
           if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
             echo "[FALLBACK] features_model missing -> rebuilding features locally"
             mkdir -p data/features data/meta
@@ -695,33 +690,27 @@ jobs:
           path: _wf1_artifacts/walkforward
           merge-multiple: true
 
-      - name: Rebuild structure from artifacts
+      - name: Restore data/ tree from wf1 artifacts (robust)
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p data/models data/signals/walkforward data/signals/walkforward2 data/badexit_pool data/labels data/meta app
-          shopt -s nullglob
+          echo "[DEBUG] wf1 models artifact tree (top 200):"
+          find _wf1_artifacts/models -maxdepth 6 -type f | sed -n '1,200p' || true
+          echo "[DEBUG] wf1 walkforward artifact tree (top 200):"
+          find _wf1_artifacts/walkforward -maxdepth 8 -type f | sed -n '1,200p' || true
 
-          for d in _wf1_artifacts/models/models_*; do
-            base="$(basename "$d")"
-            period="${base#models_}"
-            out="data/models/wf_${period}"
-            mkdir -p "$out"
-            rsync -a "${d}/" "${out}/"
-          done
+          # Most robust: artifacts typically contain full relative paths like data/models/... or data/signals/...
+          rsync -a "_wf1_artifacts/models/" "./"
+          rsync -a "_wf1_artifacts/walkforward/" "./"
 
-          for d in _wf1_artifacts/walkforward/walkforward_*; do
-            base="$(basename "$d")"
-            period="${base#walkforward_}"
-            out="data/signals/walkforward/${period}"
-            mkdir -p "$out"
-            rsync -a "${d}/" "${out}/"
-          done
-
-          echo "[INFO] models dirs:"
+          echo "[DEBUG] after restore, data/models dirs:"
           find data/models -maxdepth 2 -type d | sed -n '1,200p' || true
-          echo "[INFO] wf1 dirs:"
+          echo "[DEBUG] after restore, data/signals/walkforward dirs:"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p' || true
+
+          # Hard checks (must exist at least one period)
+          test "$(find data/models -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
+          test "$(find data/signals/walkforward -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
 
       - name: Sequential BadExit(expanding past-only) + WF#2
         env:
