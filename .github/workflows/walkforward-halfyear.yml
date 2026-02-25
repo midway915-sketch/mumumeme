@@ -1076,6 +1076,12 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install -U pandas pyarrow
 
+      - name: Download raw-data artifact (for QQQ benchmark)
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+
       - name: Download walkforward2_all artifact
         uses: actions/download-artifact@v4
         with:
