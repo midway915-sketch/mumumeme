@@ -3,412 +3,256 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 from pathlib import Path
 import math
+import re
 import numpy as np
 import pandas as pd
 
 
-# ----------------------------
-# io utils
-# ----------------------------
-def _safe_to_dt(x) -> pd.Series:
-    return pd.to_datetime(x, errors="coerce").dt.tz_localize(None)
-
-
+# -----------------------
+# IO helpers
+# -----------------------
 def _read_any(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
     if path.suffix.lower() == ".parquet":
         return pd.read_parquet(path)
     return pd.read_csv(path)
 
 
-def _curve_to_trades_path(curve_path: Path) -> Path:
-    # sim_engine_curve_... -> sim_engine_trades_...
-    name = curve_path.name.replace("sim_engine_curve_", "sim_engine_trades_")
-    # keep same extension if possible; if missing, try both
-    cand = curve_path.with_name(name)
-    if cand.exists():
-        return cand
-    if cand.suffix.lower() == ".parquet":
-        alt = cand.with_suffix(".csv")
-    else:
-        alt = cand.with_suffix(".parquet")
-    return alt
+def _safe_to_dt(x) -> pd.Series:
+    return pd.to_datetime(x, errors="coerce").dt.tz_localize(None)
 
 
-# ----------------------------
-# finance helpers
-# ----------------------------
-def _calc_cagr(start_equity: float, end_equity: float, days: float) -> float:
-    if not np.isfinite(start_equity) or not np.isfinite(end_equity) or start_equity <= 0 or end_equity <= 0:
+def _to_num(s) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _calc_cagr(mult: float, days: float) -> float:
+    if not np.isfinite(mult) or mult <= 0:
         return float("nan")
     if not np.isfinite(days) or days <= 0:
         return float("nan")
     years = days / 365.0
     if years <= 0:
         return float("nan")
-    return float((end_equity / start_equity) ** (1.0 / years) - 1.0)
+    return float(mult ** (1.0 / years) - 1.0)
 
 
-def _max_drawdown_and_durations(equity: pd.Series) -> dict:
+def _prefer_parquet_dedupe(df: pd.DataFrame, subset_cols: list[str]) -> pd.DataFrame:
     """
-    equity: positive series indexed in time order (no gaps assumption required)
-    Returns:
-      MaxDD (negative number, e.g. -0.25),
-      MaxUnderwaterDays (int),
-      MaxDDRecoveryDays (int, peak->recovery duration for the max-dd episode; NaN if never recovered)
+    같은 config+period에 curve_file이 csv/parquet 2줄씩 들어오는 케이스 방지.
+    parquet 우선으로 한 줄만 남김.
     """
-    e = pd.to_numeric(equity, errors="coerce").dropna().astype(float)
-    if e.empty:
-        return {
-            "MaxDD_AfterWarmup": float("nan"),
-            "MaxUnderwaterDays_AfterWarmup": float("nan"),
-            "MaxDDRecoveryDays_AfterWarmup": float("nan"),
-        }
+    if df.empty:
+        return df
+    if "curve_file" not in df.columns:
+        return df.drop_duplicates(subset=subset_cols, keep="first")
 
-    peak = e.expanding().max()
-    dd = e / peak - 1.0  # <= 0
-    max_dd = float(dd.min())
-
-    # underwater days: longest consecutive stretch where dd < 0
-    underwater = (dd < 0).astype(int)
-    max_underwater = 0
-    cur = 0
-    for v in underwater.values:
-        if v:
-            cur += 1
-            if cur > max_underwater:
-                max_underwater = cur
-        else:
-            cur = 0
-
-    # recovery days for max-dd episode:
-    # find the time of max dd (first occurrence), then find when equity reaches previous peak again
-    idx_min = int(np.argmin(dd.values))
-    # peak level at the time just before/at min:
-    peak_level = float(peak.iloc[idx_min])
-    # search forward for recovery
-    rec_days = float("nan")
-    e_after = e.iloc[idx_min:]
-    rec_pos = np.where(e_after.values >= peak_level)[0]
-    if len(rec_pos) > 0:
-        # 0 means same day recovered; duration in "rows" (days count) = position index
-        rec_days = int(rec_pos[0])
-
-    return {
-        "MaxDD_AfterWarmup": max_dd,
-        "MaxUnderwaterDays_AfterWarmup": int(max_underwater),
-        "MaxDDRecoveryDays_AfterWarmup": rec_days,
-    }
+    tmp = df.copy()
+    tmp["__is_parq__"] = tmp["curve_file"].astype(str).str.lower().str.endswith(".parquet").astype(int)
+    tmp = tmp.sort_values(subset_cols + ["__is_parq__"], ascending=[True] * len(subset_cols) + [False])
+    tmp = tmp.drop_duplicates(subset=subset_cols, keep="first").drop(columns=["__is_parq__"])
+    return tmp
 
 
-def _daily_risk_stats(equity: pd.Series) -> dict:
-    """
-    equity -> daily returns stats:
-      DailyVol (annualized, sqrt(252) * std),
-      Sharpe0 (rf=0),
-      Sortino0 (rf=0)
-    """
-    e = pd.to_numeric(equity, errors="coerce").dropna().astype(float)
-    if len(e) < 3:
-        return {"DailyVol": float("nan"), "Sharpe0": float("nan"), "Sortino0": float("nan")}
-
-    r = e.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-    if r.empty:
-        return {"DailyVol": float("nan"), "Sharpe0": float("nan"), "Sortino0": float("nan")}
-
-    mu = float(r.mean())
-    sd = float(r.std(ddof=1))
-    ann_mu = mu * 252.0
-    ann_sd = sd * math.sqrt(252.0) if np.isfinite(sd) else float("nan")
-    sharpe = ann_mu / ann_sd if ann_sd and np.isfinite(ann_sd) and ann_sd > 0 else float("nan")
-
-    down = r.copy()
-    down = down[down < 0]
-    down_sd = float(down.std(ddof=1)) if len(down) >= 2 else float("nan")
-    ann_down_sd = down_sd * math.sqrt(252.0) if np.isfinite(down_sd) else float("nan")
-    sortino = ann_mu / ann_down_sd if ann_down_sd and np.isfinite(ann_down_sd) and ann_down_sd > 0 else float("nan")
-
-    return {"DailyVol": ann_sd, "Sharpe0": sharpe, "Sortino0": sortino}
-
-
-def _is_badexit_reason(reason: str) -> int:
-    r = str(reason or "").strip().upper()
-    if r.startswith("REVAL_FAIL"):
-        return 1
-    if r.startswith("GRACE_END_EXIT"):
-        return 1
-    return 0
-
-
-def _badexit_reason_bucket(reason: str) -> str:
-    r = str(reason or "").strip().upper()
-    if r.startswith("REVAL_FAIL"):
-        return "REVAL_FAIL"
-    if r.startswith("GRACE_END_EXIT"):
-        return "GRACE_END_EXIT"
-    return "OTHER"
-
-
-# ----------------------------
-# per-period file parsing
-# ----------------------------
-@dataclass
-class PeriodPiece:
-    period: str
-    start_date: pd.Timestamp
-    end_date: pd.Timestamp
-    days: int
-    equity: pd.Series  # index aligned to dates (same length as dates)
-    dates: pd.Series
-    qqq_mult: float
-    qqq_days: float
-    trades: pd.DataFrame
-
-
-def _read_prices(prices_parq: Path, prices_csv: Path) -> pd.DataFrame:
-    if prices_parq.exists():
-        df = pd.read_parquet(prices_parq)
-    elif prices_csv.exists():
-        df = pd.read_csv(prices_csv)
-    else:
-        raise FileNotFoundError(f"Missing prices: {prices_parq} (or {prices_csv})")
-
-    if "Date" not in df.columns or "Ticker" not in df.columns:
-        raise ValueError("prices must have Date,Ticker")
-    if "Close" not in df.columns:
-        raise ValueError("prices missing Close")
-
-    df = df.copy()
-    df["Date"] = _safe_to_dt(df["Date"])
-    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-    df = df.dropna(subset=["Date", "Ticker", "Close"]).sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    return df
-
-
-def _qqq_mult_for_range(prices: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> tuple[float, float]:
-    q = prices.loc[prices["Ticker"] == "QQQ"].copy()
-    if q.empty:
-        return (float("nan"), float("nan"))
-    q = q.sort_values("Date")
-
-    q_start = q.loc[q["Date"] >= start]
-    if q_start.empty:
-        return (float("nan"), float("nan"))
-    p0 = float(q_start["Close"].iloc[0])
-
-    q_end = q.loc[q["Date"] <= end]
-    if q_end.empty:
-        return (float("nan"), float("nan"))
-    p1 = float(q_end["Close"].iloc[-1])
-
-    if not np.isfinite(p0) or p0 <= 0 or not np.isfinite(p1) or p1 <= 0:
-        return (float("nan"), float("nan"))
-    mult = float(p1 / p0)
-    days = float((end - start).days)
-    return (mult, days)
-
-
-def _clean_curve_df(curve: pd.DataFrame) -> pd.DataFrame:
+# -----------------------
+# Curve stitching + stats
+# -----------------------
+def _clean_curve(curve: pd.DataFrame) -> pd.DataFrame:
     if curve is None or curve.empty:
         return pd.DataFrame()
-    if "Date" not in curve.columns or "Equity" not in curve.columns:
-        return pd.DataFrame()
+
     c = curve.copy()
+    if "Date" not in c.columns or "Equity" not in c.columns:
+        return pd.DataFrame()
+
     c["Date"] = _safe_to_dt(c["Date"])
-    c["Equity"] = pd.to_numeric(c["Equity"], errors="coerce")
+    c["Equity"] = _to_num(c["Equity"])
+
+    if "InCycle" in c.columns:
+        inc = _to_num(c["InCycle"]).fillna(0).astype(int)
+        c["InCycle"] = (inc > 0).astype(int)
+    elif "InPosition" in c.columns:
+        inc = _to_num(c["InPosition"]).fillna(0).astype(int)
+        c["InCycle"] = (inc > 0).astype(int)
+    else:
+        c["InCycle"] = 0
+
     c = c.dropna(subset=["Date", "Equity"]).sort_values("Date").reset_index(drop=True)
     c = c.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
     return c
 
 
-def _warmup_end_from_trades(trades: pd.DataFrame) -> pd.Timestamp | None:
-    if trades is None or trades.empty or "EntryDate" not in trades.columns:
-        return None
-    entry = _safe_to_dt(trades["EntryDate"]).dropna()
-    if entry.empty:
-        return None
-    return pd.Timestamp(entry.min())
-
-
-def _read_period_piece(
-    period: str,
-    curve_path: Path,
-    prices: pd.DataFrame,
-) -> PeriodPiece | None:
-    if not curve_path.exists():
-        return None
-
-    trades_path = _curve_to_trades_path(curve_path)
-    if not trades_path.exists():
-        return None
-
-    curve_raw = _read_any(curve_path)
-    curve = _clean_curve_df(curve_raw)
-    if curve.empty:
-        return None
-
-    trades = _read_any(trades_path)
-    warmup_end = _warmup_end_from_trades(trades)
-    if warmup_end is None:
-        # no trades => treat as empty after-warmup
-        return None
-
-    cur2 = curve.loc[curve["Date"] >= warmup_end].copy()
-    if cur2.empty:
-        return None
-
-    dates = cur2["Date"].reset_index(drop=True)
-    equity = cur2["Equity"].reset_index(drop=True)
-
-    start_date = pd.Timestamp(dates.iloc[0])
-    end_date = pd.Timestamp(dates.iloc[-1])
-    days = int((end_date - start_date).days)
-
-    qqq_mult, qqq_days = _qqq_mult_for_range(prices, start_date, end_date)
-
-    return PeriodPiece(
-        period=str(period),
-        start_date=start_date,
-        end_date=end_date,
-        days=days,
-        equity=equity,
-        dates=dates,
-        qqq_mult=qqq_mult,
-        qqq_days=qqq_days,
-        trades=trades,
-    )
-
-
-def _stitch_pieces_to_equity(pieces: list[PeriodPiece]) -> tuple[pd.Series, pd.Series, float, float]:
+def _stitch_curves(curve_paths: list[Path]) -> pd.DataFrame:
     """
-    Stitch after-warmup equity across periods by chaining daily returns.
-    Returns:
-      stitched_dates (pd.Series),
-      stitched_equity (pd.Series starting at 1.0),
-      qqq_mult_total (product of per-piece qqq mult),
-      total_days (sum of per-piece days)
+    period별로 equity가 리셋되는 curve들을 "연속 수익률"로 이어붙임.
+    - 각 period curve를 (Equity / 첫 Equity)로 정규화
+    - 누적 multiplier를 곱해서 전체 연속 Equity를 만듦
     """
-    if not pieces:
-        return (pd.Series(dtype="datetime64[ns]"), pd.Series(dtype="float64"), float("nan"), float("nan"))
+    out_parts = []
+    cum_mult = 1.0
 
-    # sort by start_date
-    pieces = sorted(pieces, key=lambda x: x.start_date)
-
-    all_dates = []
-    all_rets = []
-    qqq_mult_total = 1.0
-    total_days = 0.0
-
-    for pc in pieces:
-        e = pd.to_numeric(pc.equity, errors="coerce").astype(float)
-        d = _safe_to_dt(pc.dates)
-        m = min(len(e), len(d))
-        e = e.iloc[:m].reset_index(drop=True)
-        d = d.iloc[:m].reset_index(drop=True)
-
-        if len(e) < 2:
+    for p in curve_paths:
+        c = _clean_curve(_read_any(p))
+        if c.empty:
             continue
 
-        # daily pct returns inside this piece
-        r = e.pct_change().replace([np.inf, -np.inf], np.nan)
-        r = r.iloc[1:].fillna(0.0).astype(float)
-        d2 = d.iloc[1:]
+        e0 = float(c["Equity"].iloc[0])
+        if not np.isfinite(e0) or e0 <= 0:
+            continue
 
-        all_rets.append(r)
-        all_dates.append(d2)
+        c = c.copy()
+        c["EquityNorm"] = c["Equity"] / e0  # period multiplier
+        c["EquityStitched"] = c["EquityNorm"] * cum_mult
 
-        if np.isfinite(pc.qqq_mult) and pc.qqq_mult > 0:
-            qqq_mult_total *= float(pc.qqq_mult)
+        # 다음 period 시작을 위해 마지막 multiplier 반영
+        last_mult = float(c["EquityNorm"].iloc[-1])
+        if np.isfinite(last_mult) and last_mult > 0:
+            cum_mult *= last_mult
+
+        out_parts.append(c[["Date", "EquityStitched", "InCycle"]])
+
+    if not out_parts:
+        return pd.DataFrame()
+
+    allc = pd.concat(out_parts, ignore_index=True)
+    allc = allc.dropna(subset=["Date", "EquityStitched"]).sort_values("Date").reset_index(drop=True)
+    allc = allc.drop_duplicates(subset=["Date"], keep="last").reset_index(drop=True)
+    allc = allc.rename(columns={"EquityStitched": "Equity"})
+    return allc
+
+
+def _max_drawdown_stats(curve: pd.DataFrame) -> dict:
+    """
+    MaxDD, MaxUnderwaterDays, MaxDDRecoveryDays
+    - drawdown = Equity / peak - 1
+    - underwater days = drawdown < 0 인 연속 구간 최대 길이
+    - recovery days = 직전 peak 회복까지 걸린 최대 일수
+    """
+    if curve is None or curve.empty:
+        return {
+            "MaxDD": float("nan"),
+            "MaxUnderwaterDays": float("nan"),
+            "MaxDDRecoveryDays": float("nan"),
+        }
+
+    c = curve[["Date", "Equity"]].copy()
+    c["Date"] = _safe_to_dt(c["Date"])
+    c["Equity"] = _to_num(c["Equity"])
+    c = c.dropna(subset=["Date", "Equity"]).sort_values("Date").reset_index(drop=True)
+    if len(c) < 2:
+        return {
+            "MaxDD": float("nan"),
+            "MaxUnderwaterDays": float("nan"),
+            "MaxDDRecoveryDays": float("nan"),
+        }
+
+    eq = c["Equity"].astype(float).values
+    peak = np.maximum.accumulate(eq)
+    dd = eq / peak - 1.0
+    max_dd = float(np.nanmin(dd))
+
+    # underwater run lengths
+    uw = dd < 0
+    max_uw = 0
+    cur = 0
+    for v in uw:
+        if v:
+            cur += 1
+            max_uw = max(max_uw, cur)
         else:
-            qqq_mult_total = float("nan")
+            cur = 0
 
-        if np.isfinite(pc.days) and pc.days > 0:
-            total_days += float(pc.days)
-
-    if not all_rets:
-        return (pd.Series(dtype="datetime64[ns]"), pd.Series(dtype="float64"), float("nan"), float("nan"))
-
-    rets = pd.concat(all_rets, ignore_index=True)
-    dates = pd.concat(all_dates, ignore_index=True)
-
-    eq = (1.0 + rets).cumprod()
-    return (dates, eq, float(qqq_mult_total), float(total_days))
-
-
-def _recent_window_metrics(dates: pd.Series, equity: pd.Series, years: float) -> tuple[float, float]:
-    if dates is None or equity is None or len(dates) < 3 or len(equity) < 3:
-        return (float("nan"), float("nan"))
-    d = _safe_to_dt(dates)
-    e = pd.to_numeric(equity, errors="coerce").astype(float)
-    m = min(len(d), len(e))
-    d = d.iloc[:m].reset_index(drop=True)
-    e = e.iloc[:m].reset_index(drop=True)
-
-    end = pd.Timestamp(d.iloc[-1])
-    start_cut = end - pd.Timedelta(days=int(round(years * 365.0)))
-    mask = d >= start_cut
-    d2 = d[mask].reset_index(drop=True)
-    e2 = e[mask].reset_index(drop=True)
-    if len(e2) < 3:
-        return (float("nan"), float("nan"))
-    seed_mult = float(e2.iloc[-1] / e2.iloc[0]) if e2.iloc[0] > 0 else float("nan")
-    days = float((pd.Timestamp(d2.iloc[-1]) - pd.Timestamp(d2.iloc[0])).days)
-    cagr = _calc_cagr(float(e2.iloc[0]), float(e2.iloc[-1]), days)
-    return (seed_mult, cagr)
-
-
-# ----------------------------
-# per-config aggregation
-# ----------------------------
-def _trade_struct_stats(trades_all: pd.DataFrame, total_days: float) -> dict:
-    if trades_all is None or trades_all.empty:
-        return {
-            "TradeCount": 0,
-            "TradesPerYear": float("nan"),
-            "HoldDays_Mean": float("nan"),
-            "HoldDays_Median": float("nan"),
-            "HoldDays_P90": float("nan"),
-        }
-
-    df = trades_all.copy()
-
-    # TradeCount: MAIN rows if present, else all rows
-    if "CycleType" in df.columns:
-        main = df[df["CycleType"].astype(str).str.upper().eq("MAIN")].copy()
-        use = main if len(main) else df
-    else:
-        use = df
-
-    trade_count = int(len(use))
-    tpy = float(trade_count / (total_days / 365.0)) if np.isfinite(total_days) and total_days > 0 else float("nan")
-
-    hold = None
-    if "HoldingDays" in use.columns:
-        hold = pd.to_numeric(use["HoldingDays"], errors="coerce").dropna().astype(float)
-
-    if hold is None or hold.empty:
-        return {
-            "TradeCount": trade_count,
-            "TradesPerYear": tpy,
-            "HoldDays_Mean": float("nan"),
-            "HoldDays_Median": float("nan"),
-            "HoldDays_P90": float("nan"),
-        }
+    # recovery days: peak 갱신 시점부터 다음에 그 peak 이상 회복하는데 걸린 days
+    # 단순 구현: peak index를 기록하고, 그 이후 equity가 peak 이상 되는 첫 index까지 거리
+    max_rec = 0
+    last_peak_i = 0
+    last_peak_val = eq[0]
+    for i in range(1, len(eq)):
+        if eq[i] >= last_peak_val:
+            # recovered (or new peak)
+            rec = i - last_peak_i
+            max_rec = max(max_rec, rec)
+            last_peak_i = i
+            last_peak_val = eq[i]
+        # else: still underwater
 
     return {
-        "TradeCount": trade_count,
-        "TradesPerYear": tpy,
-        "HoldDays_Mean": float(hold.mean()),
-        "HoldDays_Median": float(hold.median()),
-        "HoldDays_P90": float(hold.quantile(0.90)),
+        "MaxDD": max_dd,
+        "MaxUnderwaterDays": float(max_uw),
+        "MaxDDRecoveryDays": float(max_rec),
     }
 
 
-def _badexit_stats(trades_all: pd.DataFrame) -> dict:
-    base = {
+def _daily_risk_stats(curve: pd.DataFrame) -> dict:
+    """
+    DailyVol, Sharpe0, Sortino0 (risk-free=0)
+    - returns = pct_change of Equity
+    """
+    if curve is None or curve.empty or len(curve) < 3:
+        return {"DailyVol": float("nan"), "Sharpe0": float("nan"), "Sortino0": float("nan")}
+
+    c = curve[["Date", "Equity"]].copy()
+    c["Equity"] = _to_num(c["Equity"])
+    c = c.dropna(subset=["Equity"]).sort_values("Date").reset_index(drop=True)
+
+    r = c["Equity"].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    if len(r) < 3:
+        return {"DailyVol": float("nan"), "Sharpe0": float("nan"), "Sortino0": float("nan")}
+
+    mu = float(r.mean())
+    sig = float(r.std(ddof=1))
+    daily_vol = sig
+
+    sharpe = float(mu / sig) if np.isfinite(sig) and sig > 0 else float("nan")
+
+    downside = r[r < 0]
+    dsig = float(downside.std(ddof=1)) if len(downside) >= 2 else float("nan")
+    sortino = float(mu / dsig) if np.isfinite(dsig) and dsig > 0 else float("nan")
+
+    return {"DailyVol": daily_vol, "Sharpe0": sharpe, "Sortino0": sortino}
+
+
+# -----------------------
+# Trades + BadExit stats
+# -----------------------
+def _is_badexit_reason(reason: str) -> bool:
+    r = str(reason or "").strip().upper()
+    return r.startswith("REVAL_FAIL") or r.startswith("GRACE_END_EXIT")
+
+
+def _infer_trades_path_from_curve(curve_path: Path) -> Path:
+    s = str(curve_path)
+    s = s.replace("sim_engine_curve_", "sim_engine_trades_")
+    # curve는 csv/parquet 둘 다 있을 수 있으니 trades도 같은 확장자로 우선 시도
+    return Path(s)
+
+
+def _read_trades_any(trades_path: Path) -> pd.DataFrame:
+    if trades_path.exists():
+        return _read_any(trades_path)
+
+    # 확장자 바꿔서도 시도
+    if trades_path.suffix.lower() == ".parquet":
+        alt = trades_path.with_suffix(".csv")
+    else:
+        alt = trades_path.with_suffix(".parquet")
+    if alt.exists():
+        return _read_any(alt)
+
+    return pd.DataFrame()
+
+
+def _badexit_stats_from_trades(trades: pd.DataFrame) -> dict:
+    """
+    - BadExitRate_Row: trades row 기준
+    - BadExitRate_Ticker: Tickters 분해 기준
+    - BadExitReasonShare_RevalFail / _GraceEnd
+    - BadExitReturnMean / NonBadExitReturnMean / BadExitReturnDiff (가능하면)
+    """
+    out = {
         "BadExitRate_Row": float("nan"),
         "BadExitRate_Ticker": float("nan"),
         "BadExitReasonShare_RevalFail": float("nan"),
@@ -417,209 +261,256 @@ def _badexit_stats(trades_all: pd.DataFrame) -> dict:
         "NonBadExitReturnMean": float("nan"),
         "BadExitReturnDiff": float("nan"),
     }
-    if trades_all is None or trades_all.empty:
-        return base
-    if "Reason" not in trades_all.columns:
-        return base
 
-    df = trades_all.copy()
-    df["Reason"] = df["Reason"].astype(str)
-    df["IsBadExit"] = df["Reason"].apply(_is_badexit_reason).astype(int)
-
-    # row-based
-    base["BadExitRate_Row"] = float(df["IsBadExit"].mean()) if len(df) else float("nan")
-
-    # ticker-expanded
-    if "Tickers" in df.columns:
-        rows = []
-        for _, r in df.iterrows():
-            ticks = [t.strip().upper() for t in str(r.get("Tickers", "")).split(",") if t.strip()]
-            if not ticks:
-                continue
-            for t in ticks:
-                rows.append({"Ticker": t, "IsBadExit": int(r["IsBadExit"]), "CycleReturn": r.get("CycleReturn", np.nan), "Reason": r.get("Reason", "")})
-        if rows:
-            ex = pd.DataFrame(rows)
-            base["BadExitRate_Ticker"] = float(ex["IsBadExit"].mean())
-        else:
-            base["BadExitRate_Ticker"] = float("nan")
-
-    # reason shares among badexits
-    bad = df[df["IsBadExit"] == 1].copy()
-    if len(bad):
-        buckets = bad["Reason"].apply(_badexit_reason_bucket)
-        denom = float(len(buckets))
-        base["BadExitReasonShare_RevalFail"] = float((buckets == "REVAL_FAIL").sum() / denom)
-        base["BadExitReasonShare_GraceEnd"] = float((buckets == "GRACE_END_EXIT").sum() / denom)
-
-    # return diff (CycleReturn if present; else nan)
-    if "CycleReturn" in df.columns:
-        ret = pd.to_numeric(df["CycleReturn"], errors="coerce")
-        bad_ret = ret[df["IsBadExit"] == 1].dropna()
-        ok_ret = ret[df["IsBadExit"] == 0].dropna()
-        if len(bad_ret):
-            base["BadExitReturnMean"] = float(bad_ret.mean())
-        if len(ok_ret):
-            base["NonBadExitReturnMean"] = float(ok_ret.mean())
-        if np.isfinite(base["BadExitReturnMean"]) and np.isfinite(base["NonBadExitReturnMean"]):
-            base["BadExitReturnDiff"] = float(base["BadExitReturnMean"] - base["NonBadExitReturnMean"])
-
-    return base
-
-
-def _analyze_one_config(group: pd.DataFrame, prices: pd.DataFrame) -> dict:
-    # group rows are periods for one config
-    # required columns present in summary: period, curve_file, suffix, cap, ps_min, tail_threshold, utility_quantile, lambda_tail, topk, badexit_max
-    pieces: list[PeriodPiece] = []
-    trades_parts: list[pd.DataFrame] = []
-
-    for _, r in group.iterrows():
-        period = str(r.get("period", ""))
-        curve_file = Path(str(r.get("curve_file", "")))
-        pc = _read_period_piece(period=period, curve_path=curve_file, prices=prices)
-        if pc is None:
-            continue
-        pieces.append(pc)
-        if pc.trades is not None and not pc.trades.empty:
-            trades_parts.append(pc.trades)
-
-    dates, eq, qqq_mult_total, total_days = _stitch_pieces_to_equity(pieces)
-
-    out = {}
-    # identity cols (stable)
-    for k in ["suffix", "cap", "ps_min", "tail_threshold", "utility_quantile", "lambda_tail", "topk", "badexit_max"]:
-        out[k] = group.iloc[0].get(k, "")
-
-    if len(eq) < 3:
-        # still output identity cols with NaNs
-        out.update({
-            "StartDate_AfterWarmup": "",
-            "EndDate_AfterWarmup": "",
-            "TotalDays_AfterWarmup": float("nan"),
-            "SeedMultiple_AfterWarmup": float("nan"),
-            "CAGR_AfterWarmup": float("nan"),
-            "QQQ_SeedMultiple_SamePeriod": float("nan"),
-            "QQQ_CAGR_SamePeriod": float("nan"),
-            "ExcessSeedMultiple_AfterWarmup": float("nan"),
-            "ExcessCAGR_AfterWarmup": float("nan"),
-            "Recent5Y_SeedMultiple_AfterWarmup": float("nan"),
-            "Recent5Y_CAGR_AfterWarmup": float("nan"),
-        })
-        out.update(_max_drawdown_and_durations(eq))
-        out.update(_daily_risk_stats(eq))
-        trades_all = pd.concat(trades_parts, ignore_index=True) if trades_parts else pd.DataFrame()
-        out.update(_trade_struct_stats(trades_all, total_days=float("nan")))
-        out.update(_badexit_stats(trades_all))
+    if trades is None or trades.empty:
+        return out
+    if "Reason" not in trades.columns:
         return out
 
-    start_dt = pd.Timestamp(dates.iloc[0])
-    end_dt = pd.Timestamp(dates.iloc[-1])
+    t = trades.copy()
+    t["Reason"] = t["Reason"].astype(str)
+    t["IsBadExit"] = t["Reason"].apply(_is_badexit_reason).astype(int)
 
-    seed_mult = float(eq.iloc[-1] / eq.iloc[0]) if float(eq.iloc[0]) > 0 else float("nan")
-    cagr = _calc_cagr(float(eq.iloc[0]), float(eq.iloc[-1]), float(total_days))
+    out["BadExitRate_Row"] = float(t["IsBadExit"].mean()) if len(t) else float("nan")
 
-    qqq_cagr = _calc_cagr(1.0, float(qqq_mult_total), float(total_days)) if np.isfinite(qqq_mult_total) else float("nan")
-    excess_seed = float(seed_mult / qqq_mult_total) if np.isfinite(seed_mult) and np.isfinite(qqq_mult_total) and qqq_mult_total > 0 else float("nan")
-    excess_cagr = float(cagr - qqq_cagr) if np.isfinite(cagr) and np.isfinite(qqq_cagr) else float("nan")
+    # reason share among badexits
+    bad = t[t["IsBadExit"] == 1]
+    if len(bad):
+        rr = bad["Reason"].str.upper()
+        out["BadExitReasonShare_RevalFail"] = float((rr.str.startswith("REVAL_FAIL")).mean())
+        out["BadExitReasonShare_GraceEnd"] = float((rr.str.startswith("GRACE_END_EXIT")).mean())
 
-    r5_mult, r5_cagr = _recent_window_metrics(dates, eq, years=5.0)
+    # ticker exploded rate
+    if "Tickers" in t.columns:
+        rows = []
+        for _, r in t.iterrows():
+            ticks = [x.strip().upper() for x in str(r.get("Tickers", "")).split(",") if x.strip()]
+            for tk in ticks:
+                rows.append((tk, int(r["IsBadExit"])))
+        if rows:
+            x = pd.DataFrame(rows, columns=["Ticker", "IsBadExit"])
+            # Date 정보가 없어서 단순 평균(티커-엔트리 단위)로 계산
+            out["BadExitRate_Ticker"] = float(x["IsBadExit"].mean())
 
-    out.update({
-        "StartDate_AfterWarmup": str(start_dt.date()),
-        "EndDate_AfterWarmup": str(end_dt.date()),
-        "TotalDays_AfterWarmup": float(total_days),
-        "SeedMultiple_AfterWarmup": seed_mult,
-        "CAGR_AfterWarmup": cagr,
-        "QQQ_SeedMultiple_SamePeriod": float(qqq_mult_total),
-        "QQQ_CAGR_SamePeriod": qqq_cagr,
-        "ExcessSeedMultiple_AfterWarmup": excess_seed,
-        "ExcessCAGR_AfterWarmup": excess_cagr,
-        "Recent5Y_SeedMultiple_AfterWarmup": r5_mult,
-        "Recent5Y_CAGR_AfterWarmup": r5_cagr,
-    })
+    # return gap
+    ret_col = None
+    for c in ["CycleReturn", "Return", "PnL", "PnLPct", "NetReturn"]:
+        if c in t.columns:
+            ret_col = c
+            break
 
-    out.update(_max_drawdown_and_durations(eq))
-    out.update(_daily_risk_stats(eq))
-
-    trades_all = pd.concat(trades_parts, ignore_index=True) if trades_parts else pd.DataFrame()
-    out.update(_trade_struct_stats(trades_all, total_days=total_days))
-    out.update(_badexit_stats(trades_all))
+    if ret_col is not None:
+        r = _to_num(t[ret_col])
+        t["_ret_"] = r
+        bad_ret = t.loc[t["IsBadExit"] == 1, "_ret_"].dropna()
+        ok_ret = t.loc[t["IsBadExit"] == 0, "_ret_"].dropna()
+        if len(bad_ret):
+            out["BadExitReturnMean"] = float(bad_ret.mean())
+        if len(ok_ret):
+            out["NonBadExitReturnMean"] = float(ok_ret.mean())
+        if np.isfinite(out["BadExitReturnMean"]) and np.isfinite(out["NonBadExitReturnMean"]):
+            out["BadExitReturnDiff"] = float(out["BadExitReturnMean"] - out["NonBadExitReturnMean"])
 
     return out
 
 
-# ----------------------------
-# main
-# ----------------------------
+def _trade_structure_stats(trades: pd.DataFrame, total_days: float) -> dict:
+    out = {
+        "TradeCount": float("nan"),
+        "TradesPerYear": float("nan"),
+        "HoldDays_Mean": float("nan"),
+        "HoldDays_Median": float("nan"),
+        "HoldDays_P90": float("nan"),
+    }
+    if trades is None or trades.empty:
+        return out
+
+    out["TradeCount"] = float(len(trades))
+    if np.isfinite(total_days) and total_days > 0:
+        out["TradesPerYear"] = float(len(trades) / (total_days / 365.0))
+
+    hold_col = None
+    for c in ["HoldingDays", "HoldDays", "DaysHeld"]:
+        if c in trades.columns:
+            hold_col = c
+            break
+    if hold_col is not None:
+        h = _to_num(trades[hold_col]).dropna()
+        if len(h):
+            out["HoldDays_Mean"] = float(h.mean())
+            out["HoldDays_Median"] = float(h.median())
+            out["HoldDays_P90"] = float(h.quantile(0.90))
+    else:
+        # ExitDate/EntryDate 있으면 계산
+        if "EntryDate" in trades.columns and "ExitDate" in trades.columns:
+            ed = _safe_to_dt(trades["EntryDate"])
+            xd = _safe_to_dt(trades["ExitDate"])
+            dd = (xd - ed).dt.days
+            dd = _to_num(dd).dropna()
+            if len(dd):
+                out["HoldDays_Mean"] = float(dd.mean())
+                out["HoldDays_Median"] = float(dd.median())
+                out["HoldDays_P90"] = float(dd.quantile(0.90))
+
+    return out
+
+
+# -----------------------
+# Main
+# -----------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Analyze walkforward summary by config (stitch half-years into total period).")
-
-    ap.add_argument("--summary", required=True, type=str, help="path to _summary_walkforward2.csv")
-    ap.add_argument("--out", required=True, type=str, help="output analysis csv (total-period by config)")
-
-    # optional prices (for QQQ baseline)
-    ap.add_argument("--prices-parq", default="data/raw/prices.parquet", type=str)
-    ap.add_argument("--prices-csv", default="data/raw/prices.csv", type=str)
-
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--summary", required=True, type=str)
+    ap.add_argument("--out", required=True, type=str)
     args = ap.parse_args()
 
-    summary_path = Path(args.summary)
-    if not summary_path.exists():
-        raise FileNotFoundError(f"summary not found: {summary_path}")
+    sp = Path(args.summary)
+    df = pd.read_csv(sp)
 
-    df = pd.read_csv(summary_path)
-    if df.empty:
-        raise SystemExit("[ERROR] summary is empty")
+    # column normalize: strip + BOM-safe
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
 
-    # Ensure required columns
-    need = ["period", "curve_file", "suffix", "cap", "ps_min", "tail_threshold", "utility_quantile", "lambda_tail", "topk", "badexit_max"]
-    miss = [c for c in need if c not in df.columns]
-    if miss:
-        raise SystemExit(f"[ERROR] summary missing columns: {miss}")
+    required = [
+        "period",
+        "curve_file",
+        "suffix",
+        "cap",
+        "ps_min",
+        "tail_threshold",
+        "utility_quantile",
+        "lambda_tail",
+        "topk",
+        "badexit_max",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise SystemExit(f"[ERROR] summary missing columns: {missing}")
 
-    # normalize types
+    # types
+    df["period"] = df["period"].astype(str).str.strip()
+    df["curve_file"] = df["curve_file"].astype(str).str.strip()
+    df["suffix"] = df["suffix"].astype(str).str.strip()
+    df["cap"] = df["cap"].astype(str).str.strip()
+
+    # numeric keys
     for c in ["ps_min", "tail_threshold", "utility_quantile", "lambda_tail", "topk", "badexit_max"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["curve_file"] = df["curve_file"].astype(str)
+        df[c] = _to_num(df[c])
 
-    prices = _read_prices(Path(args.prices_parq), Path(args.prices_csv))
+    key_cols = ["period", "suffix", "cap", "ps_min", "tail_threshold", "utility_quantile", "lambda_tail", "topk", "badexit_max"]
 
-    group_cols = ["suffix", "cap", "ps_min", "tail_threshold", "utility_quantile", "lambda_tail", "topk", "badexit_max"]
+    # parquet 우선 dedupe (period+config 단위로 한 줄만)
+    df = _prefer_parquet_dedupe(df, subset_cols=key_cols)
+
+    # config 단위로 "전체기간 합산 성적표"
+    cfg_cols = ["suffix", "cap", "ps_min", "tail_threshold", "utility_quantile", "lambda_tail", "topk", "badexit_max"]
+
     out_rows = []
 
-    for _, g in df.groupby(group_cols, dropna=False):
-        out_rows.append(_analyze_one_config(g, prices=prices))
+    for cfg, g in df.groupby(cfg_cols, dropna=False):
+        g = g.sort_values("period")
+        curve_paths = [Path(x) for x in g["curve_file"].tolist()]
+        curve_paths = [p for p in curve_paths if p.exists()]
+
+        stitched = _stitch_curves(curve_paths)
+        if stitched.empty:
+            # 그래도 키는 남기고 NaN으로
+            row = dict(zip(cfg_cols, cfg))
+            row.update({
+                "PeriodCount": int(g["period"].nunique()),
+                "TotalDays": float("nan"),
+                "SeedMultiple_Total": float("nan"),
+                "CAGR_Total": float("nan"),
+                "StartDate": "",
+                "EndDate": "",
+            })
+            # badexit placeholders
+            row.update(_badexit_stats_from_trades(pd.DataFrame()))
+            row.update({
+                "MaxDD_Total": float("nan"),
+                "MaxUnderwaterDays_Total": float("nan"),
+                "MaxDDRecoveryDays_Total": float("nan"),
+                "DailyVol_Total": float("nan"),
+                "Sharpe0_Total": float("nan"),
+                "Sortino0_Total": float("nan"),
+            })
+            row.update(_trade_structure_stats(pd.DataFrame(), float("nan")))
+            out_rows.append(row)
+            continue
+
+        start_date = pd.Timestamp(stitched["Date"].iloc[0])
+        end_date = pd.Timestamp(stitched["Date"].iloc[-1])
+        total_days = float((end_date - start_date).days)
+
+        e0 = float(stitched["Equity"].iloc[0])
+        e1 = float(stitched["Equity"].iloc[-1])
+        mult = float(e1 / e0) if (np.isfinite(e0) and e0 > 0 and np.isfinite(e1) and e1 > 0) else float("nan")
+        cagr = _calc_cagr(mult, total_days)
+
+        dd_stats = _max_drawdown_stats(stitched)
+        risk_stats = _daily_risk_stats(stitched)
+
+        # trades aggregate
+        trades_list = []
+        for p in curve_paths:
+            tp = _infer_trades_path_from_curve(p)
+            tdf = _read_trades_any(tp)
+            if tdf is not None and not tdf.empty:
+                trades_list.append(tdf)
+        trades_all = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
+
+        bad_stats = _badexit_stats_from_trades(trades_all)
+        trade_stats = _trade_structure_stats(trades_all, total_days)
+
+        row = dict(zip(cfg_cols, cfg))
+        row.update({
+            "PeriodCount": int(g["period"].nunique()),
+            "TotalDays": total_days,
+            "SeedMultiple_Total": mult,
+            "CAGR_Total": cagr,
+            "StartDate": str(start_date.date()),
+            "EndDate": str(end_date.date()),
+        })
+        row.update({
+            "MaxDD_Total": dd_stats["MaxDD"],
+            "MaxUnderwaterDays_Total": dd_stats["MaxUnderwaterDays"],
+            "MaxDDRecoveryDays_Total": dd_stats["MaxDDRecoveryDays"],
+        })
+        row.update({
+            "DailyVol_Total": risk_stats["DailyVol"],
+            "Sharpe0_Total": risk_stats["Sharpe0"],
+            "Sortino0_Total": risk_stats["Sortino0"],
+        })
+        row.update(bad_stats)
+        row.update(trade_stats)
+
+        out_rows.append(row)
 
     out = pd.DataFrame(out_rows)
 
-    # scoring / sorting: prefer after-warmup total-period metrics
+    # 정렬: Total SeedMultiple -> CAGR
     sort_cols = []
-    if "ExcessCAGR_AfterWarmup" in out.columns:
-        sort_cols.append("ExcessCAGR_AfterWarmup")
-    if "CAGR_AfterWarmup" in out.columns:
-        sort_cols.append("CAGR_AfterWarmup")
-    if "SeedMultiple_AfterWarmup" in out.columns:
-        sort_cols.append("SeedMultiple_AfterWarmup")
+    if "SeedMultiple_Total" in out.columns:
+        sort_cols.append("SeedMultiple_Total")
+    if "CAGR_Total" in out.columns:
+        sort_cols.append("CAGR_Total")
     if sort_cols:
-        out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+        out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_path, index=False)
-    print(f"[DONE] wrote: {out_path} rows={len(out)}")
+    print(f"[DONE] wrote analysis: {out_path} rows={len(out)}")
 
     if len(out):
         best = out.iloc[0].to_dict()
-        print("=" * 70)
-        print("[BEST] total-period (stitched half-years) by ExcessCAGR/CAGR/SeedMultiple")
-        print(f"suffix={best.get('suffix')} cap={best.get('cap')} ps_min={best.get('ps_min')} tail={best.get('tail_threshold')} q={best.get('utility_quantile')} lam={best.get('lambda_tail')} topk={best.get('topk')} be={best.get('badexit_max')}")
-        print(f"SeedMultiple_AfterWarmup={best.get('SeedMultiple_AfterWarmup')}  CAGR_AfterWarmup={best.get('CAGR_AfterWarmup')}")
-        print(f"QQQ_Mult={best.get('QQQ_SeedMultiple_SamePeriod')}  QQQ_CAGR={best.get('QQQ_CAGR_SamePeriod')}")
-        print(f"ExcessSeed={best.get('ExcessSeedMultiple_AfterWarmup')}  ExcessCAGR={best.get('ExcessCAGR_AfterWarmup')}")
-        print(f"MaxDD={best.get('MaxDD_AfterWarmup')}  UWDays={best.get('MaxUnderwaterDays_AfterWarmup')}  RecDays={best.get('MaxDDRecoveryDays_AfterWarmup')}")
-        print(f"TradeCount={best.get('TradeCount')}  TradesPerYear={best.get('TradesPerYear')}")
-        print(f"BadExitRate_Row={best.get('BadExitRate_Row')}  BadExitRate_Ticker={best.get('BadExitRate_Ticker')}")
-        print("=" * 70)
+        print("=" * 60)
+        print("[BEST] (overall stitched)")
+        print(f"suffix={best.get('suffix')} cap={best.get('cap')} ps={best.get('ps_min')} tail={best.get('tail_threshold')} q={best.get('utility_quantile')} lam={best.get('lambda_tail')} topk={best.get('topk')} be={best.get('badexit_max')}")
+        print(f"SeedMultiple_Total={best.get('SeedMultiple_Total')} CAGR_Total={best.get('CAGR_Total')} Days={best.get('TotalDays')} Periods={best.get('PeriodCount')}")
+        print(f"MaxDD_Total={best.get('MaxDD_Total')} UnderwaterDays={best.get('MaxUnderwaterDays_Total')} RecoveryDays={best.get('MaxDDRecoveryDays_Total')}")
+        print(f"BadExitRate_Row={best.get('BadExitRate_Row')} BadExitRate_Ticker={best.get('BadExitRate_Ticker')}")
+        print(f"BadExitReturnDiff={best.get('BadExitReturnDiff')}")
+        print("=" * 60)
 
 
 if __name__ == "__main__":
