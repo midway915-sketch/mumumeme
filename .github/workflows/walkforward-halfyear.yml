@@ -140,6 +140,7 @@ jobs:
           path: |
             data/features
             data/meta
+            data/universe.csv
           if-no-files-found: error
 
   make-matrix:
@@ -232,6 +233,36 @@ jobs:
           name: features-base
           path: .
 
+      - name: Ensure universe.csv (from raw if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          if [ ! -f data/universe.csv ]; then
+            echo "[INFO] data/universe.csv missing -> generating from raw prices"
+            python -c '
+          from pathlib import Path
+          import pandas as pd
+          raw_parq = Path("data/raw/prices.parquet")
+          raw_csv  = Path("data/raw/prices.csv")
+          if raw_parq.exists():
+              df = pd.read_parquet(raw_parq)
+          elif raw_csv.exists():
+              df = pd.read_csv(raw_csv)
+          else:
+              raise SystemExit("[ERROR] raw prices missing")
+          if "Ticker" not in df.columns:
+              raise SystemExit("[ERROR] raw prices missing Ticker column")
+          ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+          ticks = sorted(set([t for t in ticks if t]))
+          out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
+          Path("data").mkdir(parents=True, exist_ok=True)
+          out.to_csv("data/universe.csv", index=False)
+          print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
+          '
+          fi
+          test -f data/universe.csv
+
       - name: Verify inputs
         shell: bash
         run: |
@@ -296,7 +327,6 @@ jobs:
 
           pick_one () { ls -1 $1 2>/dev/null | head -n 1 || true; }
 
-          # ---- Gate labels rolling + cut features/labels <= CUT_DATE
           python scripts/build_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
@@ -336,8 +366,7 @@ jobs:
           write_parq(lm_cut, f"data/labels/labels_model_{TAG}.parquet")
           print("[CUT] labels_model rows=", len(lm_cut))
           ' TAG="${TAG}" CUT_DATE="${CUT_DATE}"
-
-          # ---- Tail expanding: build then cut file (only if Date exists)
+          
           python scripts/build_tail_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
@@ -388,7 +417,6 @@ jobs:
           ' IN_PATH="${TL}" CUT_DATE="${CUT_DATE}" OUT_COPY="${OUT_COPY}"
           fi
 
-          # ---- Tau expanding tagged: build then (best-effort) cut
           python scripts/build_tau_labels.py \
             --tag "${TAG}" \
             --profit-target "${PROFIT_TARGET}" \
@@ -441,7 +469,6 @@ jobs:
           ' IN_PATH="${TAUL}" CUT_DATE="${CUT_DATE}" OUT_COPY="${OUT_COPY}"
           fi
 
-          # ---- Train Gate/Tail/Tau
           python scripts/train_model.py --tag "${TAG}"
 
           python scripts/train_tail_model.py \
@@ -452,7 +479,6 @@ jobs:
 
           python scripts/train_tau_model.py --tag "${TAG}"
 
-          # ---- Stage models
           mf="$(pick_one "app/model_*${TAG}*.pkl")"
           sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
           test -n "${mf}" && test -n "${sf}"
@@ -467,7 +493,6 @@ jobs:
           cp -v "${taum}" "${MODEL_DIR}/tau_model.pkl"
           cp -v "${taus}" "${MODEL_DIR}/tau_scaler.pkl"
 
-          # ---- Walkforward #1
           export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
           export PROFIT_TARGET MAX_DAYS STOP_LEVEL
           export P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL GATE_MODES TRAIL_STOPS TP1_FRAC ENABLE_TRAILING TOPK_CONFIGS PS_MINS BADEXIT_MAXES MAX_LEVERAGE_PCT
@@ -521,11 +546,50 @@ jobs:
           name: features-base
           path: .
 
-      - name: Download all period artifacts (models + wf1)
+      - name: Ensure universe.csv (from raw if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          if [ ! -f data/universe.csv ]; then
+            echo "[INFO] data/universe.csv missing -> generating from raw prices"
+            python -c '
+          from pathlib import Path
+          import pandas as pd
+          raw_parq = Path("data/raw/prices.parquet")
+          raw_csv  = Path("data/raw/prices.csv")
+          if raw_parq.exists():
+              df = pd.read_parquet(raw_parq)
+          elif raw_csv.exists():
+              df = pd.read_csv(raw_csv)
+          else:
+              raise SystemExit("[ERROR] raw prices missing")
+          if "Ticker" not in df.columns:
+              raise SystemExit("[ERROR] raw prices missing Ticker column")
+          ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+          ticks = sorted(set([t for t in ticks if t]))
+          out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
+          Path("data").mkdir(parents=True, exist_ok=True)
+          out.to_csv("data/universe.csv", index=False)
+          print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
+          '
+          fi
+          test -f data/universe.csv
+
+      # ✅ 변경: models_* / walkforward_* 아티팩트를 따로 받기
+      - name: Download models_* artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: "*_*"
-          path: _wf1_artifacts
+          pattern: models_*
+          path: _wf1_artifacts/models
+          merge-multiple: true
+
+      - name: Download walkforward_* artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: walkforward_*
+          path: _wf1_artifacts/walkforward
+          merge-multiple: true
 
       - name: Rebuild structure from artifacts
         shell: bash
@@ -534,7 +598,8 @@ jobs:
           mkdir -p data/models data/signals/walkforward data/signals/walkforward2 data/badexit_pool data/labels data/meta app
           shopt -s nullglob
 
-          for d in _wf1_artifacts/models_*; do
+          # models_{period} -> data/models/wf_{period}
+          for d in _wf1_artifacts/models/models_*; do
             base="$(basename "$d")"
             period="${base#models_}"
             out="data/models/wf_${period}"
@@ -542,7 +607,8 @@ jobs:
             rsync -a "${d}/" "${out}/"
           done
 
-          for d in _wf1_artifacts/walkforward_*; do
+          # walkforward_{period} -> data/signals/walkforward/{period}
+          for d in _wf1_artifacts/walkforward/walkforward_*; do
             base="$(basename "$d")"
             period="${base#walkforward_}"
             out="data/signals/walkforward/${period}"
@@ -550,8 +616,9 @@ jobs:
             rsync -a "${d}/" "${out}/"
           done
 
-          echo "[INFO] staged:"
+          echo "[INFO] models dirs:"
           find data/models -maxdepth 2 -type d | sed -n '1,200p' || true
+          echo "[INFO] wf1 dirs:"
           find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p' || true
 
       - name: Sequential BadExit(expanding past-only) + WF#2
@@ -731,7 +798,6 @@ jobs:
 
             ensure_features_scored_csv "data/signals/walkforward2/${WF_PERIOD}/_inputs"
 
-            # add current wf1 trades to pool for next
             EX_TAG="$(ex_tag)"
             shopt -s nullglob
             n=0
