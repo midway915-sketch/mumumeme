@@ -74,6 +74,81 @@ jobs:
           path: data/raw
           if-no-files-found: error
 
+  build-features:
+    needs: [raw-data]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (features)
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -U pandas pyarrow
+
+      - name: Download raw-data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+
+      - name: Ensure universe.csv (from raw if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          if [ ! -f data/universe.csv ]; then
+            echo "[INFO] data/universe.csv missing -> generating from raw prices"
+            python - <<'PY'
+            from pathlib import Path
+            import pandas as pd
+
+            raw_parq = Path("data/raw/prices.parquet")
+            raw_csv  = Path("data/raw/prices.csv")
+            if raw_parq.exists():
+                df = pd.read_parquet(raw_parq)
+            elif raw_csv.exists():
+                df = pd.read_csv(raw_csv)
+            else:
+                raise SystemExit("[ERROR] raw prices missing")
+            if "Ticker" not in df.columns:
+                raise SystemExit("[ERROR] raw prices missing Ticker column")
+            ticks = (
+                df["Ticker"].astype(str).str.upper().str.strip()
+                  .dropna().unique().tolist()
+            )
+            ticks = sorted(set([t for t in ticks if t]))
+            out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
+            Path("data").mkdir(parents=True, exist_ok=True)
+            out.to_csv("data/universe.csv", index=False)
+            print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
+            PY
+          fi
+          test -f data/universe.csv
+
+      - name: Build features once (full history)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/features data/meta
+          python scripts/build_features.py
+          ls -la data/features | sed -n '1,200p'
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
+
+      - name: Upload artifact features-base
+        uses: actions/upload-artifact@v4
+        with:
+          name: features-base
+          path: |
+            data/features
+            data/meta/feature_cols.json
+            data/meta/feature_cols.json.bak
+          if-no-files-found: error
+
   make-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -133,14 +208,342 @@ jobs:
           cat /tmp/matrix.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-  run:
-    # NOTE:
-    # - Gate: rolling (TRAIN_START..CUT_DATE)
-    # - Tail/Tau: expanding (..CUT_DATE)
-    # - BadExit: expanding past-only pool
-    # SPEEDUP:
-    # - build_features once, build_gate_labels once (min TRAIN_START), build_tail_labels once
-    needs: [raw-data, make-matrix]
+  wf1-parallel:
+    name: wf1-parallel (Gate/Tail/Tau + Walkforward#1)
+    needs: [raw-data, build-features, make-matrix]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -U pandas pyarrow
+
+      - name: Download raw-data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+
+      - name: Download features-base artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: features-base
+          path: .
+
+      - name: Verify inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
+          if [ ! -f data/universe.csv ]; then
+            echo "[WARN] data/universe.csv missing (should exist). Will generate from raw."
+            python - <<'PY'
+            from pathlib import Path
+            import pandas as pd
+            raw_parq = Path("data/raw/prices.parquet")
+            raw_csv  = Path("data/raw/prices.csv")
+            if raw_parq.exists():
+                df = pd.read_parquet(raw_parq)
+            elif raw_csv.exists():
+                df = pd.read_csv(raw_csv)
+            else:
+                raise SystemExit("[ERROR] raw prices missing")
+            ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+            ticks = sorted(set([t for t in ticks if t]))
+            out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
+            Path("data").mkdir(parents=True, exist_ok=True)
+            out.to_csv("data/universe.csv", index=False)
+            print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
+            PY
+          fi
+          test -f data/universe.csv
+
+      - name: Train Gate/Tail/Tau + Walkforward#1 (this period)
+        env:
+          WF_PERIOD: ${{ matrix.period }}
+          TRAIN_START: ${{ matrix.TRAIN_START }}
+          TRAIN_END: ${{ matrix.TRAIN_END }}
+          VALID_START: ${{ matrix.VALID_START }}
+          VALID_END: ${{ matrix.VALID_END }}
+          TEST_START: ${{ matrix.TEST_START }}
+          TEST_END: ${{ matrix.TEST_END }}
+          CUT_DATE: ${{ matrix.CUT_DATE }}
+
+          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
+          MAX_DAYS: ${{ inputs.MAX_DAYS }}
+          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
+          MAX_EXTEND_DAYS: "20"
+
+          P_TAIL_THRESHOLDS: "0.10,0.20,0.30"
+          UTILITY_QUANTILES: "0.60,0.75,0.90"
+          RANK_METRICS: "utility"
+          LAMBDA_TAIL: "1.0"
+          GATE_MODES: "tail_utility"
+          TRAIL_STOPS: "0.10"
+          TP1_FRAC: "0.50"
+          ENABLE_TRAILING: "true"
+          TOPK_CONFIGS: "1|1.0"
+          PS_MINS: "0.00"
+          BADEXIT_MAXES: "1.00"
+          MAX_LEVERAGE_PCT: "1.0"
+
+          EXCLUDE_TICKERS: ""
+
+          REGIME_MODE: "off"
+          REGIME_DD_MAX: "0.20"
+          REGIME_RET20_MIN: "0.00"
+          REGIME_ATR_MAX: "1.30"
+          REGIME_LEVERAGE_MULT: "3.0"
+
+          TAU_SPLIT: ""
+          USE_TAU_H: "false"
+          ENABLE_DCA: "false"
+
+          WF_TAG_BASE: wf
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/run_walkforward_halfyear.sh
+
+          TAG="wf_${WF_PERIOD}"
+          MODEL_DIR="data/models/${TAG}"
+          mkdir -p "${MODEL_DIR}" data/labels data/meta app data/signals/walkforward
+
+          echo "[PERIOD] ${WF_PERIOD} TAG=${TAG}"
+          echo "[PERIOD] train=${TRAIN_START}..${TRAIN_END} cut=${CUT_DATE} test=${TEST_START}..${TEST_END}"
+
+          pick_one () {
+            local pat="$1"
+            local f
+            f="$(ls -1 ${pat} 2>/dev/null | head -n 1 || true)"
+            echo "${f}"
+          }
+
+          cut_parq_by_date () {
+            local inpath="$1"
+            local cut="$2"
+            local outcopy="$3"
+            if [ -z "${inpath}" ] || [ ! -f "${inpath}" ]; then
+              echo "[CUT] skip missing: ${inpath}"
+              return 0
+            fi
+            IN_PATH="${inpath}" CUT_DATE="${cut}" OUT_COPY="${outcopy}" python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+          p = Path(os.environ["IN_PATH"])
+          cut = pd.to_datetime(os.environ["CUT_DATE"])
+          out_copy = os.environ.get("OUT_COPY","").strip()
+          df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
+          if "Date" not in df.columns:
+              print(f"[CUT] no Date column -> skip: {p}")
+              raise SystemExit(0)
+          dt = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+          df = df.loc[dt.notna()].copy()
+          df["Date"] = dt.loc[dt.notna()].values
+          before=len(df)
+          df = df[df["Date"] <= cut].copy()
+          after=len(df)
+          if p.suffix==".parquet": df.to_parquet(p, index=False)
+          else: df.to_csv(p, index=False)
+          print(f"[CUT] {p}: {before} -> {after} (<= {cut.date()})")
+          if out_copy:
+              cp = Path(out_copy)
+              cp.parent.mkdir(parents=True, exist_ok=True)
+              if cp.suffix==".parquet": df.to_parquet(cp, index=False)
+              else: df.to_csv(cp, index=False)
+              print(f"[CUT] wrote copy: {cp}")
+          PY
+          }
+
+          # -------------------------
+          # Gate labels (rolling): build_labels --start-date TRAIN_START
+          # and cut features/labels <= CUT_DATE
+          # -------------------------
+          python scripts/build_labels.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --start-date "${TRAIN_START}"
+
+          TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
+          import os
+          from pathlib import Path
+          import pandas as pd
+
+          TAG=os.environ["TAG"]
+          CUT=pd.to_datetime(os.environ["CUT_DATE"])
+
+          def read_any(parq, csv):
+              if Path(parq).exists(): return pd.read_parquet(parq)
+              if Path(csv).exists():  return pd.read_csv(csv)
+              raise FileNotFoundError(f"missing {parq} or {csv}")
+
+          def write_parq(df, p):
+              Path(p).parent.mkdir(parents=True, exist_ok=True)
+              df.to_parquet(p, index=False)
+
+          f = read_any("data/features/features_model.parquet", "data/features/features_model.csv")
+          f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.tz_localize(None)
+          f = f.dropna(subset=["Date"])
+          f_cut = f[f["Date"] <= CUT].copy()
+          write_parq(f_cut, "data/features/features_model.parquet")
+          write_parq(f_cut, f"data/features/features_model_{TAG}.parquet")
+          print("[CUT] features_model rows=", len(f_cut))
+
+          lm = read_any("data/labels/labels_model.parquet", "data/labels/labels_model.csv")
+          lm["Date"] = pd.to_datetime(lm["Date"], errors="coerce").dt.tz_localize(None)
+          lm = lm.dropna(subset=["Date"])
+          lm_cut = lm[lm["Date"] <= CUT].copy()
+          write_parq(lm_cut, "data/labels/labels_model.parquet")
+          write_parq(lm_cut, f"data/labels/labels_model_{TAG}.parquet")
+          print("[CUT] labels_model rows=", len(lm_cut))
+          PY
+
+          # -------------------------
+          # Tail labels (expanding): build full on cut features, then cut <= CUT_DATE
+          # -------------------------
+          python scripts/build_tail_labels.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}"
+
+          TL="$(python - <<'PY'
+          import glob
+          cand=[]
+          cand += glob.glob("data/labels/labels_tail*.parquet")
+          cand += glob.glob("data/labels/labels_tail*.csv")
+          cand += glob.glob("data/labels/*tail*labels*.parquet")
+          cand += glob.glob("data/labels/*tail*labels*.csv")
+          cand=sorted(set(cand))
+          print(cand[0] if cand else "")
+          PY
+          )"
+          echo "[TAIL] labels_path=${TL}"
+          if [ -n "${TL}" ] && [ -f "${TL}" ]; then
+            if [[ "${TL}" == *.parquet ]]; then ext=".parquet"; else ext=".csv"; fi
+            cut_parq_by_date "${TL}" "${CUT_DATE}" "data/labels/labels_tail_${TAG}${ext}"
+          fi
+
+          # -------------------------
+          # Tau labels (expanding): build tagged, then attempt cut <= CUT_DATE (only if Date exists)
+          # -------------------------
+          python scripts/build_tau_labels.py \
+            --tag "${TAG}" \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}"
+
+          TAUL="$(TAG="${TAG}" python - <<'PY'
+          import os, glob
+          tag=os.environ["TAG"]
+          cand=[]
+          cand += glob.glob(f"data/labels/*tau*{tag}*.parquet")
+          cand += glob.glob(f"data/labels/*tau*{tag}*.csv")
+          cand += glob.glob(f"data/labels/labels_tau_{tag}.parquet")
+          cand += glob.glob(f"data/labels/labels_tau_{tag}.csv")
+          cand=sorted(set(cand))
+          print(cand[0] if cand else "")
+          PY
+          )"
+          echo "[TAU] labels_path=${TAUL}"
+          if [ -n "${TAUL}" ] && [ -f "${TAUL}" ]; then
+            if [[ "${TAUL}" == *.parquet ]]; then ext=".parquet"; else ext=".csv"; fi
+            # NOTE: if tau labels have no Date column, cutter will just skip (ok)
+            cut_parq_by_date "${TAUL}" "${CUT_DATE}" "data/labels/labels_tau_${TAG}${ext}"
+          fi
+
+          # -------------------------
+          # Train Gate/Tail/Tau
+          # -------------------------
+          echo "[TRAIN] gate: python scripts/train_model.py --tag ${TAG}"
+          python scripts/train_model.py --tag "${TAG}"
+
+          echo "[TRAIN] tail: python scripts/train_tail_model.py"
+          python scripts/train_tail_model.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}"
+
+          echo "[TRAIN] tau: python scripts/train_tau_model.py --tag ${TAG}"
+          python scripts/train_tau_model.py --tag "${TAG}"
+
+          # Stage models into MODEL_DIR
+          echo "[TRAIN] produced app/:"
+          ls -la app | sed -n '1,200p'
+
+          mf="$(pick_one "app/model_*${TAG}*.pkl")"
+          sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
+          test -n "${mf}"
+          test -n "${sf}"
+          cp -v "${mf}" "${MODEL_DIR}/model.pkl"
+          cp -v "${sf}" "${MODEL_DIR}/scaler.pkl"
+
+          test -f "app/tail_model.pkl"
+          test -f "app/tail_scaler.pkl"
+          cp -v "app/tail_model.pkl" "${MODEL_DIR}/tail_model.pkl"
+          cp -v "app/tail_scaler.pkl" "${MODEL_DIR}/tail_scaler.pkl"
+
+          taum="$(pick_one "app/tau_model_*${TAG}*.pkl app/tau_model.pkl")"
+          taus="$(pick_one "app/tau_scaler_*${TAG}*.pkl app/tau_scaler.pkl")"
+          test -n "${taum}"
+          test -n "${taus}"
+          cp -v "${taum}" "${MODEL_DIR}/tau_model.pkl"
+          cp -v "${taus}" "${MODEL_DIR}/tau_scaler.pkl"
+
+          echo "[TRAIN] staged in ${MODEL_DIR}:"
+          ls -la "${MODEL_DIR}" | sed -n '1,200p'
+
+          # -------------------------
+          # Walkforward #1
+          # -------------------------
+          export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
+          export PROFIT_TARGET MAX_DAYS STOP_LEVEL
+          export P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL GATE_MODES TRAIL_STOPS TP1_FRAC ENABLE_TRAILING TOPK_CONFIGS PS_MINS BADEXIT_MAXES MAX_LEVERAGE_PCT
+          export EXCLUDE_TICKERS REGIME_MODE REGIME_DD_MAX REGIME_RET20_MIN REGIME_ATR_MAX REGIME_LEVERAGE_MULT TAU_SPLIT USE_TAU_H ENABLE_DCA
+
+          export MODEL_DIR="${MODEL_DIR}"
+          export REQUIRE_FILES="${MODEL_DIR}/model.pkl,${MODEL_DIR}/scaler.pkl,${MODEL_DIR}/tail_model.pkl,${MODEL_DIR}/tail_scaler.pkl,${MODEL_DIR}/tau_model.pkl,${MODEL_DIR}/tau_scaler.pkl"
+          export OUT_DIR_BASE="data/signals/walkforward"
+          export WF_TAG_BASE="wf"
+
+          echo "[RUN1] MODEL_DIR=${MODEL_DIR}"
+          ./scripts/run_walkforward_halfyear.sh
+
+          echo "[RUN1] done. signals:"
+          ls -la "data/signals/walkforward/${WF_PERIOD}" | sed -n '1,200p' || true
+
+      - name: Upload artifact (models, this period)
+        uses: actions/upload-artifact@v4
+        with:
+          name: models_${{ matrix.period }}
+          path: data/models/wf_${{ matrix.period }}
+          if-no-files-found: error
+
+      - name: Upload artifact (walkforward #1, this period)
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward_${{ matrix.period }}
+          path: data/signals/walkforward/${{ matrix.period }}
+          if-no-files-found: warn
+
+  wf2-seq:
+    name: wf2-seq (BadExit expanding + Walkforward#2 sequential)
+    needs: [wf1-parallel, raw-data, build-features, make-matrix]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -161,12 +564,54 @@ jobs:
           name: raw-data
           path: data/raw
 
-      - name: Verify raw-data present
-        run: |
-          ls -la data/raw
-          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
+      - name: Download features-base artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: features-base
+          path: .
 
-      - name: Run walkforward (fast precompute + loop)
+      - name: Download all period artifacts (models + walkforward #1)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*_*"
+          path: _wf1_artifacts
+
+      - name: Rebuild folder structure from artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/models data/signals/walkforward data/signals/walkforward2 data/badexit_pool data/meta data/labels app
+
+          echo "[INFO] downloaded artifacts:"
+          ls -la _wf1_artifacts | sed -n '1,200p'
+
+          # models_<PERIOD>  -> data/models/wf_<PERIOD>/
+          shopt -s nullglob
+          for d in _wf1_artifacts/models_*; do
+            base="$(basename "$d")"
+            period="${base#models_}"
+            out="data/models/wf_${period}"
+            mkdir -p "$out"
+            echo "[STAGE] ${base} -> ${out}"
+            rsync -a "${d}/" "${out}/"
+          done
+
+          # walkforward_<PERIOD> -> data/signals/walkforward/<PERIOD>/
+          for d in _wf1_artifacts/walkforward_*; do
+            base="$(basename "$d")"
+            period="${base#walkforward_}"
+            out="data/signals/walkforward/${period}"
+            mkdir -p "$out"
+            echo "[STAGE] ${base} -> ${out}"
+            rsync -a "${d}/" "${out}/"
+          done
+
+          echo "[INFO] models staged:"
+          find data/models -maxdepth 2 -type d | sed -n '1,200p' || true
+          echo "[INFO] wf1 signals staged:"
+          find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p' || true
+
+      - name: Run sequential badexit(expanding past-only) + walkforward#2
         env:
           MATRIX_JSON: ${{ needs.make-matrix.outputs.matrix }}
 
@@ -205,57 +650,20 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/run_walkforward_halfyear.sh
-
           echo "$MATRIX_JSON" > /tmp/matrix.json
 
-          python - <<'PY'
+          python - <<'PY' > /tmp/periods.tsv
           import json
           m=json.load(open("/tmp/matrix.json","r"))["include"]
-          assert m, "matrix include empty"
-          print("[OK] periods=", len(m))
-          print("[OK] first=", m[0]["period"], "last=", m[-1]["period"])
-          for i,it in enumerate(m, start=1):
-              print(f"[PLAN] {i:02d} {it['period']} train={it['TRAIN_START']}..{it['TRAIN_END']} cut={it['CUT_DATE']} test={it['TEST_START']}..{it['TEST_END']}")
+          for it in m:
+              print("\t".join([
+                  it["period"],
+                  it["TRAIN_START"], it["TRAIN_END"],
+                  it["VALID_START"], it["VALID_END"],
+                  it["TEST_START"], it["TEST_END"],
+                  it["CUT_DATE"],
+              ]))
           PY
-
-          mkdir -p data/features data/labels data/meta app
-          mkdir -p data/models data/signals/walkforward data/signals/walkforward2
-          mkdir -p data/badexit_pool
-
-          pick_one () {
-            local pat="$1"
-            local f
-            f="$(ls -1 ${pat} 2>/dev/null | head -n 1 || true)"
-            echo "${f}"
-          }
-
-          ensure_universe () {
-            if [ -f data/universe.csv ]; then return 0; fi
-            echo "[INFO] data/universe.csv missing -> generating from raw prices"
-            python - <<'PY'
-          from pathlib import Path
-          import pandas as pd
-          raw_parq = Path("data/raw/prices.parquet")
-          raw_csv  = Path("data/raw/prices.csv")
-          if raw_parq.exists():
-              df = pd.read_parquet(raw_parq)
-          elif raw_csv.exists():
-              df = pd.read_csv(raw_csv)
-          else:
-              raise SystemExit("[ERROR] raw prices missing")
-          if "Ticker" not in df.columns:
-              raise SystemExit("[ERROR] raw prices missing Ticker column")
-          ticks = (
-              df["Ticker"].astype(str).str.upper().str.strip()
-                .dropna().unique().tolist()
-          )
-          ticks = sorted(set([t for t in ticks if t]))
-          out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
-          Path("data").mkdir(parents=True, exist_ok=True)
-          out.to_csv("data/universe.csv", index=False)
-          print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
-          PY
-          }
 
           ex_tag () {
             python - <<'PY'
@@ -267,57 +675,6 @@ jobs:
           pt_i=int(round(pt*100))
           sl_i=int(round(abs(sl)*100))
           print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
-          PY
-          }
-
-          # fast filter helper
-          filter_by_date () {
-            # args: IN_PATH OUT_PATH CUT_DATE START_DATE(optional)
-            local in_path="$1"
-            local out_path="$2"
-            local cut="$3"
-            local start="${4:-}"
-            IN_PATH="${in_path}" OUT_PATH="${out_path}" CUT_DATE="${cut}" START_DATE="${start}" python - <<'PY'
-          import os
-          import pandas as pd
-          from pathlib import Path
-
-          inp=Path(os.environ["IN_PATH"])
-          out=Path(os.environ["OUT_PATH"])
-          cut=pd.to_datetime(os.environ["CUT_DATE"])
-          start=os.environ.get("START_DATE","").strip()
-          start_dt=pd.to_datetime(start) if start else None
-
-          if not inp.exists():
-              raise SystemExit(f"[FILTER] missing: {inp}")
-
-          df=pd.read_parquet(inp) if inp.suffix==".parquet" else pd.read_csv(inp)
-
-          if "Date" not in df.columns:
-              out.parent.mkdir(parents=True, exist_ok=True)
-              if out.suffix==".parquet":
-                  df.to_parquet(out, index=False)
-              else:
-                  df.to_csv(out, index=False)
-              print(f"[FILTER] no Date -> passthrough {inp} -> {out} rows={len(df)}")
-              raise SystemExit(0)
-
-          dt=pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
-          df=df.loc[dt.notna()].copy()
-          df["Date"]=dt.loc[dt.notna()].values
-
-          before=len(df)
-          df=df[df["Date"]<=cut].copy()
-          if start_dt is not None:
-              df=df[df["Date"]>=start_dt].copy()
-          after=len(df)
-
-          out.parent.mkdir(parents=True, exist_ok=True)
-          if out.suffix==".parquet":
-              df.to_parquet(out, index=False)
-          else:
-              df.to_csv(out, index=False)
-          print(f"[FILTER] {inp} -> {out}: {before} -> {after}")
           PY
           }
 
@@ -346,225 +703,55 @@ jobs:
             echo "[WARN] no features_scored.(csv|parquet) in ${dir}"
           }
 
-          # write periods + min train start
-          python - <<'PY' > /tmp/periods.tsv
-          import json
-          m=json.load(open("/tmp/matrix.json","r"))["include"]
-          for it in m:
-              print("\t".join([
-                  it["period"],
-                  it["TRAIN_START"], it["TRAIN_END"],
-                  it["VALID_START"], it["VALID_END"],
-                  it["TEST_START"], it["TEST_END"],
-                  it["CUT_DATE"],
-              ]))
-          PY
+          pick_one () {
+            local pat="$1"
+            local f
+            f="$(ls -1 ${pat} 2>/dev/null | head -n 1 || true)"
+            echo "${f}"
+          }
 
-          MIN_TRAIN_START="$(python - <<'PY'
-          import json
-          m=json.load(open("/tmp/matrix.json","r"))["include"]
-          print(min(it["TRAIN_START"] for it in m))
-          PY
-          )"
-          echo "[PRE] MIN_TRAIN_START=${MIN_TRAIN_START}"
-
-          # ============================================================
-          # PRECOMPUTE ONCE
-          # ============================================================
-          ensure_universe
-
-          echo "[PRE] build_features once"
-          python scripts/build_features.py
-
-          if [ -f data/features/features_model.parquet ]; then
-            cp -v data/features/features_model.parquet data/features/features_model_full.parquet
-            FEAT_FULL="data/features/features_model_full.parquet"
-            FEAT_OUT="data/features/features_model.parquet"
-            FEAT_TAG_OUT_PREFIX="data/features/features_model_"
-          elif [ -f data/features/features_model.csv ]; then
-            cp -v data/features/features_model.csv data/features/features_model_full.csv
-            FEAT_FULL="data/features/features_model_full.csv"
-            FEAT_OUT="data/features/features_model.csv"
-            FEAT_TAG_OUT_PREFIX="data/features/features_model_"
-          else
-            echo "[ERROR] features_model not found after build_features"
-            ls -la data/features | sed -n '1,200p' || true
-            exit 1
-          fi
-
-          echo "[PRE] build gate labels once (start=${MIN_TRAIN_START})"
-          python scripts/build_labels.py \
-            --profit-target "${PROFIT_TARGET}" \
-            --max-days "${MAX_DAYS}" \
-            --stop-level "${STOP_LEVEL}" \
-            --start-date "${MIN_TRAIN_START}"
-
-          if [ -f data/labels/labels_model.parquet ]; then
-            cp -v data/labels/labels_model.parquet data/labels/labels_model_full.parquet
-            GATE_FULL="data/labels/labels_model_full.parquet"
-            GATE_OUT="data/labels/labels_model.parquet"
-            GATE_TAG_OUT_PREFIX="data/labels/labels_model_"
-          elif [ -f data/labels/labels_model.csv ]; then
-            cp -v data/labels/labels_model.csv data/labels/labels_model_full.csv
-            GATE_FULL="data/labels/labels_model_full.csv"
-            GATE_OUT="data/labels/labels_model.csv"
-            GATE_TAG_OUT_PREFIX="data/labels/labels_model_"
-          else
-            echo "[ERROR] labels_model not found after build_labels"
-            ls -la data/labels | sed -n '1,240p' || true
-            exit 1
-          fi
-
-          echo "[PRE] build tail labels once"
-          python scripts/build_tail_labels.py \
-            --profit-target "${PROFIT_TARGET}" \
-            --max-days "${MAX_DAYS}" \
-            --stop-level "${STOP_LEVEL}" \
-            --max-extend-days "${MAX_EXTEND_DAYS}"
-
-          EX_TAG="$(ex_tag)"
-          echo "[PRE] EX_TAG=${EX_TAG}"
-
-          if [ -f "data/labels/labels_tail_${EX_TAG}.parquet" ]; then
-            cp -v "data/labels/labels_tail_${EX_TAG}.parquet" "data/labels/labels_tail_full_${EX_TAG}.parquet"
-            TAIL_FULL="data/labels/labels_tail_full_${EX_TAG}.parquet"
-            TAIL_OUT="data/labels/labels_tail_${EX_TAG}.parquet"
-            TAIL_TAG_OUT_PREFIX="data/labels/labels_tail_"
-          elif [ -f "data/labels/labels_tail_${EX_TAG}.csv" ]; then
-            cp -v "data/labels/labels_tail_${EX_TAG}.csv" "data/labels/labels_tail_full_${EX_TAG}.csv"
-            TAIL_FULL="data/labels/labels_tail_full_${EX_TAG}.csv"
-            TAIL_OUT="data/labels/labels_tail_${EX_TAG}.csv"
-            TAIL_TAG_OUT_PREFIX="data/labels/labels_tail_"
-          else
-            echo "[ERROR] tail labels not found after build_tail_labels"
-            ls -la data/labels | sed -n '1,240p' || true
-            exit 1
-          fi
-
-          # ============================================================
-          # LOOP
-          # ============================================================
           total="$(wc -l < /tmp/periods.tsv | tr -d ' ')"
           idx=0
+          POOL="data/badexit_pool"
+          mkdir -p "${POOL}"
 
           while IFS=$'\t' read -r WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE; do
             idx=$((idx+1))
             TAG="wf_${WF_PERIOD}"
             MODEL_DIR="data/models/${TAG}"
-            mkdir -p "${MODEL_DIR}"
+            SIGNALS_WF1="data/signals/walkforward/${WF_PERIOD}"
+            OUT2="data/signals/walkforward2/${WF_PERIOD}"
 
             echo ""
             echo "===================="
-            echo "[PERIOD] ${WF_PERIOD} (#${idx}/${total})"
+            echo "[WF2] ${WF_PERIOD} (#${idx}/${total})"
             echo "===================="
-            echo "[PERIOD] train=${TRAIN_START}..${TRAIN_END} cut=${CUT_DATE} test=${TEST_START}..${TEST_END}"
 
-            # Gate rolling: features <= cut, labels train_start..cut
-            filter_by_date "${FEAT_FULL}" "${FEAT_OUT}" "${CUT_DATE}" ""
-            if [[ "${FEAT_OUT}" == *.parquet ]]; then
-              cp -f "${FEAT_OUT}" "${FEAT_TAG_OUT_PREFIX}${TAG}.parquet"
-            else
-              cp -f "${FEAT_OUT}" "${FEAT_TAG_OUT_PREFIX}${TAG}.csv"
+            if [ ! -d "${MODEL_DIR}" ]; then
+              echo "[ERROR] missing MODEL_DIR=${MODEL_DIR} (models artifact not staged?)"
+              ls -la data/models | sed -n '1,200p' || true
+              exit 1
             fi
-
-            filter_by_date "${GATE_FULL}" "${GATE_OUT}" "${CUT_DATE}" "${TRAIN_START}"
-            if [[ "${GATE_OUT}" == *.parquet ]]; then
-              cp -f "${GATE_OUT}" "${GATE_TAG_OUT_PREFIX}${TAG}.parquet"
-            else
-              cp -f "${GATE_OUT}" "${GATE_TAG_OUT_PREFIX}${TAG}.csv"
-            fi
-
-            # Tail expanding: <= cut
-            filter_by_date "${TAIL_FULL}" "${TAIL_OUT}" "${CUT_DATE}" ""
-            if [[ "${TAIL_OUT}" == *.parquet ]]; then
-              cp -f "${TAIL_OUT}" "${TAIL_TAG_OUT_PREFIX}${TAG}.parquet"
-            else
-              cp -f "${TAIL_OUT}" "${TAIL_TAG_OUT_PREFIX}${TAG}.csv"
-            fi
-
-            # Tau expanding tagged: build + cut
-            python scripts/build_tau_labels.py \
-              --tag "${TAG}" \
-              --profit-target "${PROFIT_TARGET}" \
-              --max-days "${MAX_DAYS}" \
-              --stop-level "${STOP_LEVEL}" \
-              --max-extend-days "${MAX_EXTEND_DAYS}"
-
-            TAUL="$(python - <<'PY'
-          import os, glob
-          tag=os.environ.get("TAG","")
-          cand=[]
-          cand += glob.glob(f"data/labels/labels_tau_{tag}.parquet")
-          cand += glob.glob(f"data/labels/labels_tau_{tag}.csv")
-          cand += glob.glob(f"data/labels/*tau*{tag}*.parquet")
-          cand += glob.glob(f"data/labels/*tau*{tag}*.csv")
-          cand=sorted(set(cand))
-          print(cand[0] if cand else "")
-          PY
-            )"
-            if [ -z "${TAUL}" ] || [ ! -f "${TAUL}" ]; then
-              echo "[ERROR] tau labels missing for ${TAG}"
-              ls -la data/labels | sed -n '1,240p' || true
+            if [ ! -d "${SIGNALS_WF1}" ]; then
+              echo "[ERROR] missing wf1 signals dir=${SIGNALS_WF1}"
+              find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p' || true
               exit 1
             fi
 
-            if [[ "${TAUL}" == *.parquet ]]; then
-              filter_by_date "${TAUL}" "data/labels/labels_tau_${TAG}.parquet" "${CUT_DATE}" ""
-            else
-              filter_by_date "${TAUL}" "data/labels/labels_tau_${TAG}.csv" "${CUT_DATE}" ""
-            fi
-
-            # Train models
-            echo "[TRAIN] gate"
-            python scripts/train_model.py --tag "${TAG}"
-
-            echo "[TRAIN] tail"
-            python scripts/train_tail_model.py \
-              --profit-target "${PROFIT_TARGET}" \
-              --max-days "${MAX_DAYS}" \
-              --stop-level "${STOP_LEVEL}" \
-              --max-extend-days "${MAX_EXTEND_DAYS}"
-
-            echo "[TRAIN] tau"
-            python scripts/train_tau_model.py --tag "${TAG}"
-
-            # Stage models
-            mf="$(pick_one "app/model_*${TAG}*.pkl")"
-            sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
-            test -n "${mf}" && test -n "${sf}"
-            cp -v "${mf}" "${MODEL_DIR}/model.pkl"
-            cp -v "${sf}" "${MODEL_DIR}/scaler.pkl"
-
-            test -f app/tail_model.pkl && test -f app/tail_scaler.pkl
-            cp -v app/tail_model.pkl "${MODEL_DIR}/tail_model.pkl"
-            cp -v app/tail_scaler.pkl "${MODEL_DIR}/tail_scaler.pkl"
-
-            taum="$(pick_one "app/tau_model_*${TAG}*.pkl app/tau_model.pkl")"
-            taus="$(pick_one "app/tau_scaler_*${TAG}*.pkl app/tau_scaler.pkl")"
-            test -n "${taum}" && test -n "${taus}"
-            cp -v "${taum}" "${MODEL_DIR}/tau_model.pkl"
-            cp -v "${taus}" "${MODEL_DIR}/tau_scaler.pkl"
-
-            # Walkforward #1
-            export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
-            export PROFIT_TARGET MAX_DAYS STOP_LEVEL
-            export P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL GATE_MODES TRAIL_STOPS TP1_FRAC ENABLE_TRAILING TOPK_CONFIGS PS_MINS BADEXIT_MAXES MAX_LEVERAGE_PCT
-            export EXCLUDE_TICKERS REGIME_MODE REGIME_DD_MAX REGIME_RET20_MIN REGIME_ATR_MAX REGIME_LEVERAGE_MULT TAU_SPLIT USE_TAU_H ENABLE_DCA
-            export MODEL_DIR
-            export REQUIRE_FILES="data/models/${TAG}/model.pkl,data/models/${TAG}/scaler.pkl,data/models/${TAG}/tail_model.pkl,data/models/${TAG}/tail_scaler.pkl,data/models/${TAG}/tau_model.pkl,data/models/${TAG}/tau_scaler.pkl"
-            export OUT_DIR_BASE="data/signals/walkforward"
-            export WF_TAG_BASE="wf"
-
-            ./scripts/run_walkforward_halfyear.sh
-
-            # BadExit expanding (past-only pool)
-            POOL="data/badexit_pool"
-            mkdir -p "${POOL}"
+            # -------------------------
+            # BadExit expanding PAST-ONLY
+            # - train using POOL (past periods only)
+            # - then run wf2; then add current wf1 trades to POOL for next periods
+            # -------------------------
             pool_files="$(find "${POOL}" -type f -name 'sim_engine_trades_*' | wc -l | tr -d ' ')"
+            echo "[BADEXIT-EXP] pool files count=${pool_files}"
             BADEXIT_AVAILABLE="false"
 
             if [ "${pool_files}" != "0" ]; then
               BADEXIT_AVAILABLE="true"
+              EX_TAG="$(ex_tag)"
+              echo "[BADEXIT-EXP] EX_TAG=${EX_TAG}"
+
               python scripts/build_badexit_labels.py \
                 --profit-target "${PROFIT_TARGET}" \
                 --max-days "${MAX_DAYS}" \
@@ -574,7 +761,12 @@ jobs:
                 --also-read-csv
 
               badlbl="$(pick_one "data/labels/labels_badexit_${EX_TAG}.parquet data/labels/labels_badexit_${EX_TAG}.csv data/labels/labels_badexit_*.parquet data/labels/labels_badexit_*.csv")"
-              test -n "${badlbl}"
+              if [ -z "${badlbl}" ]; then
+                echo "[ERROR] badexit labels not found"
+                ls -la data/labels | sed -n '1,200p' || true
+                exit 1
+              fi
+              echo "[BADEXIT] labels=${badlbl}"
 
               LABEL_COL="$(BADLBL="${badlbl}" python - <<'PY'
           import os
@@ -582,7 +774,7 @@ jobs:
           from pathlib import Path
           p=Path(os.environ["BADLBL"])
           df=pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
-          cols=set(df.columns)
+          cols=list(df.columns)
           for c in ["y_badexit","BadExit","badexit","is_badexit","label","target"]:
               if c in cols:
                   print(c)
@@ -590,7 +782,10 @@ jobs:
           print("__MISSING__")
           PY
               )"
-              test "${LABEL_COL}" != "__MISSING__"
+              if [ "${LABEL_COL}" = "__MISSING__" ]; then
+                echo "[ERROR] badexit label col missing in ${badlbl}"
+                exit 1
+              fi
 
               python scripts/train_badexit_model_wf_lite.py \
                 --data-path "${badlbl}" \
@@ -599,29 +794,43 @@ jobs:
                 --out-scaler "app/badexit_scaler_${TAG}.pkl" \
                 --out-report "data/meta/train_badexit_report_${TAG}.json"
 
-              test -f "app/badexit_model_${TAG}.pkl" && test -f "app/badexit_scaler_${TAG}.pkl"
+              test -f "app/badexit_model_${TAG}.pkl"
+              test -f "app/badexit_scaler_${TAG}.pkl"
               cp -v "app/badexit_model_${TAG}.pkl" "${MODEL_DIR}/badexit_model.pkl"
               cp -v "app/badexit_scaler_${TAG}.pkl" "${MODEL_DIR}/badexit_scaler.pkl"
+            else
+              echo "[BADEXIT-EXP] pool empty -> skip badexit training (no lookahead)."
             fi
 
-            # Walkforward #2
+            # -------------------------
+            # Walkforward #2 (with badexit if available)
+            # -------------------------
+            export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
+            export PROFIT_TARGET MAX_DAYS STOP_LEVEL
+            export P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL GATE_MODES TRAIL_STOPS TP1_FRAC ENABLE_TRAILING TOPK_CONFIGS PS_MINS BADEXIT_MAXES MAX_LEVERAGE_PCT
+            export EXCLUDE_TICKERS REGIME_MODE REGIME_DD_MAX REGIME_RET20_MIN REGIME_ATR_MAX REGIME_LEVERAGE_MULT TAU_SPLIT USE_TAU_H ENABLE_DCA
+            export MODEL_DIR
+
             if [ "${BADEXIT_AVAILABLE}" != "true" ]; then
-              mkdir -p "data/signals/walkforward2/${WF_PERIOD}"
-              rsync -a "data/signals/walkforward/${WF_PERIOD}/" "data/signals/walkforward2/${WF_PERIOD}/" || true
+              echo "[RUN2] no badexit -> copy wf1 -> wf2"
+              mkdir -p "${OUT2}"
+              rsync -a "${SIGNALS_WF1}/" "${OUT2}/" || true
             else
-              export REQUIRE_FILES="data/models/${TAG}/model.pkl,data/models/${TAG}/scaler.pkl,data/models/${TAG}/tail_model.pkl,data/models/${TAG}/tail_scaler.pkl,data/models/${TAG}/tau_model.pkl,data/models/${TAG}/tau_scaler.pkl,data/models/${TAG}/badexit_model.pkl,data/models/${TAG}/badexit_scaler.pkl"
+              export REQUIRE_FILES="${MODEL_DIR}/model.pkl,${MODEL_DIR}/scaler.pkl,${MODEL_DIR}/tail_model.pkl,${MODEL_DIR}/tail_scaler.pkl,${MODEL_DIR}/tau_model.pkl,${MODEL_DIR}/tau_scaler.pkl,${MODEL_DIR}/badexit_model.pkl,${MODEL_DIR}/badexit_scaler.pkl"
               export OUT_DIR_BASE="data/signals/walkforward2"
+              export WF_TAG_BASE="wf"
               ./scripts/run_walkforward_halfyear.sh
             fi
 
-            ensure_features_scored_csv "data/signals/walkforward/${WF_PERIOD}/_inputs"
             ensure_features_scored_csv "data/signals/walkforward2/${WF_PERIOD}/_inputs"
 
-            # Add current wf1 trades to pool for next periods
-            SIGNALS_DIR="data/signals/walkforward/${WF_PERIOD}"
+            # -------------------------
+            # Add CURRENT wf1 trades to POOL (for NEXT periods)
+            # -------------------------
+            EX_TAG="$(ex_tag)"
             shopt -s nullglob
             n=0
-            for f in "${SIGNALS_DIR}"/sim_engine_trades_*.csv "${SIGNALS_DIR}"/sim_engine_trades_*.parquet; do
+            for f in "${SIGNALS_WF1}"/sim_engine_trades_*.csv "${SIGNALS_WF1}"/sim_engine_trades_*.parquet; do
               base="$(basename "$f")"
               out="${POOL}/sim_engine_trades_${EX_TAG}__${WF_PERIOD}__${base}"
               if [ ! -f "${out}" ]; then
@@ -629,15 +838,12 @@ jobs:
                 n=$((n+1))
               fi
             done
-            echo "[POOL] copied ${n} files."
+            echo "[POOL] added ${n} files from ${WF_PERIOD}. pool now=$(find "${POOL}" -type f -name 'sim_engine_trades_*' | wc -l | tr -d ' ')"
+
           done < /tmp/periods.tsv
 
-      - name: Upload artifact (walkforward all)
-        uses: actions/upload-artifact@v4
-        with:
-          name: walkforward_all
-          path: data/signals/walkforward
-          if-no-files-found: error
+          echo "[DONE] wf2 sequential complete."
+          find data/signals/walkforward2 -maxdepth 2 -type d | sed -n '1,200p' || true
 
       - name: Upload artifact (walkforward2 all)
         uses: actions/upload-artifact@v4
@@ -646,20 +852,16 @@ jobs:
           path: data/signals/walkforward2
           if-no-files-found: error
 
-      - name: Upload artifact (features_scored all)
+      - name: Upload artifact (badexit pool, debug)
         uses: actions/upload-artifact@v4
         with:
-          name: features_scored_all
-          path: |
-            data/signals/walkforward/*/_inputs/features_scored.csv
-            data/signals/walkforward/*/_inputs/features_scored.parquet
-            data/signals/walkforward2/*/_inputs/features_scored.csv
-            data/signals/walkforward2/*/_inputs/features_scored.parquet
+          name: badexit_pool_debug
+          path: data/badexit_pool
           if-no-files-found: warn
 
   aggregate:
-    name: aggregate-walkforward
-    needs: [run]
+    name: aggregate-walkforward2
+    needs: [wf2-seq]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -674,42 +876,42 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install -U pandas pyarrow
 
-      - name: Download walkforward_all artifact
+      - name: Download walkforward2_all artifact
         uses: actions/download-artifact@v4
         with:
-          name: walkforward_all
-          path: _wf_all
+          name: walkforward2_all
+          path: _wf2_all
 
-      - name: Rebuild expected folder structure (#1)
+      - name: Rebuild expected folder structure (walkforward2)
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p data/signals/walkforward
-          rsync -a "_wf_all/" "data/signals/walkforward/"
-          find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p'
-          test "$(find data/signals/walkforward -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
+          mkdir -p data/signals/walkforward2
+          rsync -a "_wf2_all/" "data/signals/walkforward2/"
+          find data/signals/walkforward2 -maxdepth 2 -type d | sed -n '1,200p'
+          test "$(find data/signals/walkforward2 -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
 
-      - name: Aggregate metrics across periods
+      - name: Aggregate metrics across periods (walkforward2)
         run: |
           set -euo pipefail
           python scripts/aggregate_walkforward_halfyear.py \
-            --root data/signals/walkforward \
-            --out data/signals/walkforward/_summary_walkforward.csv
-          test -f data/signals/walkforward/_summary_walkforward.csv
+            --root data/signals/walkforward2 \
+            --out data/signals/walkforward2/_summary_walkforward2.csv
+          test -f data/signals/walkforward2/_summary_walkforward2.csv
 
-      - name: Analyze summary (rank configs)
+      - name: Analyze summary (rank configs, walkforward2)
         run: |
           set -euo pipefail
           python scripts/analyze_walkforward_summary.py \
-            --summary data/signals/walkforward/_summary_walkforward.csv \
-            --out data/signals/walkforward/_analysis_walkforward.csv
-          test -f data/signals/walkforward/_analysis_walkforward.csv
+            --summary data/signals/walkforward2/_summary_walkforward2.csv \
+            --out data/signals/walkforward2/_analysis_walkforward2.csv
+          test -f data/signals/walkforward2/_analysis_walkforward2.csv
 
-      - name: Upload artifact (walkforward summary)
+      - name: Upload artifact (walkforward2 summary)
         uses: actions/upload-artifact@v4
         with:
-          name: walkforward_summary
+          name: walkforward2_summary
           path: |
-            data/signals/walkforward/_summary_walkforward.csv
-            data/signals/walkforward/_analysis_walkforward.csv
+            data/signals/walkforward2/_summary_walkforward2.csv
+            data/signals/walkforward2/_analysis_walkforward2.csv
           if-no-files-found: error
