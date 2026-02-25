@@ -94,6 +94,19 @@ jobs:
           name: raw-data
           path: data/raw
 
+      - name: Normalize downloaded raw-data artifact (flatten if nested)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Sometimes artifacts come down nested (e.g., data/raw/data/raw/*)
+          if [ -d data/raw/data/raw ]; then
+            echo "[FIX] flatten nested raw-data: data/raw/data/raw -> data/raw"
+            rsync -a data/raw/data/raw/ data/raw/
+            rm -rf data/raw/data
+          fi
+          echo "[DEBUG] data/raw:"
+          ls -la data/raw | sed -n '1,200p'
+
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
         run: |
@@ -104,26 +117,26 @@ jobs:
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-          
+
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-          
+
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-          
+
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-          
+
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
-          
+
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
@@ -164,22 +177,22 @@ jobs:
           python - <<'PY' > /tmp/matrix.json
           import json, re
           from datetime import date, timedelta
-          
+
           wf_start = "${{ inputs.wf_start }}".strip()
           wf_end   = "${{ inputs.wf_end }}".strip()
           train_years = int("${{ inputs.train_years }}")
-          
+
           m = re.fullmatch(r"(\d{4})H([12])", wf_start)
           n = re.fullmatch(r"(\d{4})H([12])", wf_end)
           if not m or not n:
               raise SystemExit("wf_start/wf_end must be like 2018H1")
-          
+
           sy, sh = int(m.group(1)), int(m.group(2))
           ey, eh = int(n.group(1)), int(n.group(2))
-          
+
           def half_start(y,h): return date(y,1,1) if h==1 else date(y,7,1)
           def half_end(y,h):   return date(y,6,30) if h==1 else date(y,12,31)
-          
+
           items=[]
           y,h=sy,sh
           while True:
@@ -203,7 +216,7 @@ jobs:
               if y==ey and h==eh: break
               if h==1: h=2
               else: y+=1; h=1
-          
+
           print(json.dumps({"include":items}, ensure_ascii=False))
           PY
 
@@ -242,6 +255,39 @@ jobs:
           name: features-base
           path: .
 
+      - name: Normalize downloaded artifacts (flatten if nested)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # raw-data flatten
+          if [ -d data/raw/data/raw ]; then
+            echo "[FIX] flatten nested raw-data: data/raw/data/raw -> data/raw"
+            rsync -a data/raw/data/raw/ data/raw/
+            rm -rf data/raw/data
+          fi
+
+          # features-base flatten (rare, but handle common nested patterns)
+          if [ -d data/features/data/features ]; then
+            echo "[FIX] flatten nested features: data/features/data/features -> data/features"
+            rsync -a data/features/data/features/ data/features/
+            rm -rf data/features/data
+          fi
+          if [ -d data/meta/data/meta ]; then
+            echo "[FIX] flatten nested meta: data/meta/data/meta -> data/meta"
+            rsync -a data/meta/data/meta/ data/meta/
+            rm -rf data/meta/data
+          fi
+
+          echo "[DEBUG] tree (top):"
+          ls -la . | sed -n '1,200p' || true
+          echo "[DEBUG] data/:"
+          ls -la data | sed -n '1,200p' || true
+          echo "[DEBUG] data/raw/:"
+          ls -la data/raw | sed -n '1,200p' || true
+          echo "[DEBUG] data/features/:"
+          ls -la data/features | sed -n '1,200p' || true
+
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
         run: |
@@ -252,26 +298,26 @@ jobs:
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-          
+
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-          
+
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-          
+
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-          
+
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
-          
+
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
@@ -281,10 +327,26 @@ jobs:
           ls -la data | sed -n '1,200p'
           test -f data/universe.csv
 
-      - name: Verify inputs
+      - name: Verify inputs (with debug)
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "[VERIFY] expecting:"
+          echo "  - data/raw/prices.(parquet|csv)"
+          echo "  - data/features/features_model.(parquet|csv)"
+          echo "  - data/universe.csv"
+          echo ""
+          echo "[DEBUG] quick find (prices/features/universe):"
+          find data -maxdepth 5 -type f \( -name "prices.parquet" -o -name "prices.csv" -o -name "features_model.parquet" -o -name "features_model.csv" -o -name "universe.csv" \) | sed -n '1,200p' || true
+          echo ""
+          echo "[DEBUG] ls data/raw:"
+          ls -la data/raw | sed -n '1,200p' || true
+          echo "[DEBUG] ls data/features:"
+          ls -la data/features | sed -n '1,200p' || true
+          echo "[DEBUG] ls data/:"
+          ls -la data | sed -n '1,200p' || true
+
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
           test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
@@ -355,19 +417,19 @@ jobs:
           import os
           from pathlib import Path
           import pandas as pd
-          
+
           TAG=os.environ["TAG"]
           CUT=pd.to_datetime(os.environ["CUT_DATE"])
-          
+
           def read_any(parq, csv):
               if Path(parq).exists(): return pd.read_parquet(parq)
               if Path(csv).exists():  return pd.read_csv(csv)
               raise FileNotFoundError(f"missing {parq} or {csv}")
-          
+
           def write_parq(df, p):
               Path(p).parent.mkdir(parents=True, exist_ok=True)
               df.to_parquet(p, index=False)
-          
+
           f = read_any("data/features/features_model.parquet", "data/features/features_model.csv")
           f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.tz_localize(None)
           f = f.dropna(subset=["Date"])
@@ -375,7 +437,7 @@ jobs:
           write_parq(f_cut, "data/features/features_model.parquet")
           write_parq(f_cut, f"data/features/features_model_{TAG}.parquet")
           print("[CUT] features_model rows=", len(f_cut))
-          
+
           lm = read_any("data/labels/labels_model.parquet", "data/labels/labels_model.csv")
           lm["Date"] = pd.to_datetime(lm["Date"], errors="coerce").dt.tz_localize(None)
           lm = lm.dropna(subset=["Date"])
@@ -564,6 +626,35 @@ jobs:
           name: features-base
           path: .
 
+      - name: Normalize downloaded artifacts (flatten if nested)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -d data/raw/data/raw ]; then
+            echo "[FIX] flatten nested raw-data: data/raw/data/raw -> data/raw"
+            rsync -a data/raw/data/raw/ data/raw/
+            rm -rf data/raw/data
+          fi
+
+          if [ -d data/features/data/features ]; then
+            echo "[FIX] flatten nested features: data/features/data/features -> data/features"
+            rsync -a data/features/data/features/ data/features/
+            rm -rf data/features/data
+          fi
+          if [ -d data/meta/data/meta ]; then
+            echo "[FIX] flatten nested meta: data/meta/data/meta -> data/meta"
+            rsync -a data/meta/data/meta/ data/meta/
+            rm -rf data/meta/data
+          fi
+
+          echo "[DEBUG] data/raw:"
+          ls -la data/raw | sed -n '1,200p' || true
+          echo "[DEBUG] data/features:"
+          ls -la data/features | sed -n '1,200p' || true
+          echo "[DEBUG] data/:"
+          ls -la data | sed -n '1,200p' || true
+
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
         run: |
@@ -574,33 +665,32 @@ jobs:
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-          
+
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-          
+
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-          
+
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-          
+
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
-          
+
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
           PY
           fi
-          ls -la data | sed -n '1,200p'
           test -f data/universe.csv
 
       - name: Download models_* artifacts
