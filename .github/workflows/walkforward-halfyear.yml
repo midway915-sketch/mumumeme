@@ -101,27 +101,36 @@ jobs:
           mkdir -p data
           if [ ! -f data/universe.csv ]; then
             echo "[INFO] data/universe.csv missing -> generating from raw prices"
-            python -c '
+            python - <<'PY'
           from pathlib import Path
           import pandas as pd
+          
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
+          
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
+          
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-          ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+          
+          ticks = (
+              df["Ticker"].astype(str).str.upper().str.strip()
+                .dropna().unique().tolist()
+          )
           ticks = sorted(set([t for t in ticks if t]))
+          
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
-          '
+          PY
           fi
+          ls -la data | sed -n '1,200p'
           test -f data/universe.csv
 
       - name: Build features once (full history)
@@ -240,27 +249,36 @@ jobs:
           mkdir -p data
           if [ ! -f data/universe.csv ]; then
             echo "[INFO] data/universe.csv missing -> generating from raw prices"
-            python -c '
+            python - <<'PY'
           from pathlib import Path
           import pandas as pd
+          
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
+          
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
+          
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-          ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+          
+          ticks = (
+              df["Ticker"].astype(str).str.upper().str.strip()
+                .dropna().unique().tolist()
+          )
           ticks = sorted(set([t for t in ticks if t]))
+          
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
-          '
+          PY
           fi
+          ls -la data | sed -n '1,200p'
           test -f data/universe.csv
 
       - name: Verify inputs
@@ -366,7 +384,7 @@ jobs:
           write_parq(lm_cut, f"data/labels/labels_model_{TAG}.parquet")
           print("[CUT] labels_model rows=", len(lm_cut))
           ' TAG="${TAG}" CUT_DATE="${CUT_DATE}"
-          
+
           python scripts/build_tail_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
@@ -553,30 +571,38 @@ jobs:
           mkdir -p data
           if [ ! -f data/universe.csv ]; then
             echo "[INFO] data/universe.csv missing -> generating from raw prices"
-            python -c '
+            python - <<'PY'
           from pathlib import Path
           import pandas as pd
+          
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
+          
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
+          
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-          ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+          
+          ticks = (
+              df["Ticker"].astype(str).str.upper().str.strip()
+                .dropna().unique().tolist()
+          )
           ticks = sorted(set([t for t in ticks if t]))
+          
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
-          '
+          PY
           fi
+          ls -la data | sed -n '1,200p'
           test -f data/universe.csv
 
-      # ✅ 변경: models_* / walkforward_* 아티팩트를 따로 받기
       - name: Download models_* artifacts
         uses: actions/download-artifact@v4
         with:
@@ -598,7 +624,6 @@ jobs:
           mkdir -p data/models data/signals/walkforward data/signals/walkforward2 data/badexit_pool data/labels data/meta app
           shopt -s nullglob
 
-          # models_{period} -> data/models/wf_{period}
           for d in _wf1_artifacts/models/models_*; do
             base="$(basename "$d")"
             period="${base#models_}"
@@ -607,7 +632,6 @@ jobs:
             rsync -a "${d}/" "${out}/"
           done
 
-          # walkforward_{period} -> data/signals/walkforward/{period}
           for d in _wf1_artifacts/walkforward/walkforward_*; do
             base="$(basename "$d")"
             period="${base#walkforward_}"
@@ -691,13 +715,13 @@ jobs:
           ensure_features_scored_csv () {
             local dir="$1"
             if [ -d "${dir}" ] && [ ! -f "${dir}/features_scored.csv" ] && [ -f "${dir}/features_scored.parquet" ]; then
-              python -c '
+              DIR="${dir}" python - <<'PY'
           import os, pandas as pd
           d=os.environ["DIR"]
           df=pd.read_parquet(f"{d}/features_scored.parquet")
           df.to_csv(f"{d}/features_scored.csv", index=False)
           print("[DONE] wrote", f"{d}/features_scored.csv", "rows=", len(df))
-          ' DIR="${dir}"
+          PY
             fi
           }
 
@@ -745,7 +769,7 @@ jobs:
               test -n "${badlbl}"
               echo "[BADEXIT] labels=${badlbl}"
 
-              LABEL_COL="$(python -c '
+              LABEL_COL="$(BADLBL="${badlbl}" python - <<'PY'
           import os
           import pandas as pd
           from pathlib import Path
@@ -757,7 +781,8 @@ jobs:
                   print(c)
                   raise SystemExit(0)
           print("__MISSING__")
-          ' BADLBL="${badlbl}")"
+          PY
+              )"
 
               if [ "${LABEL_COL}" = "__MISSING__" ]; then
                 echo "[ERROR] badexit label col missing"
