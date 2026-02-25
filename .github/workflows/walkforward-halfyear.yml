@@ -31,32 +31,32 @@ on:
 
       # ---- GRID PARAMS ----
       P_TAIL_THRESHOLDS:
-        description: "comma list (e.g. 0.10,0.20,0.30)"
+        description: "P_TAIL_THRESHOLDS (e.g. 0.10,0.20,0.30)"
         required: true
         default: "0.10,0.20,0.30"
 
       UTILITY_QUANTILES:
-        description: "comma list (e.g. 0.60,0.75,0.90)"
+        description: "UTILITY_QUANTILES (e.g. 0.60,0.75,0.90)"
         required: true
         default: "0.60,0.75,0.90"
 
       PS_MINS:
-        description: "comma list (e.g. 0.00,0.60,0.70)"
+        description: "PS_MINS (e.g. 0.00,0.60,0.70)"
         required: true
         default: "0.00"
 
       TRAIL_STOPS:
-        description: "comma list (e.g. 0.10,0.12)"
+        description: "TRAIL_STOPS (e.g. 0.10,0.12)"
         required: true
         default: "0.10"
 
       TP1_FRAC:
-        description: "comma list (e.g. 0.50,0.70)"
+        description: "TP1_FRAC (e.g. 0.50,0.70)"
         required: true
         default: "0.50"
 
       BADEXIT_MAXES:
-        description: "comma list (e.g. 1.00,0.50,0.30)"
+        description: "BADEXIT_MAXES (e.g. 1.00,0.50,0.30)"
         required: true
         default: "1.00"
 
@@ -66,7 +66,7 @@ on:
         default: "1.0"
 
       GATE_MODES:
-        description: "comma list (e.g. tail_utility,tail_only)"
+        description: "GATE_MODES (e.g. tail_utility,tail_only)"
         required: true
         default: "tail_utility"
 
