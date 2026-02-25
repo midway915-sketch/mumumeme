@@ -98,7 +98,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Sometimes artifacts come down nested (e.g., data/raw/data/raw/*)
           if [ -d data/raw/data/raw ]; then
             echo "[FIX] flatten nested raw-data: data/raw/data/raw -> data/raw"
             rsync -a data/raw/data/raw/ data/raw/
@@ -249,11 +248,23 @@ jobs:
           name: raw-data
           path: data/raw
 
-      - name: Download features-base artifact
+      # ★ 핵심 수정: features-base를 항상 별도 폴더로 받고, rsync로 루트에 펼침
+      - name: Download features-base artifact (into _artifacts)
         uses: actions/download-artifact@v4
         with:
           name: features-base
-          path: .
+          path: _artifacts/features-base
+
+      - name: Expand features-base into workspace (rsync)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[DEBUG] _artifacts/features-base top:"
+          ls -la _artifacts/features-base | sed -n '1,200p' || true
+          echo "[DEBUG] find inside features-base:"
+          find _artifacts/features-base -maxdepth 4 -type f | sed -n '1,200p' || true
+
+          rsync -a _artifacts/features-base/ ./
 
       - name: Normalize downloaded artifacts (flatten if nested)
         shell: bash
@@ -267,7 +278,7 @@ jobs:
             rm -rf data/raw/data
           fi
 
-          # features-base flatten (rare, but handle common nested patterns)
+          # features/meta flatten (defensive)
           if [ -d data/features/data/features ]; then
             echo "[FIX] flatten nested features: data/features/data/features -> data/features"
             rsync -a data/features/data/features/ data/features/
@@ -279,8 +290,6 @@ jobs:
             rm -rf data/meta/data
           fi
 
-          echo "[DEBUG] tree (top):"
-          ls -la . | sed -n '1,200p' || true
           echo "[DEBUG] data/:"
           ls -la data | sed -n '1,200p' || true
           echo "[DEBUG] data/raw/:"
@@ -324,7 +333,6 @@ jobs:
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
           PY
           fi
-          ls -la data | sed -n '1,200p'
           test -f data/universe.csv
 
       - name: Verify inputs (with debug)
@@ -337,15 +345,16 @@ jobs:
           echo "  - data/features/features_model.(parquet|csv)"
           echo "  - data/universe.csv"
           echo ""
-          echo "[DEBUG] quick find (prices/features/universe):"
-          find data -maxdepth 5 -type f \( -name "prices.parquet" -o -name "prices.csv" -o -name "features_model.parquet" -o -name "features_model.csv" -o -name "universe.csv" \) | sed -n '1,200p' || true
+          echo "[DEBUG] quick find (prices/features/universe) under data/:"
+          find data -maxdepth 6 -type f \( -name "prices.parquet" -o -name "prices.csv" -o -name "features_model.parquet" -o -name "features_model.csv" -o -name "universe.csv" \) | sed -n '1,200p' || true
+
           echo ""
-          echo "[DEBUG] ls data/raw:"
-          ls -la data/raw | sed -n '1,200p' || true
-          echo "[DEBUG] ls data/features:"
+          echo "[DEBUG] global find (features_model*) anywhere:"
+          find . -maxdepth 8 -type f \( -name "features_model.parquet" -o -name "features_model.csv" \) | sed -n '1,200p' || true
+
+          echo ""
+          echo "[DEBUG] ls data/features (if exists):"
           ls -la data/features | sed -n '1,200p' || true
-          echo "[DEBUG] ls data/:"
-          ls -la data | sed -n '1,200p' || true
 
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
           test -f data/features/features_model.parquet -o -f data/features/features_model.csv
@@ -620,11 +629,17 @@ jobs:
           name: raw-data
           path: data/raw
 
-      - name: Download features-base artifact
+      - name: Download features-base artifact (into _artifacts)
         uses: actions/download-artifact@v4
         with:
           name: features-base
-          path: .
+          path: _artifacts/features-base
+
+      - name: Expand features-base into workspace (rsync)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rsync -a _artifacts/features-base/ ./
 
       - name: Normalize downloaded artifacts (flatten if nested)
         shell: bash
@@ -647,13 +662,6 @@ jobs:
             rsync -a data/meta/data/meta/ data/meta/
             rm -rf data/meta/data
           fi
-
-          echo "[DEBUG] data/raw:"
-          ls -la data/raw | sed -n '1,200p' || true
-          echo "[DEBUG] data/features:"
-          ls -la data/features | sed -n '1,200p' || true
-          echo "[DEBUG] data/:"
-          ls -la data | sed -n '1,200p' || true
 
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
@@ -729,11 +737,6 @@ jobs:
             mkdir -p "$out"
             rsync -a "${d}/" "${out}/"
           done
-
-          echo "[INFO] models dirs:"
-          find data/models -maxdepth 2 -type d | sed -n '1,200p' || true
-          echo "[INFO] wf1 dirs:"
-          find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p' || true
 
       - name: Sequential BadExit(expanding past-only) + WF#2
         env:
@@ -830,22 +833,15 @@ jobs:
             WF1_DIR="data/signals/walkforward/${WF_PERIOD}"
             WF2_DIR="data/signals/walkforward2/${WF_PERIOD}"
 
-            echo ""
-            echo "===================="
-            echo "[WF2] ${WF_PERIOD} (#${idx}/${total})"
-            echo "===================="
-
             test -d "${MODEL_DIR}"
             test -d "${WF1_DIR}"
 
             pool_files="$(find "${POOL}" -type f -name 'sim_engine_trades_*' | wc -l | tr -d ' ')"
-            echo "[BADEXIT-EXP] pool files=${pool_files}"
 
             BADEXIT_AVAILABLE="false"
             if [ "${pool_files}" != "0" ]; then
               BADEXIT_AVAILABLE="true"
               EX_TAG="$(ex_tag)"
-              echo "[BADEXIT-EXP] EX_TAG=${EX_TAG}"
 
               python scripts/build_badexit_labels.py \
                 --profit-target "${PROFIT_TARGET}" \
@@ -857,7 +853,6 @@ jobs:
 
               badlbl="$(pick_one "data/labels/labels_badexit_${EX_TAG}.parquet data/labels/labels_badexit_${EX_TAG}.csv data/labels/labels_badexit_*.parquet data/labels/labels_badexit_*.csv")"
               test -n "${badlbl}"
-              echo "[BADEXIT] labels=${badlbl}"
 
               LABEL_COL="$(BADLBL="${badlbl}" python - <<'PY'
           import os
@@ -890,8 +885,6 @@ jobs:
               test -f "app/badexit_scaler_${TAG}.pkl"
               cp -v "app/badexit_model_${TAG}.pkl" "${MODEL_DIR}/badexit_model.pkl"
               cp -v "app/badexit_scaler_${TAG}.pkl" "${MODEL_DIR}/badexit_scaler.pkl"
-            else
-              echo "[BADEXIT-EXP] pool empty -> skip training"
             fi
 
             export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
@@ -901,7 +894,6 @@ jobs:
             export MODEL_DIR
 
             if [ "${BADEXIT_AVAILABLE}" != "true" ]; then
-              echo "[RUN2] no badexit -> copy wf1 -> wf2"
               mkdir -p "${WF2_DIR}"
               rsync -a "${WF1_DIR}/" "${WF2_DIR}/" || true
             else
@@ -924,8 +916,6 @@ jobs:
                 n=$((n+1))
               fi
             done
-            echo "[POOL] added ${n} files. pool now=$(find "${POOL}" -type f -name 'sim_engine_trades_*' | wc -l | tr -d ' ')"
-
           done < /tmp/periods.tsv
 
       - name: Upload artifact (walkforward2 all)
