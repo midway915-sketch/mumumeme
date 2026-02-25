@@ -253,9 +253,6 @@ jobs:
           set -euo pipefail
           mkdir -p data/features data/meta data
 
-          # artifact structure may be either:
-          #  A) _artifacts/features-base/features/*, meta/*, universe.csv
-          #  B) _artifacts/features-base/data/features/*, data/meta/*, data/universe.csv
           if [ -d _artifacts/features-base/features ]; then
             rsync -a "_artifacts/features-base/features/" "data/features/"
           elif [ -d _artifacts/features-base/data/features ]; then
@@ -656,7 +653,6 @@ jobs:
           test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
 
-      # merge-multiple 금지 (폴더 구조 보존)
       - name: Download models_* artifacts (keep per-artifact dirs)
         uses: actions/download-artifact@v4
         with:
@@ -764,31 +760,6 @@ jobs:
           PY
           }
 
-          # (5) parquet 통일: pool에는 parquet만 남긴다
-          ensure_parquet () {
-            local in_path="$1"
-            if [[ "$in_path" == *.parquet ]]; then
-              echo "$in_path"
-              return 0
-            fi
-            if [[ "$in_path" == *.csv ]]; then
-              local out_path="${in_path%.csv}.parquet"
-              python - <<'PY'
-          import os
-          import pandas as pd
-          inp=os.environ["INP"]
-          out=os.environ["OUT"]
-          df=pd.read_csv(inp)
-          df.to_parquet(out, index=False)
-          print(out)
-          PY INP="$in_path" OUT="$out_path" >/tmp/_pq_path.txt
-              cat /tmp/_pq_path.txt
-              return 0
-            fi
-            echo "$in_path"
-          }
-
-          # state files
           POOL="data/badexit_pool"
           STATE="data/badexit_state"
           PROC_LIST="${STATE}/processed_trades.txt"
@@ -797,13 +768,33 @@ jobs:
 
           touch "${PROC_LIST}"
 
-          # master labels (per ex_tag)
           EX_TAG="$(ex_tag)"
           MASTER_LABEL="data/labels/labels_badexit_master_${EX_TAG}.parquet"
           DELTA_DIR="${STATE}/delta_trades"
           mkdir -p "${DELTA_DIR}"
 
-          # build/append delta labels into master (1)
+          normalize_pool_to_parquet () {
+            shopt -s nullglob
+            for f in "${POOL}"/sim_engine_trades_*.csv; do
+              out="${f%.csv}.parquet"
+              INP="$f" OUT="$out" python - <<'PY'
+          import os
+          import pandas as pd
+          inp=os.environ["INP"]
+          out=os.environ["OUT"]
+          df=pd.read_csv(inp)
+          df.to_parquet(out, index=False)
+          PY
+              rm -f "$f"
+            done
+          }
+
+          compute_delta_list () {
+            find "${POOL}" -maxdepth 1 -type f -name "sim_engine_trades_*.parquet" -printf "%f\n" | sort > "${STATE}/pool_list_now.txt"
+            comm -23 "${STATE}/pool_list_now.txt" <(sort -u "${PROC_LIST}") > "${STATE}/delta_list.txt" || true
+            wc -l < "${STATE}/delta_list.txt" | tr -d ' '
+          }
+
           build_badexit_labels_delta () {
             local n_delta="$1"
             if [ "${n_delta}" = "0" ]; then
@@ -814,13 +805,11 @@ jobs:
             rm -rf "${DELTA_DIR}"
             mkdir -p "${DELTA_DIR}"
 
-            # copy delta trades into DELTA_DIR (parquet only)
             while IFS= read -r rel; do
               [ -z "$rel" ] && continue
               cp -v "${POOL}/${rel}" "${DELTA_DIR}/${rel}" >/dev/null
             done < "${STATE}/delta_list.txt"
 
-            # run label builder only on delta
             python scripts/build_badexit_labels.py \
               --profit-target "${PROFIT_TARGET}" \
               --max-days "${MAX_DAYS}" \
@@ -828,61 +817,54 @@ jobs:
               --max-extend-days "${MAX_EXTEND_DAYS}" \
               --signals-dir "${DELTA_DIR}"
 
-            # pick output label file
             badlbl="$(ls -1 data/labels/labels_badexit_${EX_TAG}.parquet 2>/dev/null | head -n 1 || true)"
             if [ -z "${badlbl}" ]; then
-              # 혹시 csv로만 나오면 parquet로 변환
               badcsv="$(ls -1 data/labels/labels_badexit_${EX_TAG}.csv 2>/dev/null | head -n 1 || true)"
               if [ -n "${badcsv}" ]; then
                 python - <<'PY'
-          import pandas as pd
-          df=pd.read_csv("data/labels/labels_badexit_${EX_TAG}.csv")
-          df.to_parquet("data/labels/labels_badexit_${EX_TAG}.parquet", index=False)
-          PY
+            import pandas as pd
+            df=pd.read_csv("data/labels/labels_badexit_${EX_TAG}.csv")
+            df.to_parquet("data/labels/labels_badexit_${EX_TAG}.parquet", index=False)
+            PY
                 badlbl="data/labels/labels_badexit_${EX_TAG}.parquet"
               fi
             fi
             test -f "${badlbl}"
 
-            # append delta -> master (parquet)
-            python - <<'PY'
+            DELTA_LBL="${badlbl}" MASTER_LBL="${MASTER_LABEL}" python - <<'PY'
           import os
           import pandas as pd
           from pathlib import Path
-
+          
           delta_path = Path(os.environ["DELTA_LBL"])
           master_path = Path(os.environ["MASTER_LBL"])
-
+          
           d = pd.read_parquet(delta_path)
-
+          
           if master_path.exists():
               m = pd.read_parquet(master_path)
               out = pd.concat([m, d], ignore_index=True)
           else:
               out = d
-
-          # best-effort dedupe
+          
           cols = list(out.columns)
           subset = None
           if "Date" in cols and "Ticker" in cols:
               subset = ["Date", "Ticker"] + [c for c in cols if c.startswith("y_") or "badexit" in c.lower()]
               subset = [c for c in subset if c in cols]
           out = out.drop_duplicates(subset=subset) if subset else out.drop_duplicates()
-
+          
           master_path.parent.mkdir(parents=True, exist_ok=True)
           out.to_parquet(master_path, index=False)
           print("[BADEXIT] master rows=", len(out))
-          PY DELTA_LBL="${badlbl}" MASTER_LBL="${MASTER_LABEL}"
+          PY
 
             sha256sum "${MASTER_LABEL}" | awk '{print $1}' > "${LAST_LABEL_SHA}"
-            echo "[BADEXIT] master updated sha=$(cat ${LAST_LABEL_SHA})"
 
-            # mark processed delta files
             cat "${STATE}/delta_list.txt" >> "${PROC_LIST}"
             sort -u "${PROC_LIST}" -o "${PROC_LIST}"
           }
 
-          # train badexit only if master changed (2)
           maybe_train_badexit () {
             if [ ! -f "${MASTER_LABEL}" ]; then
               echo "[BADEXIT] master label missing -> train skip"
@@ -895,7 +877,6 @@ jobs:
               return 0
             fi
 
-            # detect label column
             LABEL_COL="$(python - <<'PY'
           import pandas as pd
           df=pd.read_parquet("data/labels/labels_badexit_master_${EX_TAG}.parquet")
@@ -923,33 +904,7 @@ jobs:
             test -f app/badexit_scaler_latest.pkl
 
             echo "${cur_sha}" > "${LAST_TRAIN_SHA}"
-            echo "[BADEXIT] trained latest sha=$(cat ${LAST_TRAIN_SHA})"
             return 0
-          }
-
-          # pool delta detection helper
-          compute_delta_list () {
-            # list pool parquet files relative names
-            find "${POOL}" -maxdepth 1 -type f -name "sim_engine_trades_*.parquet" -printf "%f\n" | sort > "${STATE}/pool_list_now.txt"
-            # delta = now - processed
-            comm -23 "${STATE}/pool_list_now.txt" <(sort -u "${PROC_LIST}") > "${STATE}/delta_list.txt" || true
-            n_delta="$(wc -l < "${STATE}/delta_list.txt" | tr -d ' ')"
-            echo "${n_delta}"
-          }
-
-          # make pool consistent: if any csv exists in pool, convert and delete csv
-          normalize_pool_to_parquet () {
-            shopt -s nullglob
-            for f in "${POOL}"/sim_engine_trades_*.csv; do
-              out="${f%.csv}.parquet"
-              python - <<'PY'
-          import pandas as pd, os
-          inp=os.environ["INP"]; out=os.environ["OUT"]
-          df=pd.read_csv(inp)
-          df.to_parquet(out, index=False)
-          PY INP="$f" OUT="$out"
-              rm -f "$f"
-            done
           }
 
           normalize_pool_to_parquet
@@ -965,28 +920,23 @@ jobs:
             WF2_DIR="data/signals/walkforward2/${WF_PERIOD}"
 
             echo "[WF2] ${WF_PERIOD} (#${idx}/${total})"
-
             test -d "${MODEL_DIR}"
             test -d "${WF1_DIR}"
 
-            # (1) delta 라벨만 append
             n_delta="$(compute_delta_list)"
             if [ "${n_delta}" != "0" ]; then
               echo "[BADEXIT] delta files=${n_delta} -> update master labels"
               build_badexit_labels_delta "${n_delta}"
             fi
 
-            # (2) labels unchanged면 학습 스킵
             BADEXIT_AVAILABLE="false"
             if [ -f "${MASTER_LABEL}" ]; then
               BADEXIT_AVAILABLE="true"
               maybe_train_badexit || true
-              # attach latest model to current period
               if [ -f app/badexit_model_latest.pkl ] && [ -f app/badexit_scaler_latest.pkl ]; then
                 cp -v app/badexit_model_latest.pkl "${MODEL_DIR}/badexit_model.pkl" >/dev/null
                 cp -v app/badexit_scaler_latest.pkl "${MODEL_DIR}/badexit_scaler.pkl" >/dev/null
               else
-                # master는 있는데 모델이 없으면 이번엔 wf1 복사로 처리
                 BADEXIT_AVAILABLE="false"
               fi
             fi
@@ -1007,7 +957,7 @@ jobs:
               ./scripts/run_walkforward_halfyear.sh
             fi
 
-            # (5) pool append: parquet만 추가 (csv면 parquet 변환 후 추가)
+            # pool append: parquet only
             EX_TAG="$(ex_tag)"
             shopt -s nullglob
             added=0
@@ -1021,16 +971,17 @@ jobs:
               fi
             done
 
-            # csv만 있는 경우 parquet로 변환해서 pool에 추가
             for f in "${WF1_DIR}"/sim_engine_trades_*.csv; do
               base="$(basename "$f")"
               tmp="${STATE}/_tmp_${WF_PERIOD}_${base%.csv}.parquet"
-              python - <<'PY'
-          import os, pandas as pd
-          inp=os.environ["INP"]; out=os.environ["OUT"]
+              INP="$f" OUT="$tmp" python - <<'PY'
+          import os
+          import pandas as pd
+          inp=os.environ["INP"]
+          out=os.environ["OUT"]
           df=pd.read_csv(inp)
           df.to_parquet(out, index=False)
-          PY INP="$f" OUT="$tmp"
+          PY
               out="${POOL}/sim_engine_trades_${EX_TAG}__${WF_PERIOD}__${base%.csv}.parquet"
               if [ ! -f "${out}" ]; then
                 mv -v "$tmp" "${out}" >/dev/null
@@ -1043,7 +994,6 @@ jobs:
             if [ "${added}" != "0" ]; then
               echo "[POOL] added=${added}"
             fi
-
           done < /tmp/periods.tsv
 
       - name: Upload artifact (walkforward2 all)
