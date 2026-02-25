@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # scripts/aggregate_gate_grid.py
 from __future__ import annotations
 
@@ -45,8 +46,20 @@ def _curve_path(signals_dir: Path, tag: str, suffix: str) -> Path:
     return signals_dir / f"sim_engine_curve_{tag}_gate_{suffix}.parquet"
 
 
-def _trades_path(signals_dir: Path, tag: str, suffix: str) -> Path:
-    return signals_dir / f"sim_engine_trades_{tag}_gate_{suffix}.parquet"
+def _trades_path_any(signals_dir: Path, tag: str, suffix: str) -> Path | None:
+    p_parq = signals_dir / f"sim_engine_trades_{tag}_gate_{suffix}.parquet"
+    if p_parq.exists():
+        return p_parq
+    p_csv = signals_dir / f"sim_engine_trades_{tag}_gate_{suffix}.csv"
+    if p_csv.exists():
+        return p_csv
+    return None
+
+
+def _read_trades_any(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
 
 
 def _safe_to_dt(x) -> pd.Series:
@@ -125,7 +138,6 @@ def _parse_cap_from_suffix(suffix: str) -> tuple[str, str]:
     return (m.group(1), m.group(2))
 
 
-# ✅ NEW: yearly returns (warmup 이후 구간 기준)
 def _calc_yearly_returns(cur2: pd.DataFrame) -> dict:
     """
     cur2: cleaned curve filtered to Date >= warmup_end (must have Date, Equity)
@@ -144,12 +156,11 @@ def _calc_yearly_returns(cur2: pd.DataFrame) -> dict:
     if c.empty:
         return {}
 
-    # 연도별 마지막 equity
     c["Year"] = c["Date"].dt.year.astype(int)
     year_end = c.groupby("Year", as_index=False).tail(1).sort_values("Year").reset_index(drop=True)
 
     out: dict[str, float] = {}
-    base = float(c["Equity"].iloc[0])  # 첫 해 기준: warmup 이후 첫 관측 equity
+    base = float(c["Equity"].iloc[0])
     if not np.isfinite(base) or base <= 0:
         return {}
 
@@ -162,9 +173,72 @@ def _calc_yearly_returns(cur2: pd.DataFrame) -> dict:
             prev = eq_end
         else:
             out[f"YearReturn_{y}"] = float("nan")
-            # prev는 유지
 
     return out
+
+
+def _is_badexit_reason(reason: str) -> int:
+    """
+    build_badexit_labels.py 기준과 동일:
+      - REVAL_FAIL*  -> BadExit
+      - GRACE_END_EXIT* -> BadExit
+    """
+    r = str(reason or "").strip().upper()
+    if r.startswith("REVAL_FAIL"):
+        return 1
+    if r.startswith("GRACE_END_EXIT"):
+        return 1
+    return 0
+
+
+def _badexit_stats(trades: pd.DataFrame) -> dict:
+    """
+    trades에서 BadExit 분포 + Reason 상위 카운트 뽑기
+    (필터는 걸지 않고 분포만 산출)
+    """
+    if trades is None or trades.empty or "Reason" not in trades.columns:
+        return {
+            "TradesRows": 0,
+            "BadExitCount": np.nan,
+            "BadExitRate": np.nan,
+            "ReasonTop1": "",
+            "ReasonTop1Count": np.nan,
+            "ReasonTop2": "",
+            "ReasonTop2Count": np.nan,
+            "ReasonTop3": "",
+            "ReasonTop3Count": np.nan,
+        }
+
+    r = trades["Reason"].astype(str)
+    bad = r.apply(_is_badexit_reason).astype(int)
+
+    vc = r.value_counts(dropna=False)
+    top = vc.head(3)
+
+    def _top(i: int) -> tuple[str, float]:
+        if len(top) > i:
+            return (str(top.index[i]), float(top.iloc[i]))
+        return ("", float("nan"))
+
+    t1, c1 = _top(0)
+    t2, c2 = _top(1)
+    t3, c3 = _top(2)
+
+    n = int(len(trades))
+    bc = int(bad.sum())
+    br = float(bc / n) if n > 0 else float("nan")
+
+    return {
+        "TradesRows": n,
+        "BadExitCount": bc,
+        "BadExitRate": br,
+        "ReasonTop1": t1,
+        "ReasonTop1Count": c1,
+        "ReasonTop2": t2,
+        "ReasonTop2Count": c2,
+        "ReasonTop3": t3,
+        "ReasonTop3Count": c3,
+    }
 
 
 def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) -> dict:
@@ -174,23 +248,36 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
     out = {}
 
     cpath = _curve_path(signals_dir, tag, suffix)
-    tpath = _trades_path(signals_dir, tag, suffix)
+    tpath = _trades_path_any(signals_dir, tag, suffix)
 
-    if (not cpath.exists()) or (not tpath.exists()):
+    if (not cpath.exists()) or (tpath is None):
         out.update({
             "WarmupEndDate": "",
             "BacktestDaysAfterWarmup": np.nan,
             "ActiveDaysAfterWarmup": np.nan,
             "IdleDaysAfterWarmup": np.nan,
             "IdlePctAfterWarmup": np.nan,
+            "SeedMultiple_AfterWarmup": np.nan,
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessSeedMultiple_AfterWarmup": np.nan,
             "ExcessCAGR_AfterWarmup": np.nan,
+
+            # BadExit dist
+            "TradesRows": np.nan,
+            "BadExitCount": np.nan,
+            "BadExitRate": np.nan,
+            "ReasonTop1": "",
+            "ReasonTop1Count": np.nan,
+            "ReasonTop2": "",
+            "ReasonTop2Count": np.nan,
+            "ReasonTop3": "",
+            "ReasonTop3Count": np.nan,
         })
         return out
 
-    trades = pd.read_parquet(tpath)
+    trades = _read_trades_any(tpath)
     if trades.empty or "EntryDate" not in trades.columns:
         out.update({
             "WarmupEndDate": "",
@@ -198,10 +285,13 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
             "ActiveDaysAfterWarmup": np.nan,
             "IdleDaysAfterWarmup": np.nan,
             "IdlePctAfterWarmup": np.nan,
+            "SeedMultiple_AfterWarmup": np.nan,
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessSeedMultiple_AfterWarmup": np.nan,
             "ExcessCAGR_AfterWarmup": np.nan,
+            **_badexit_stats(trades),
         })
         return out
 
@@ -213,10 +303,13 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
             "ActiveDaysAfterWarmup": np.nan,
             "IdleDaysAfterWarmup": np.nan,
             "IdlePctAfterWarmup": np.nan,
+            "SeedMultiple_AfterWarmup": np.nan,
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessSeedMultiple_AfterWarmup": np.nan,
             "ExcessCAGR_AfterWarmup": np.nan,
+            **_badexit_stats(trades),
         })
         return out
 
@@ -231,10 +324,13 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
             "ActiveDaysAfterWarmup": np.nan,
             "IdleDaysAfterWarmup": np.nan,
             "IdlePctAfterWarmup": np.nan,
+            "SeedMultiple_AfterWarmup": np.nan,
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessSeedMultiple_AfterWarmup": np.nan,
             "ExcessCAGR_AfterWarmup": np.nan,
+            **_badexit_stats(trades),
         })
         return out
 
@@ -246,10 +342,13 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
             "ActiveDaysAfterWarmup": np.nan,
             "IdleDaysAfterWarmup": np.nan,
             "IdlePctAfterWarmup": np.nan,
+            "SeedMultiple_AfterWarmup": np.nan,
             "CAGR_AfterWarmup": np.nan,
             "QQQ_SeedMultiple_SamePeriod": np.nan,
             "QQQ_CAGR_SamePeriod": np.nan,
+            "ExcessSeedMultiple_AfterWarmup": np.nan,
             "ExcessCAGR_AfterWarmup": np.nan,
+            **_badexit_stats(trades),
         })
         return out
 
@@ -260,6 +359,7 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
     start_eq = float(cur2["Equity"].iloc[0])
     end_eq = float(cur2["Equity"].iloc[-1])
 
+    seed_mult = (end_eq / start_eq) if np.isfinite(start_eq) and start_eq > 0 and np.isfinite(end_eq) and end_eq > 0 else float("nan")
     cagr = _calc_cagr(start_eq, end_eq, days)
 
     total_days = int(cur2["Date"].nunique())
@@ -268,6 +368,7 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
     idle_pct = float(idle_days / total_days) if total_days > 0 else float("nan")
 
     qqq_mult, qqq_cagr, _ = _qqq_stats(prices, start_date, end_date)
+    excess_seed = seed_mult - qqq_mult if np.isfinite(seed_mult) and np.isfinite(qqq_mult) else float("nan")
     excess_cagr = cagr - qqq_cagr if np.isfinite(cagr) and np.isfinite(qqq_cagr) else float("nan")
 
     out.update({
@@ -276,15 +377,16 @@ def enrich_one_summary(row: pd.Series, signals_dir: Path, prices: pd.DataFrame) 
         "ActiveDaysAfterWarmup": active_days,
         "IdleDaysAfterWarmup": idle_days,
         "IdlePctAfterWarmup": idle_pct,
+        "SeedMultiple_AfterWarmup": seed_mult,
         "CAGR_AfterWarmup": cagr,
         "QQQ_SeedMultiple_SamePeriod": qqq_mult,
         "QQQ_CAGR_SamePeriod": qqq_cagr,
+        "ExcessSeedMultiple_AfterWarmup": excess_seed,
         "ExcessCAGR_AfterWarmup": excess_cagr,
+        **_badexit_stats(trades),
     })
 
-    # ✅ NEW: YearReturn_YYYY columns
     out.update(_calc_yearly_returns(cur2))
-
     return out
 
 
@@ -294,7 +396,6 @@ def main() -> None:
     ap.add_argument("--out-aggregate", default="data/signals/gate_grid_aggregate.csv", type=str)
     ap.add_argument("--out-top", default="data/signals/gate_grid_top_by_recent10y.csv", type=str)
 
-    # ✅ NEW: base config별 best cap 1개만 모은 파일
     ap.add_argument("--out-top-bestcap", default="data/signals/gate_grid_top_by_recent10y_bestcap.csv", type=str)
 
     ap.add_argument("--pattern", default="gate_summary_*.csv", type=str)
@@ -328,7 +429,6 @@ def main() -> None:
         if "GateSuffix" not in row.index:
             row["GateSuffix"] = _find_suffix_from_summary_path(sp)
 
-        # ✅ parse cap from suffix
         base_suffix, cap_mode = _parse_cap_from_suffix(str(row["GateSuffix"]))
         row["BaseSuffix"] = base_suffix
         row["CapMode"] = cap_mode
@@ -341,21 +441,23 @@ def main() -> None:
 
     out = pd.DataFrame(rows)
 
-    # ---- robust numeric conversions for scoring columns
     num_cols = [
         "Recent10Y_SeedMultiple", "SeedMultiple",
         "MaxHoldingDaysObserved", "MaxExtendDaysObserved",
         "CycleCount", "SuccessRate",
         "MaxLeveragePct",
-        "CAGR_AfterWarmup", "QQQ_CAGR_SamePeriod", "ExcessCAGR_AfterWarmup",
-        "IdlePctAfterWarmup",
-        "QQQ_SeedMultiple_SamePeriod",
 
-        # summarize_sim_trades.py (existing)
+        "SeedMultiple_AfterWarmup",
+        "CAGR_AfterWarmup", "QQQ_CAGR_SamePeriod", "ExcessCAGR_AfterWarmup",
+        "QQQ_SeedMultiple_SamePeriod", "ExcessSeedMultiple_AfterWarmup",
+        "IdlePctAfterWarmup",
+
+        "TradesRows", "BadExitCount", "BadExitRate",
+        "ReasonTop1Count", "ReasonTop2Count", "ReasonTop3Count",
+
         "TrailEntryCountTotal", "TrailEntryCountPerCycleAvg", "MaxCyclePeakReturn",
         "MaxCycleReturn", "P95CycleReturn", "MedianCycleReturn", "MeanCycleReturn",
 
-        # ✅ summarize_sim_trades.py NEW (cap / tp1 / exits)
         "TP1HoldCapDays", "TotalHoldCapDays",
         "TP1CycleRate", "TP1CycleCount", "TP1FirstDay_Mean", "TP1FirstDay_Median",
         "Exit_TrailAll", "Exit_GraceEnd", "Exit_GraceRecovery", "Exit_RevalFail",
@@ -377,11 +479,13 @@ def main() -> None:
 
         lev = out["MaxLeveragePct"].fillna(0.0) if "MaxLeveragePct" in out.columns else 0.0
         idle = out["IdlePctAfterWarmup"].fillna(0.0) if "IdlePctAfterWarmup" in out.columns else 0.0
-
         trail = out["TrailEntryCountPerCycleAvg"].fillna(0.0) if "TrailEntryCountPerCycleAvg" in out.columns else 0.0
         peak = out["MaxCyclePeakReturn"].fillna(0.0) if "MaxCyclePeakReturn" in out.columns else 0.0
 
-        pen = (0.25 * lev) + (0.15 * idle) + (0.05 * trail) + (0.03 * np.maximum(0.0, peak - 0.50))
+        # BadExit 분포가 높으면 살짝 패널티(“필터는 안 거는데 참고 지표”)
+        badr = out["BadExitRate"].fillna(0.0) if "BadExitRate" in out.columns else 0.0
+
+        pen = (0.25 * lev) + (0.15 * idle) + (0.05 * trail) + (0.03 * np.maximum(0.0, peak - 0.50)) + (0.20 * badr)
         out["RiskAdjScore"] = sm / (1.0 + pen)
 
     # ---- sort aggregate
@@ -396,6 +500,8 @@ def main() -> None:
         sort_cols.append("CAGR_AfterWarmup")
     if "ExcessCAGR_AfterWarmup" in out.columns:
         sort_cols.append("ExcessCAGR_AfterWarmup")
+    if "ExcessSeedMultiple_AfterWarmup" in out.columns:
+        sort_cols.append("ExcessSeedMultiple_AfterWarmup")
 
     if sort_cols:
         out = out.sort_values(sort_cols, ascending=[False] * len(sort_cols))
@@ -414,7 +520,7 @@ def main() -> None:
     top.to_csv(top_path, index=False)
     print(f"[DONE] wrote top: {top_path} rows={len(top)}")
 
-    # ---- ✅ BaseSuffix별 “best cap 1개”만 뽑기
+    # ---- BaseSuffix별 “best cap 1개”
     bestcap = out.copy()
     if "Recent10Y_SeedMultiple" in bestcap.columns:
         bestcap = bestcap.sort_values(["BaseSuffix", "Recent10Y_SeedMultiple"], ascending=[True, False])
@@ -433,8 +539,11 @@ def main() -> None:
         print(f"TAG={best.get('TAG')} suffix={best.get('GateSuffix')} base={best.get('BaseSuffix')} cap={best.get('CapMode')}")
         print(f"RiskAdjScore={best.get('RiskAdjScore')}")
         print(f"SeedMultiple={best.get('SeedMultiple')}  Recent10Y={best.get('Recent10Y_SeedMultiple')}")
+        print(f"AfterWarmup SeedMultiple={best.get('SeedMultiple_AfterWarmup')}  ExcessSeed={best.get('ExcessSeedMultiple_AfterWarmup')}")
         print(f"CAGR_AfterWarmup={best.get('CAGR_AfterWarmup')}  QQQ_CAGR={best.get('QQQ_CAGR_SamePeriod')}  Excess={best.get('ExcessCAGR_AfterWarmup')}")
         print(f"IdlePctAfterWarmup={best.get('IdlePctAfterWarmup')}  MaxLevPct={best.get('MaxLeveragePct')}")
+        print(f"BadExitRate={best.get('BadExitRate')} (count={best.get('BadExitCount')}, tradesRows={best.get('TradesRows')})")
+        print(f"ReasonTop1={best.get('ReasonTop1')} ({best.get('ReasonTop1Count')})")
         print(f"TrailAvg={best.get('TrailEntryCountPerCycleAvg')}  PeakCycleRet={best.get('MaxCyclePeakReturn')}")
         print(
             f"MaxCycleReturn={best.get('MaxCycleReturn')}  "
