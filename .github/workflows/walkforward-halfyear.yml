@@ -21,13 +21,54 @@ on:
         required: true
         default: "0.10"
       MAX_DAYS:
-        description: "max holding days H (e.g. 40)"
+        description: "max holding days H"
         required: true
         default: "40"
       STOP_LEVEL:
-        description: "stop level (e.g. -0.10)"
+        description: "stop level"
         required: true
         default: "-0.10"
+
+      # ---- GRID PARAMS ----
+      P_TAIL_THRESHOLDS:
+        description: "comma list (e.g. 0.10,0.20,0.30)"
+        required: true
+        default: "0.10,0.20,0.30"
+
+      UTILITY_QUANTILES:
+        description: "comma list (e.g. 0.60,0.75,0.90)"
+        required: true
+        default: "0.60,0.75,0.90"
+
+      PS_MINS:
+        description: "comma list (e.g. 0.00,0.60,0.70)"
+        required: true
+        default: "0.00"
+
+      TRAIL_STOPS:
+        description: "comma list (e.g. 0.10,0.12)"
+        required: true
+        default: "0.10"
+
+      TP1_FRAC:
+        description: "comma list (e.g. 0.50,0.70)"
+        required: true
+        default: "0.50"
+
+      BADEXIT_MAXES:
+        description: "comma list (e.g. 1.00,0.50,0.30)"
+        required: true
+        default: "1.00"
+
+      LAMBDA_TAIL:
+        description: "tail lambda weight (e.g. 1.0)"
+        required: true
+        default: "1.0"
+
+      GATE_MODES:
+        description: "comma list (e.g. tail_utility,tail_only)"
+        required: true
+        default: "tail_utility"
 
 jobs:
   raw-data:
@@ -332,17 +373,21 @@ jobs:
           STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
           MAX_EXTEND_DAYS: "20"
 
-          P_TAIL_THRESHOLDS: "0.10,0.20,0.30"
-          UTILITY_QUANTILES: "0.60,0.75,0.90"
-          RANK_METRICS: "utility"
-          LAMBDA_TAIL: "1.0"
-          GATE_MODES: "tail_utility"
-          TRAIL_STOPS: "0.10"
-          TP1_FRAC: "0.50"
+          P_TAIL_THRESHOLDS: ${{ inputs.P_TAIL_THRESHOLDS }}
+          UTILITY_QUANTILES: ${{ inputs.UTILITY_QUANTILES }}
+          PS_MINS: ${{ inputs.PS_MINS }}
+          TRAIL_STOPS: ${{ inputs.TRAIL_STOPS }}
+          TP1_FRAC: ${{ inputs.TP1_FRAC }}
+          BADEXIT_MAXES: ${{ inputs.BADEXIT_MAXES }}
+
+          LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
+          GATE_MODES: ${{ inputs.GATE_MODES }}
+          
+          RANK_METRICS: "p_success"
+          
           ENABLE_TRAILING: "true"
           TOPK_CONFIGS: "1|1.0"
-          PS_MINS: "0.00"
-          BADEXIT_MAXES: "1.00"
+      
           MAX_LEVERAGE_PCT: "1.0"
 
           EXCLUDE_TICKERS: ""
@@ -700,17 +745,21 @@ jobs:
           STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
           MAX_EXTEND_DAYS: "20"
 
-          P_TAIL_THRESHOLDS: "0.10,0.20,0.30"
-          UTILITY_QUANTILES: "0.60,0.75,0.90"
-          RANK_METRICS: "utility"
-          LAMBDA_TAIL: "1.0"
-          GATE_MODES: "tail_utility"
-          TRAIL_STOPS: "0.10"
-          TP1_FRAC: "0.50"
+          P_TAIL_THRESHOLDS: ${{ inputs.P_TAIL_THRESHOLDS }}
+          UTILITY_QUANTILES: ${{ inputs.UTILITY_QUANTILES }}
+          PS_MINS: ${{ inputs.PS_MINS }}
+          TRAIL_STOPS: ${{ inputs.TRAIL_STOPS }}
+          TP1_FRAC: ${{ inputs.TP1_FRAC }}
+          BADEXIT_MAXES: ${{ inputs.BADEXIT_MAXES }}
+
+          LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
+          GATE_MODES: ${{ inputs.GATE_MODES }}
+          
+          RANK_METRICS: "p_success"
+          
           ENABLE_TRAILING: "true"
           TOPK_CONFIGS: "1|1.0"
-          PS_MINS: "0.00"
-          BADEXIT_MAXES: "1.00"
+      
           MAX_LEVERAGE_PCT: "1.0"
 
           EXCLUDE_TICKERS: ""
