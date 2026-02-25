@@ -94,18 +94,6 @@ jobs:
           name: raw-data
           path: data/raw
 
-      - name: Normalize downloaded raw-data artifact (flatten if nested)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -d data/raw/data/raw ]; then
-            echo "[FIX] flatten nested raw-data: data/raw/data/raw -> data/raw"
-            rsync -a data/raw/data/raw/ data/raw/
-            rm -rf data/raw/data
-          fi
-          echo "[DEBUG] data/raw:"
-          ls -la data/raw | sed -n '1,200p'
-
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
         run: |
@@ -116,26 +104,26 @@ jobs:
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-
+          
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-
+          
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-
+          
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-
+          
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
-
+          
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
@@ -176,22 +164,22 @@ jobs:
           python - <<'PY' > /tmp/matrix.json
           import json, re
           from datetime import date, timedelta
-
+          
           wf_start = "${{ inputs.wf_start }}".strip()
           wf_end   = "${{ inputs.wf_end }}".strip()
           train_years = int("${{ inputs.train_years }}")
-
+          
           m = re.fullmatch(r"(\d{4})H([12])", wf_start)
           n = re.fullmatch(r"(\d{4})H([12])", wf_end)
           if not m or not n:
               raise SystemExit("wf_start/wf_end must be like 2018H1")
-
+          
           sy, sh = int(m.group(1)), int(m.group(2))
           ey, eh = int(n.group(1)), int(n.group(2))
-
+          
           def half_start(y,h): return date(y,1,1) if h==1 else date(y,7,1)
           def half_end(y,h):   return date(y,6,30) if h==1 else date(y,12,31)
-
+          
           items=[]
           y,h=sy,sh
           while True:
@@ -215,7 +203,7 @@ jobs:
               if y==ey and h==eh: break
               if h==1: h=2
               else: y+=1; h=1
-
+          
           print(json.dumps({"include":items}, ensure_ascii=False))
           PY
 
@@ -248,66 +236,11 @@ jobs:
           name: raw-data
           path: data/raw
 
-      - name: Download features-base artifact (into _artifacts)
+      - name: Download features-base artifact
         uses: actions/download-artifact@v4
         with:
           name: features-base
-          path: _artifacts/features-base
-
-      - name: Expand features-base into workspace (rsync)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rsync -a _artifacts/features-base/ ./
-
-      - name: Normalize downloaded artifacts (flatten if nested)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # raw-data flatten
-          if [ -d data/raw/data/raw ]; then
-            echo "[FIX] flatten nested raw-data: data/raw/data/raw -> data/raw"
-            rsync -a data/raw/data/raw/ data/raw/
-            rm -rf data/raw/data
-          fi
-
-          # defensive flatten
-          if [ -d data/features/data/features ]; then
-            echo "[FIX] flatten nested features: data/features/data/features -> data/features"
-            rsync -a data/features/data/features/ data/features/
-            rm -rf data/features/data
-          fi
-          if [ -d data/meta/data/meta ]; then
-            echo "[FIX] flatten nested meta: data/meta/data/meta -> data/meta"
-            rsync -a data/meta/data/meta/ data/meta/
-            rm -rf data/meta/data
-          fi
-
-      # ★ 핵심 추가: features/ -> data/features, meta/ -> data/meta 매핑
-      - name: Map features/meta into data/* (handle artifact top-level folders)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -d data/features ] && [ -d features ]; then
-            echo "[MAP] features/ -> data/features/"
-            mkdir -p data/features
-            rsync -a features/ data/features/
-          fi
-
-          if [ ! -d data/meta ] && [ -d meta ]; then
-            echo "[MAP] meta/ -> data/meta/"
-            mkdir -p data/meta
-            rsync -a meta/ data/meta/
-          fi
-
-          echo "[DEBUG] data/:"
-          ls -la data | sed -n '1,200p' || true
-          echo "[DEBUG] data/features/:"
-          ls -la data/features | sed -n '1,200p' || true
-          echo "[DEBUG] data/meta/:"
-          ls -la data/meta | sed -n '1,200p' || true
+          path: .
 
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
@@ -319,52 +252,39 @@ jobs:
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-
+          
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-
+          
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-
+          
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-
+          
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
-
+          
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
           PY
           fi
+          ls -la data | sed -n '1,200p'
           test -f data/universe.csv
 
-      - name: Verify inputs (with debug)
+      - name: Verify inputs
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "[VERIFY] expecting:"
-          echo "  - data/raw/prices.(parquet|csv)"
-          echo "  - data/features/features_model.(parquet|csv)"
-          echo "  - data/universe.csv"
-          echo ""
-          echo "[DEBUG] quick find (prices/features/universe) under data/:"
-          find data -maxdepth 6 -type f \( -name "prices.parquet" -o -name "prices.csv" -o -name "features_model.parquet" -o -name "features_model.csv" -o -name "universe.csv" \) | sed -n '1,200p' || true
-          echo ""
-          echo "[DEBUG] global find (features_model*) anywhere:"
-          find . -maxdepth 8 -type f \( -name "features_model.parquet" -o -name "features_model.csv" \) | sed -n '1,200p' || true
-          echo ""
-          ls -la data/features | sed -n '1,200p' || true
-
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
           test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
@@ -425,29 +345,31 @@ jobs:
 
           pick_one () { ls -1 $1 2>/dev/null | head -n 1 || true; }
 
+          # Gate labels (rolling)
           python scripts/build_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --start-date "${TRAIN_START}"
 
-          python -c '
+          # Cut features_model + labels_model to CUT_DATE (no lookahead)
+          TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
           import os
           from pathlib import Path
           import pandas as pd
-
+          
           TAG=os.environ["TAG"]
           CUT=pd.to_datetime(os.environ["CUT_DATE"])
-
+          
           def read_any(parq, csv):
               if Path(parq).exists(): return pd.read_parquet(parq)
               if Path(csv).exists():  return pd.read_csv(csv)
               raise FileNotFoundError(f"missing {parq} or {csv}")
-
+          
           def write_parq(df, p):
               Path(p).parent.mkdir(parents=True, exist_ok=True)
               df.to_parquet(p, index=False)
-
+          
           f = read_any("data/features/features_model.parquet", "data/features/features_model.csv")
           f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.tz_localize(None)
           f = f.dropna(subset=["Date"])
@@ -455,7 +377,7 @@ jobs:
           write_parq(f_cut, "data/features/features_model.parquet")
           write_parq(f_cut, f"data/features/features_model_{TAG}.parquet")
           print("[CUT] features_model rows=", len(f_cut))
-
+          
           lm = read_any("data/labels/labels_model.parquet", "data/labels/labels_model.csv")
           lm["Date"] = pd.to_datetime(lm["Date"], errors="coerce").dt.tz_localize(None)
           lm = lm.dropna(subset=["Date"])
@@ -463,15 +385,16 @@ jobs:
           write_parq(lm_cut, "data/labels/labels_model.parquet")
           write_parq(lm_cut, f"data/labels/labels_model_{TAG}.parquet")
           print("[CUT] labels_model rows=", len(lm_cut))
-          ' TAG="${TAG}" CUT_DATE="${CUT_DATE}"
+          PY
 
+          # Tail labels (expanding build, then cut <= CUT_DATE)
           python scripts/build_tail_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          TL="$(python -c '
+          TL="$(python - <<'PY'
           import glob
           cand=[]
           cand += glob.glob("data/labels/labels_tail*.parquet")
@@ -480,41 +403,55 @@ jobs:
           cand += glob.glob("data/labels/*tail*labels*.csv")
           cand=sorted(set(cand))
           print(cand[0] if cand else "")
-          ')"
+          PY
+          )"
           echo "[TAIL] labels_path=${TL}"
 
           if [ -n "${TL}" ] && [ -f "${TL}" ]; then
             if [[ "${TL}" == *.parquet ]]; then ext=".parquet"; else ext=".csv"; fi
             OUT_COPY="data/labels/labels_tail_${TAG}${ext}"
-            python -c '
+            IN_PATH="${TL}" CUT_DATE="${CUT_DATE}" OUT_COPY="${OUT_COPY}" python - <<'PY'
           import os
           import pandas as pd
           from pathlib import Path
+          
           p = Path(os.environ["IN_PATH"])
           cut = pd.to_datetime(os.environ["CUT_DATE"])
           out_copy = os.environ.get("OUT_COPY","").strip()
+          
           df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
+          
           if "Date" not in df.columns:
               print(f"[CUT] no Date column -> skip: {p}")
               raise SystemExit(0)
+          
           dt = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
           df = df.loc[dt.notna()].copy()
           df["Date"] = dt.loc[dt.notna()].values
+          
           before=len(df)
           df = df[df["Date"] <= cut].copy()
           after=len(df)
-          if p.suffix==".parquet": df.to_parquet(p, index=False)
-          else: df.to_csv(p, index=False)
+          
+          if p.suffix==".parquet":
+              df.to_parquet(p, index=False)
+          else:
+              df.to_csv(p, index=False)
+          
           print(f"[CUT] {p}: {before} -> {after} (<= {cut.date()})")
+          
           if out_copy:
               cp = Path(out_copy)
               cp.parent.mkdir(parents=True, exist_ok=True)
-              if cp.suffix==".parquet": df.to_parquet(cp, index=False)
-              else: df.to_csv(cp, index=False)
+              if cp.suffix==".parquet":
+                  df.to_parquet(cp, index=False)
+              else:
+                  df.to_csv(cp, index=False)
               print(f"[CUT] wrote copy: {cp}")
-          ' IN_PATH="${TL}" CUT_DATE="${CUT_DATE}" OUT_COPY="${OUT_COPY}"
+          PY
           fi
 
+          # Tau labels (expanding build tagged, then cut <= CUT_DATE)
           python scripts/build_tau_labels.py \
             --tag "${TAG}" \
             --profit-target "${PROFIT_TARGET}" \
@@ -522,7 +459,7 @@ jobs:
             --stop-level "${STOP_LEVEL}" \
             --max-extend-days "${MAX_EXTEND_DAYS}"
 
-          TAUL="$(python -c '
+          TAUL="$(TAG="${TAG}" python - <<'PY'
           import os, glob
           tag=os.environ["TAG"]
           cand=[]
@@ -532,41 +469,55 @@ jobs:
           cand += glob.glob(f"data/labels/labels_tau_{tag}.csv")
           cand=sorted(set(cand))
           print(cand[0] if cand else "")
-          ' TAG="${TAG}")"
+          PY
+          )"
           echo "[TAU] labels_path=${TAUL}"
 
           if [ -n "${TAUL}" ] && [ -f "${TAUL}" ]; then
             if [[ "${TAUL}" == *.parquet ]]; then ext=".parquet"; else ext=".csv"; fi
             OUT_COPY="data/labels/labels_tau_${TAG}${ext}"
-            python -c '
+            IN_PATH="${TAUL}" CUT_DATE="${CUT_DATE}" OUT_COPY="${OUT_COPY}" python - <<'PY'
           import os
           import pandas as pd
           from pathlib import Path
+          
           p = Path(os.environ["IN_PATH"])
           cut = pd.to_datetime(os.environ["CUT_DATE"])
           out_copy = os.environ.get("OUT_COPY","").strip()
+          
           df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
+          
           if "Date" not in df.columns:
               print(f"[CUT] no Date column -> skip: {p}")
               raise SystemExit(0)
+          
           dt = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
           df = df.loc[dt.notna()].copy()
           df["Date"] = dt.loc[dt.notna()].values
+          
           before=len(df)
           df = df[df["Date"] <= cut].copy()
           after=len(df)
-          if p.suffix==".parquet": df.to_parquet(p, index=False)
-          else: df.to_csv(p, index=False)
+          
+          if p.suffix==".parquet":
+              df.to_parquet(p, index=False)
+          else:
+              df.to_csv(p, index=False)
+          
           print(f"[CUT] {p}: {before} -> {after} (<= {cut.date()})")
+          
           if out_copy:
               cp = Path(out_copy)
               cp.parent.mkdir(parents=True, exist_ok=True)
-              if cp.suffix==".parquet": df.to_parquet(cp, index=False)
-              else: df.to_csv(cp, index=False)
+              if cp.suffix==".parquet":
+                  df.to_parquet(cp, index=False)
+              else:
+                  df.to_csv(cp, index=False)
               print(f"[CUT] wrote copy: {cp}")
-          ' IN_PATH="${TAUL}" CUT_DATE="${CUT_DATE}" OUT_COPY="${OUT_COPY}"
+          PY
           fi
 
+          # Train models
           python scripts/train_model.py --tag "${TAG}"
 
           python scripts/train_tail_model.py \
@@ -577,20 +528,24 @@ jobs:
 
           python scripts/train_tau_model.py --tag "${TAG}"
 
-          mf="$(ls -1 app/model_*${TAG}*.pkl 2>/dev/null | head -n 1 || true)"
-          sf="$(ls -1 app/scaler_*${TAG}*.pkl 2>/dev/null | head -n 1 || true)"
+          # Stage models
+          mf="$(pick_one "app/model_*${TAG}*.pkl")"
+          sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
           test -n "${mf}" && test -n "${sf}"
           cp -v "${mf}" "${MODEL_DIR}/model.pkl"
           cp -v "${sf}" "${MODEL_DIR}/scaler.pkl"
+
           test -f app/tail_model.pkl && test -f app/tail_scaler.pkl
           cp -v app/tail_model.pkl "${MODEL_DIR}/tail_model.pkl"
           cp -v app/tail_scaler.pkl "${MODEL_DIR}/tail_scaler.pkl"
-          taum="$(ls -1 app/tau_model_*${TAG}*.pkl 2>/dev/null | head -n 1 || true)"
-          taus="$(ls -1 app/tau_scaler_*${TAG}*.pkl 2>/dev/null | head -n 1 || true)"
+
+          taum="$(pick_one "app/tau_model_*${TAG}*.pkl")"
+          taus="$(pick_one "app/tau_scaler_*${TAG}*.pkl")"
           test -n "${taum}" && test -n "${taus}"
           cp -v "${taum}" "${MODEL_DIR}/tau_model.pkl"
           cp -v "${taus}" "${MODEL_DIR}/tau_scaler.pkl"
 
+          # Walkforward #1
           export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
           export PROFIT_TARGET MAX_DAYS STOP_LEVEL
           export P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL GATE_MODES TRAIL_STOPS TP1_FRAC ENABLE_TRAILING TOPK_CONFIGS PS_MINS BADEXIT_MAXES MAX_LEVERAGE_PCT
@@ -638,46 +593,11 @@ jobs:
           name: raw-data
           path: data/raw
 
-      - name: Download features-base artifact (into _artifacts)
+      - name: Download features-base artifact
         uses: actions/download-artifact@v4
         with:
           name: features-base
-          path: _artifacts/features-base
-
-      - name: Expand features-base into workspace (rsync)
-        shell: bash
-        run: |
-          set -euo pipefail
-          rsync -a _artifacts/features-base/ ./
-
-      - name: Normalize & Map features/meta into data/*
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -d data/raw/data/raw ]; then
-            rsync -a data/raw/data/raw/ data/raw/
-            rm -rf data/raw/data
-          fi
-
-          if [ ! -d data/features ] && [ -d features ]; then
-            mkdir -p data/features
-            rsync -a features/ data/features/
-          fi
-
-          if [ ! -d data/meta ] && [ -d meta ]; then
-            mkdir -p data/meta
-            rsync -a meta/ data/meta/
-          fi
-
-          if [ ! -d data/features ] && [ -d data/features/data/features ]; then
-            rsync -a data/features/data/features/ data/features/
-            rm -rf data/features/data
-          fi
-          if [ ! -d data/meta ] && [ -d data/meta/data/meta ]; then
-            rsync -a data/meta/data/meta/ data/meta/
-            rm -rf data/meta/data
-          fi
+          path: .
 
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
@@ -685,30 +605,37 @@ jobs:
           set -euo pipefail
           mkdir -p data
           if [ ! -f data/universe.csv ]; then
+            echo "[INFO] data/universe.csv missing -> generating from raw prices"
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
+          
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
+          
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
+          
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
+          
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
+          
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
           print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
           PY
           fi
+          ls -la data | sed -n '1,200p'
           test -f data/universe.csv
 
       - name: Download models_* artifacts
@@ -747,6 +674,11 @@ jobs:
             mkdir -p "$out"
             rsync -a "${d}/" "${out}/"
           done
+
+          echo "[INFO] models dirs:"
+          find data/models -maxdepth 2 -type d | sed -n '1,200p' || true
+          echo "[INFO] wf1 dirs:"
+          find data/signals/walkforward -maxdepth 2 -type d | sed -n '1,200p' || true
 
       - name: Sequential BadExit(expanding past-only) + WF#2
         env:
@@ -803,7 +735,7 @@ jobs:
           PY
 
           ex_tag () {
-            python -c '
+            python - <<'PY'
           import os
           pt=float(os.environ["PROFIT_TARGET"])
           h=int(os.environ["MAX_DAYS"])
@@ -812,7 +744,7 @@ jobs:
           pt_i=int(round(pt*100))
           sl_i=int(round(abs(sl)*100))
           print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
-          '
+          PY
           }
 
           ensure_features_scored_csv () {
@@ -843,15 +775,22 @@ jobs:
             WF1_DIR="data/signals/walkforward/${WF_PERIOD}"
             WF2_DIR="data/signals/walkforward2/${WF_PERIOD}"
 
+            echo ""
+            echo "===================="
+            echo "[WF2] ${WF_PERIOD} (#${idx}/${total})"
+            echo "===================="
+
             test -d "${MODEL_DIR}"
             test -d "${WF1_DIR}"
 
             pool_files="$(find "${POOL}" -type f -name 'sim_engine_trades_*' | wc -l | tr -d ' ')"
+            echo "[BADEXIT-EXP] pool files=${pool_files}"
 
             BADEXIT_AVAILABLE="false"
             if [ "${pool_files}" != "0" ]; then
               BADEXIT_AVAILABLE="true"
               EX_TAG="$(ex_tag)"
+              echo "[BADEXIT-EXP] EX_TAG=${EX_TAG}"
 
               python scripts/build_badexit_labels.py \
                 --profit-target "${PROFIT_TARGET}" \
@@ -863,6 +802,7 @@ jobs:
 
               badlbl="$(pick_one "data/labels/labels_badexit_${EX_TAG}.parquet data/labels/labels_badexit_${EX_TAG}.csv data/labels/labels_badexit_*.parquet data/labels/labels_badexit_*.csv")"
               test -n "${badlbl}"
+              echo "[BADEXIT] labels=${badlbl}"
 
               LABEL_COL="$(BADLBL="${badlbl}" python - <<'PY'
           import os
@@ -895,6 +835,8 @@ jobs:
               test -f "app/badexit_scaler_${TAG}.pkl"
               cp -v "app/badexit_model_${TAG}.pkl" "${MODEL_DIR}/badexit_model.pkl"
               cp -v "app/badexit_scaler_${TAG}.pkl" "${MODEL_DIR}/badexit_scaler.pkl"
+            else
+              echo "[BADEXIT-EXP] pool empty -> skip training"
             fi
 
             export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
@@ -904,6 +846,7 @@ jobs:
             export MODEL_DIR
 
             if [ "${BADEXIT_AVAILABLE}" != "true" ]; then
+              echo "[RUN2] no badexit -> copy wf1 -> wf2"
               mkdir -p "${WF2_DIR}"
               rsync -a "${WF1_DIR}/" "${WF2_DIR}/" || true
             else
@@ -917,13 +860,17 @@ jobs:
 
             EX_TAG="$(ex_tag)"
             shopt -s nullglob
+            n=0
             for f in "${WF1_DIR}"/sim_engine_trades_*.csv "${WF1_DIR}"/sim_engine_trades_*.parquet; do
               base="$(basename "$f")"
               out="${POOL}/sim_engine_trades_${EX_TAG}__${WF_PERIOD}__${base}"
               if [ ! -f "${out}" ]; then
                 cp -v "$f" "${out}"
+                n=$((n+1))
               fi
             done
+            echo "[POOL] added ${n} files. pool now=$(find "${POOL}" -type f -name 'sim_engine_trades_*' | wc -l | tr -d ' ')"
+
           done < /tmp/periods.tsv
 
       - name: Upload artifact (walkforward2 all)
