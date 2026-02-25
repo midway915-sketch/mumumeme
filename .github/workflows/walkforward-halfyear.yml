@@ -92,7 +92,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: raw-data
-          path: data/raw
+          path: _artifacts/raw-data
+
+      - name: Unpack raw-data into repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/raw
+          rsync -a "_artifacts/raw-data/" "data/raw/"
+          echo "[DEBUG] raw-data tree:"
+          find data/raw -maxdepth 2 -type f | sed -n '1,200p'
+          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
@@ -234,13 +244,33 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: raw-data
-          path: data/raw
+          path: _artifacts/raw-data
+
+      - name: Unpack raw-data into repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/raw
+          rsync -a "_artifacts/raw-data/" "data/raw/"
+          echo "[DEBUG] raw-data tree:"
+          find data/raw -maxdepth 2 -type f | sed -n '1,200p'
+          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
       - name: Download features-base artifact
         uses: actions/download-artifact@v4
         with:
           name: features-base
-          path: .
+          path: _artifacts/features-base
+
+      - name: Unpack features-base into repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          rsync -a "_artifacts/features-base/" "./"
+          echo "[DEBUG] features-base tree:"
+          find data -maxdepth 3 -type f | sed -n '1,200p'
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
+          test -f data/universe.csv
 
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
@@ -285,6 +315,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "[DEBUG] verify listing:"
+          ls -la data | sed -n '1,200p'
+          ls -la data/features | sed -n '1,200p' || true
+          ls -la data/raw | sed -n '1,200p' || true
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
           test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
@@ -591,13 +625,33 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: raw-data
-          path: data/raw
+          path: _artifacts/raw-data
+
+      - name: Unpack raw-data into repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/raw
+          rsync -a "_artifacts/raw-data/" "data/raw/"
+          echo "[DEBUG] raw-data tree:"
+          find data/raw -maxdepth 2 -type f | sed -n '1,200p'
+          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
 
       - name: Download features-base artifact
         uses: actions/download-artifact@v4
         with:
           name: features-base
-          path: .
+          path: _artifacts/features-base
+
+      - name: Unpack features-base into repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          rsync -a "_artifacts/features-base/" "./"
+          echo "[DEBUG] features-base tree:"
+          find data -maxdepth 3 -type f | sed -n '1,200p'
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
+          test -f data/universe.csv
 
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
