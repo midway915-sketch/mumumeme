@@ -262,13 +262,43 @@ jobs:
           name: features-base
           path: _artifacts/features-base
 
-      - name: Unpack features-base into repo
+      - name: Unpack features-base into repo (robust)
         shell: bash
         run: |
           set -euo pipefail
-          rsync -a "_artifacts/features-base/" "./"
-          echo "[DEBUG] features-base tree:"
-          find data -maxdepth 3 -type f | sed -n '1,200p'
+
+          echo "[DEBUG] features-base artifact tree:"
+          find _artifacts/features-base -maxdepth 6 -type f | sed -n '1,200p' || true
+
+          # Find a parent dir that contains data/features or data/universe.csv, then rsync that parent into repo root.
+          base=""
+          hit="$(find _artifacts/features-base -maxdepth 6 -type d -path '*/data/features' | head -n 1 || true)"
+          if [ -n "${hit}" ]; then
+            base="${hit%/data/features}"
+          else
+            hit2="$(find _artifacts/features-base -maxdepth 6 -type f -path '*/data/universe.csv' | head -n 1 || true)"
+            if [ -n "${hit2}" ]; then
+              base="${hit2%/data/universe.csv}"
+            fi
+          fi
+
+          if [ -n "${base}" ]; then
+            echo "[INFO] unpack features-base from base=${base}"
+            rsync -a "${base}/" "./"
+          else
+            echo "[WARN] could not locate data/features in features-base artifact; will fallback to rebuild features."
+          fi
+
+          echo "[DEBUG] after unpack, repo data tree:"
+          find data -maxdepth 3 -type f | sed -n '1,200p' || true
+
+          # Fallback: if still missing, rebuild here (should be rare)
+          if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
+            echo "[FALLBACK] features_model missing -> rebuilding features locally"
+            mkdir -p data/features data/meta
+            python scripts/build_features.py
+          fi
+
           test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
 
@@ -379,14 +409,12 @@ jobs:
 
           pick_one () { ls -1 $1 2>/dev/null | head -n 1 || true; }
 
-          # Gate labels (rolling)
           python scripts/build_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
             --stop-level "${STOP_LEVEL}" \
             --start-date "${TRAIN_START}"
 
-          # Cut features_model + labels_model to CUT_DATE (no lookahead)
           TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
           import os
           from pathlib import Path
@@ -421,7 +449,6 @@ jobs:
           print("[CUT] labels_model rows=", len(lm_cut))
           PY
 
-          # Tail labels (expanding build, then cut <= CUT_DATE)
           python scripts/build_tail_labels.py \
             --profit-target "${PROFIT_TARGET}" \
             --max-days "${MAX_DAYS}" \
@@ -485,7 +512,6 @@ jobs:
           PY
           fi
 
-          # Tau labels (expanding build tagged, then cut <= CUT_DATE)
           python scripts/build_tau_labels.py \
             --tag "${TAG}" \
             --profit-target "${PROFIT_TARGET}" \
@@ -551,7 +577,6 @@ jobs:
           PY
           fi
 
-          # Train models
           python scripts/train_model.py --tag "${TAG}"
 
           python scripts/train_tail_model.py \
@@ -562,7 +587,6 @@ jobs:
 
           python scripts/train_tau_model.py --tag "${TAG}"
 
-          # Stage models
           mf="$(pick_one "app/model_*${TAG}*.pkl")"
           sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
           test -n "${mf}" && test -n "${sf}"
@@ -579,7 +603,6 @@ jobs:
           cp -v "${taum}" "${MODEL_DIR}/tau_model.pkl"
           cp -v "${taus}" "${MODEL_DIR}/tau_scaler.pkl"
 
-          # Walkforward #1
           export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
           export PROFIT_TARGET MAX_DAYS STOP_LEVEL
           export P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL GATE_MODES TRAIL_STOPS TP1_FRAC ENABLE_TRAILING TOPK_CONFIGS PS_MINS BADEXIT_MAXES MAX_LEVERAGE_PCT
@@ -643,13 +666,41 @@ jobs:
           name: features-base
           path: _artifacts/features-base
 
-      - name: Unpack features-base into repo
+      - name: Unpack features-base into repo (robust)
         shell: bash
         run: |
           set -euo pipefail
-          rsync -a "_artifacts/features-base/" "./"
-          echo "[DEBUG] features-base tree:"
-          find data -maxdepth 3 -type f | sed -n '1,200p'
+
+          echo "[DEBUG] features-base artifact tree:"
+          find _artifacts/features-base -maxdepth 6 -type f | sed -n '1,200p' || true
+
+          base=""
+          hit="$(find _artifacts/features-base -maxdepth 6 -type d -path '*/data/features' | head -n 1 || true)"
+          if [ -n "${hit}" ]; then
+            base="${hit%/data/features}"
+          else
+            hit2="$(find _artifacts/features-base -maxdepth 6 -type f -path '*/data/universe.csv' | head -n 1 || true)"
+            if [ -n "${hit2}" ]; then
+              base="${hit2%/data/universe.csv}"
+            fi
+          fi
+
+          if [ -n "${base}" ]; then
+            echo "[INFO] unpack features-base from base=${base}"
+            rsync -a "${base}/" "./"
+          else
+            echo "[WARN] could not locate data/features in features-base artifact; will fallback to rebuild features."
+          fi
+
+          echo "[DEBUG] after unpack, repo data tree:"
+          find data -maxdepth 3 -type f | sed -n '1,200p' || true
+
+          if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
+            echo "[FALLBACK] features_model missing -> rebuilding features locally"
+            mkdir -p data/features data/meta
+            python scripts/build_features.py
+          fi
+
           test -f data/features/features_model.parquet -o -f data/features/features_model.csv
           test -f data/universe.csv
 
