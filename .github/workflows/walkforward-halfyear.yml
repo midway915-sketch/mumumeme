@@ -248,7 +248,6 @@ jobs:
           name: raw-data
           path: data/raw
 
-      # ★ 핵심 수정: features-base를 항상 별도 폴더로 받고, rsync로 루트에 펼침
       - name: Download features-base artifact (into _artifacts)
         uses: actions/download-artifact@v4
         with:
@@ -259,11 +258,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "[DEBUG] _artifacts/features-base top:"
-          ls -la _artifacts/features-base | sed -n '1,200p' || true
-          echo "[DEBUG] find inside features-base:"
-          find _artifacts/features-base -maxdepth 4 -type f | sed -n '1,200p' || true
-
           rsync -a _artifacts/features-base/ ./
 
       - name: Normalize downloaded artifacts (flatten if nested)
@@ -278,7 +272,7 @@ jobs:
             rm -rf data/raw/data
           fi
 
-          # features/meta flatten (defensive)
+          # defensive flatten
           if [ -d data/features/data/features ]; then
             echo "[FIX] flatten nested features: data/features/data/features -> data/features"
             rsync -a data/features/data/features/ data/features/
@@ -290,12 +284,30 @@ jobs:
             rm -rf data/meta/data
           fi
 
+      # ★ 핵심 추가: features/ -> data/features, meta/ -> data/meta 매핑
+      - name: Map features/meta into data/* (handle artifact top-level folders)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -d data/features ] && [ -d features ]; then
+            echo "[MAP] features/ -> data/features/"
+            mkdir -p data/features
+            rsync -a features/ data/features/
+          fi
+
+          if [ ! -d data/meta ] && [ -d meta ]; then
+            echo "[MAP] meta/ -> data/meta/"
+            mkdir -p data/meta
+            rsync -a meta/ data/meta/
+          fi
+
           echo "[DEBUG] data/:"
           ls -la data | sed -n '1,200p' || true
-          echo "[DEBUG] data/raw/:"
-          ls -la data/raw | sed -n '1,200p' || true
           echo "[DEBUG] data/features/:"
           ls -la data/features | sed -n '1,200p' || true
+          echo "[DEBUG] data/meta/:"
+          ls -la data/meta | sed -n '1,200p' || true
 
       - name: Ensure universe.csv (from raw if missing)
         shell: bash
@@ -347,13 +359,10 @@ jobs:
           echo ""
           echo "[DEBUG] quick find (prices/features/universe) under data/:"
           find data -maxdepth 6 -type f \( -name "prices.parquet" -o -name "prices.csv" -o -name "features_model.parquet" -o -name "features_model.csv" -o -name "universe.csv" \) | sed -n '1,200p' || true
-
           echo ""
           echo "[DEBUG] global find (features_model*) anywhere:"
           find . -maxdepth 8 -type f \( -name "features_model.parquet" -o -name "features_model.csv" \) | sed -n '1,200p' || true
-
           echo ""
-          echo "[DEBUG] ls data/features (if exists):"
           ls -la data/features | sed -n '1,200p' || true
 
           test -f data/raw/prices.parquet -o -f data/raw/prices.csv
@@ -568,16 +577,16 @@ jobs:
 
           python scripts/train_tau_model.py --tag "${TAG}"
 
-          mf="$(pick_one "app/model_*${TAG}*.pkl")"
-          sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
+          mf="$(ls -1 app/model_*${TAG}*.pkl 2>/dev/null | head -n 1 || true)"
+          sf="$(ls -1 app/scaler_*${TAG}*.pkl 2>/dev/null | head -n 1 || true)"
           test -n "${mf}" && test -n "${sf}"
           cp -v "${mf}" "${MODEL_DIR}/model.pkl"
           cp -v "${sf}" "${MODEL_DIR}/scaler.pkl"
           test -f app/tail_model.pkl && test -f app/tail_scaler.pkl
           cp -v app/tail_model.pkl "${MODEL_DIR}/tail_model.pkl"
           cp -v app/tail_scaler.pkl "${MODEL_DIR}/tail_scaler.pkl"
-          taum="$(pick_one "app/tau_model_*${TAG}*.pkl")"
-          taus="$(pick_one "app/tau_scaler_*${TAG}*.pkl")"
+          taum="$(ls -1 app/tau_model_*${TAG}*.pkl 2>/dev/null | head -n 1 || true)"
+          taus="$(ls -1 app/tau_scaler_*${TAG}*.pkl 2>/dev/null | head -n 1 || true)"
           test -n "${taum}" && test -n "${taus}"
           cp -v "${taum}" "${MODEL_DIR}/tau_model.pkl"
           cp -v "${taus}" "${MODEL_DIR}/tau_scaler.pkl"
@@ -641,24 +650,31 @@ jobs:
           set -euo pipefail
           rsync -a _artifacts/features-base/ ./
 
-      - name: Normalize downloaded artifacts (flatten if nested)
+      - name: Normalize & Map features/meta into data/*
         shell: bash
         run: |
           set -euo pipefail
 
           if [ -d data/raw/data/raw ]; then
-            echo "[FIX] flatten nested raw-data: data/raw/data/raw -> data/raw"
             rsync -a data/raw/data/raw/ data/raw/
             rm -rf data/raw/data
           fi
 
-          if [ -d data/features/data/features ]; then
-            echo "[FIX] flatten nested features: data/features/data/features -> data/features"
+          if [ ! -d data/features ] && [ -d features ]; then
+            mkdir -p data/features
+            rsync -a features/ data/features/
+          fi
+
+          if [ ! -d data/meta ] && [ -d meta ]; then
+            mkdir -p data/meta
+            rsync -a meta/ data/meta/
+          fi
+
+          if [ ! -d data/features ] && [ -d data/features/data/features ]; then
             rsync -a data/features/data/features/ data/features/
             rm -rf data/features/data
           fi
-          if [ -d data/meta/data/meta ]; then
-            echo "[FIX] flatten nested meta: data/meta/data/meta -> data/meta"
+          if [ ! -d data/meta ] && [ -d data/meta/data/meta ]; then
             rsync -a data/meta/data/meta/ data/meta/
             rm -rf data/meta/data
           fi
@@ -669,30 +685,24 @@ jobs:
           set -euo pipefail
           mkdir -p data
           if [ ! -f data/universe.csv ]; then
-            echo "[INFO] data/universe.csv missing -> generating from raw prices"
             python - <<'PY'
           from pathlib import Path
           import pandas as pd
-
           raw_parq = Path("data/raw/prices.parquet")
           raw_csv  = Path("data/raw/prices.csv")
-
           if raw_parq.exists():
               df = pd.read_parquet(raw_parq)
           elif raw_csv.exists():
               df = pd.read_csv(raw_csv)
           else:
               raise SystemExit("[ERROR] raw prices missing")
-
           if "Ticker" not in df.columns:
               raise SystemExit("[ERROR] raw prices missing Ticker column")
-
           ticks = (
               df["Ticker"].astype(str).str.upper().str.strip()
                 .dropna().unique().tolist()
           )
           ticks = sorted(set([t for t in ticks if t]))
-
           out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
           Path("data").mkdir(parents=True, exist_ok=True)
           out.to_csv("data/universe.csv", index=False)
@@ -907,13 +917,11 @@ jobs:
 
             EX_TAG="$(ex_tag)"
             shopt -s nullglob
-            n=0
             for f in "${WF1_DIR}"/sim_engine_trades_*.csv "${WF1_DIR}"/sim_engine_trades_*.parquet; do
               base="$(basename "$f")"
               out="${POOL}/sim_engine_trades_${EX_TAG}__${WF_PERIOD}__${base}"
               if [ ! -f "${out}" ]; then
                 cp -v "$f" "${out}"
-                n=$((n+1))
               fi
             done
           done < /tmp/periods.tsv
