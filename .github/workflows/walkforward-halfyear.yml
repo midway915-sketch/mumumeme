@@ -769,6 +769,8 @@ jobs:
           touch "${PROC_LIST}"
 
           EX_TAG="$(ex_tag)"
+          export EX_TAG
+
           MASTER_LABEL="data/labels/labels_badexit_master_${EX_TAG}.parquet"
           DELTA_DIR="${STATE}/delta_trades"
           mkdir -p "${DELTA_DIR}"
@@ -817,16 +819,18 @@ jobs:
               --max-extend-days "${MAX_EXTEND_DAYS}" \
               --signals-dir "${DELTA_DIR}"
 
-            badlbl="$(ls -1 data/labels/labels_badexit_${EX_TAG}.parquet 2>/dev/null | head -n 1 || true)"
-            if [ -z "${badlbl}" ]; then
-              badcsv="$(ls -1 data/labels/labels_badexit_${EX_TAG}.csv 2>/dev/null | head -n 1 || true)"
-              if [ -n "${badcsv}" ]; then
-                python - <<'PY'
-            import pandas as pd
-            df=pd.read_csv("data/labels/labels_badexit_${EX_TAG}.csv")
-            df.to_parquet("data/labels/labels_badexit_${EX_TAG}.parquet", index=False)
-            PY
-                badlbl="data/labels/labels_badexit_${EX_TAG}.parquet"
+            badlbl="data/labels/labels_badexit_${EX_TAG}.parquet"
+            if [ ! -f "${badlbl}" ]; then
+              badcsv="data/labels/labels_badexit_${EX_TAG}.csv"
+              if [ -f "${badcsv}" ]; then
+                INP="${badcsv}" OUT="${badlbl}" python - <<'PY'
+          import os
+          import pandas as pd
+          inp=os.environ["INP"]
+          out=os.environ["OUT"]
+          df=pd.read_csv(inp)
+          df.to_parquet(out, index=False)
+          PY
               fi
             fi
             test -f "${badlbl}"
@@ -859,7 +863,7 @@ jobs:
           print("[BADEXIT] master rows=", len(out))
           PY
 
-            sha256sum "${MASTER_LABEL}" | awk '{print $1}' > "${LAST_LABEL_SHA}"
+            sha256sum "${MASTER_LABEL}" | cut -d ' ' -f1 > "${LAST_LABEL_SHA}"
 
             cat "${STATE}/delta_list.txt" >> "${PROC_LIST}"
             sort -u "${PROC_LIST}" -o "${PROC_LIST}"
@@ -870,16 +874,18 @@ jobs:
               echo "[BADEXIT] master label missing -> train skip"
               return 1
             fi
-            cur_sha="$(sha256sum "${MASTER_LABEL}" | awk '{print $1}')"
+            cur_sha="$(sha256sum "${MASTER_LABEL}" | cut -d ' ' -f1)"
             prev_sha="$(cat "${LAST_TRAIN_SHA}" 2>/dev/null || true)"
             if [ -n "${prev_sha}" ] && [ "${cur_sha}" = "${prev_sha}" ] && [ -f app/badexit_model_latest.pkl ] && [ -f app/badexit_scaler_latest.pkl ]; then
               echo "[BADEXIT] train skip (labels unchanged)"
               return 0
             fi
 
-            LABEL_COL="$(python - <<'PY'
+            LABEL_COL="$(MASTER="${MASTER_LABEL}" python - <<'PY'
+          import os
           import pandas as pd
-          df=pd.read_parquet("data/labels/labels_badexit_master_${EX_TAG}.parquet")
+          p=os.environ["MASTER"]
+          df=pd.read_parquet(p)
           cols=list(df.columns)
           for c in ["y_badexit","BadExit","badexit","is_badexit","label","target"]:
               if c in cols:
@@ -958,7 +964,6 @@ jobs:
             fi
 
             # pool append: parquet only
-            EX_TAG="$(ex_tag)"
             shopt -s nullglob
             added=0
 
