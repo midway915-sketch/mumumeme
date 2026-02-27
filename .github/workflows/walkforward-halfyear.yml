@@ -1130,6 +1130,32 @@ jobs:
             --out data/signals/walkforward2/_analysis_walkforward2.csv
           test -f data/signals/walkforward2/_analysis_walkforward2.csv
 
+      - name: Diagnose model power (walkforward2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          mkdir -p data/model_power
+
+          for f in $(find data/signals/walkforward2 -name "sim_engine_trades_*.parquet"); do
+            base=$(basename "$f" .parquet)
+            out="data/model_power/${base}_power.csv"
+
+            python scripts/diagnose_model_power.py \
+              --picks "$f" \
+              --score-col p_success \
+              --ret-col Return \
+              --label-col y_success \
+              --out "$out" || true
+          done
+
+      - name: Upload artifact (model_power)
+        uses: actions/upload-artifact@v4
+        with:
+          name: model_power
+          path: data/model_power
+          if-no-files-found: warn
+
       - name: Upload artifact (walkforward2 summary)
         uses: actions/upload-artifact@v4
         with:
