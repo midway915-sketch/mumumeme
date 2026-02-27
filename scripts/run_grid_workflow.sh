@@ -5,6 +5,7 @@ set -euo pipefail
 PRED="scripts/predict_gate.py"
 SIM="scripts/simulate_single_position_engine.py"
 SUM="scripts/summarize_sim_trades.py"
+DIAG="scripts/diagnose_distributions.py"
 
 # ✅ split별 signals 폴더로 분리 (예: data/signals/taucur, data/signals/tauq255025)
 TAU_SPLIT="${TAU_SPLIT:-}"
@@ -44,6 +45,7 @@ REQUIRE_FILES="${REQUIRE_FILES:-}"
 
 DATE_FROM="${WF_DATE_FROM:-}"
 DATE_TO="${WF_DATE_TO:-}"
+echo "[INFO] WF_DATE_FROM=${DATE_FROM:-<unset>} WF_DATE_TO=${DATE_TO:-<unset>}"
 
 # ✅ NEW: Regime filter env (optional; defaults are safe)
 REGIME_MODE="${REGIME_MODE:-off}"                   # off|basic|trend|dd|combo
@@ -314,6 +316,17 @@ PY
                   continue
                 fi
 
+                # ---- distribution diagnostics (picks vs universe)
+                # Helps catch degenerate filters / scoring issues.
+                if [ -f "$DIAG" ]; then
+                  python "$DIAG" \
+                    --picks-path "$picks_path" \
+                    --out-json "$OUT_DIR/diag_picks_${TAG}_gate_${base_suffix}.json" \
+                    --out-csv  "$OUT_DIR/diag_picks_${TAG}_gate_${base_suffix}.csv" \
+                    ${DATE_FROM:+--date-from "$DATE_FROM"} \
+                    ${DATE_TO:+--date-to "$DATE_TO"}
+                fi
+
                 if [ "$DEDUP_PICKS" = "true" ]; then
                   h="$(picks_hash "$picks_path")"
                   if is_hash_seen "$h"; then
@@ -367,6 +380,8 @@ PY
                     --tag "$TAG" \
                     --suffix "$cap_suffix" \
                     --out-dir "$OUT_DIR" \
+                    ${DATE_FROM:+--sim-start "$DATE_FROM"} \
+                    ${DATE_TO:+--sim-end "$DATE_TO"} \
                     "${SIM_EXTRA_ARGS[@]}"
 
                   trades_path="$OUT_DIR/sim_engine_trades_${TAG}_gate_${cap_suffix}.parquet"

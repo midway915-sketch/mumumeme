@@ -246,6 +246,13 @@ def main() -> None:
     ap.add_argument("--stop-level", required=True, type=float)  # kept for metadata compatibility
     ap.add_argument("--max-extend-days", required=True, type=int)
 
+    # ✅ NEW: explicit simulation window (optional)
+    # If not provided, the engine infers a compact window from picks:
+    #   start = min(picks.Date)
+    #   end   = max(picks.Date) + (max_days + max_extend_days + buffer)
+    ap.add_argument("--sim-start", default="", type=str, help="YYYY-MM-DD (optional)")
+    ap.add_argument("--sim-end", default="", type=str, help="YYYY-MM-DD (optional)")
+
     ap.add_argument("--max-leverage-pct", default=1.0, type=float)
 
     ap.add_argument("--enable-trailing", default="true", type=str)
@@ -359,9 +366,28 @@ def main() -> None:
     for d, g in picks.groupby("Date"):
         picks_by_date[d] = g["Ticker"].tolist()
 
+    # ---- compact simulation window (critical for walkforward aggregation)
+    # Without this, curve rows span the entire raw price history, which inflates Days_AfterWarmup
+    # and makes period-level metrics unusable.
+    sim_start = pd.to_datetime(args.sim_start, errors="coerce") if str(args.sim_start).strip() else None
+    sim_end = pd.to_datetime(args.sim_end, errors="coerce") if str(args.sim_end).strip() else None
+    if sim_start is None or pd.isna(sim_start):
+        sim_start = picks["Date"].min()
+    if sim_end is None or pd.isna(sim_end):
+        sim_end = picks["Date"].max()
+
+    # buffer to allow holding until H + extend (and a few extra calendar days)
+    buffer_days = int(max(0, int(args.max_days) + int(args.max_extend_days) + 5))
+    sim_end_target = sim_end + pd.Timedelta(days=buffer_days)
+
+    prices = prices[(prices["Date"] >= sim_start) & (prices["Date"] <= sim_end_target)].reset_index(drop=True)
+
     grouped = prices.groupby("Date", sort=True)
     all_dates = list(grouped.groups.keys())
     last_date = all_dates[-1] if all_dates else None
+
+    if all_dates:
+        print(f"[INFO] sim window: {all_dates[0].date()} -> {all_dates[-1].date()} (rows={len(all_dates)})")
 
     st = CycleState(
         seed=float(args.initial_seed),

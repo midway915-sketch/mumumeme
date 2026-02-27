@@ -223,29 +223,52 @@ def _discover_files(period_dir: Path) -> List[Dict[str, Any]]:
     """
     rows: List[Dict[str, Any]] = []
 
-    trade_files = sorted(list(period_dir.glob("sim_engine_trades_*_gate_*.parquet")) +
-                         list(period_dir.glob("sim_engine_trades_*_gate_*.csv")))
-    if not trade_files:
-        return rows
+    # Prefer parquet over csv. Many runs write both; counting both doubles your configs.
+    trade_parq = list(period_dir.glob("sim_engine_trades_*_gate_*.parquet"))
+    trade_csv = list(period_dir.glob("sim_engine_trades_*_gate_*.csv"))
 
     rx = re.compile(r"sim_engine_trades_(?P<tag>.+?)_gate_(?P<suffix>.+?)\.(csv|parquet)$", re.IGNORECASE)
 
-    for tf in trade_files:
+    seen: set[tuple[str, str]] = set()
+
+    # parquet first
+    for tf in sorted(trade_parq):
         m = rx.match(tf.name)
         if not m:
             continue
         tag = m.group("tag")
         suffix = m.group("suffix")
-
-        curve_parq = period_dir / f"sim_engine_curve_{tag}_gate_{suffix}.parquet"
-        curve_csv = period_dir / f"sim_engine_curve_{tag}_gate_{suffix}.csv"
+        key = (tag, suffix)
+        if key in seen:
+            continue
+        seen.add(key)
 
         rows.append({
             "tag": tag,
             "suffix": suffix,
             "trades_file": tf,
-            "curve_parq": curve_parq,
-            "curve_csv": curve_csv,
+            "curve_parq": period_dir / f"sim_engine_curve_{tag}_gate_{suffix}.parquet",
+            "curve_csv": period_dir / f"sim_engine_curve_{tag}_gate_{suffix}.csv",
+        })
+
+    # csv if parquet missing
+    for tf in sorted(trade_csv):
+        m = rx.match(tf.name)
+        if not m:
+            continue
+        tag = m.group("tag")
+        suffix = m.group("suffix")
+        key = (tag, suffix)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rows.append({
+            "tag": tag,
+            "suffix": suffix,
+            "trades_file": tf,
+            "curve_parq": period_dir / f"sim_engine_curve_{tag}_gate_{suffix}.parquet",
+            "curve_csv": period_dir / f"sim_engine_curve_{tag}_gate_{suffix}.csv",
         })
 
     return rows
