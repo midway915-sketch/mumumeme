@@ -1130,7 +1130,7 @@ jobs:
             --out data/signals/walkforward2/_analysis_walkforward2.csv
           test -f data/signals/walkforward2/_analysis_walkforward2.csv
 
-      - name: Diagnose model power (walkforward2) + build index
+      - name: Diagnose model power (diag_picks) + build index
         shell: bash
         run: |
           set -euo pipefail
@@ -1142,7 +1142,7 @@ jobs:
           while IFS= read -r f; do
             n=$((n+1))
             base="$(basename "$f")"
-            out="data/model_power/${base%.parquet}_power.csv"
+            out="data/model_power/${base%.*}_power.csv"
 
             err=""
             status="ok"
@@ -1154,17 +1154,15 @@ jobs:
               --out "$out" 2> /tmp/mp_err.txt; then
               status="fail"
               err="$(cat /tmp/mp_err.txt | tail -n 3 | tr '\n' ' ' | sed 's/,/;/g')"
-              # 실패해도 인덱스는 남김
               echo "\"$f\",,,,,,,,,${status},\"${err}\"" >> data/model_power/_INDEX.csv
               continue
             fi
 
-            # 성공이면 power csv의 첫 데이터 행을 인덱스로 복사
             line="$(tail -n +2 "$out" | head -n 1)"
             echo "${line},${status}," >> data/model_power/_INDEX.csv
-          done < <(find data/signals/walkforward2 -type f -name "sim_engine_trades_*.parquet" | sort)
+          done < <(find data -type f \( -name "diag_picks_*.csv" -o -name "diag_picks_*.parquet" \) | sort)
 
-          echo "[INFO] trades files found: $n"
+          echo "[INFO] diag_picks files found: $n"
           ls -lah data/model_power | head -n 50
 
       - name: Upload artifact (model_power)
