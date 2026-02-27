@@ -611,6 +611,15 @@ jobs:
           path: data/signals/walkforward/${{ matrix.period }}
           if-no-files-found: warn
 
+      - name: Upload artifact (diagnostics, this period)
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics_${{ matrix.period }}
+          path: |
+            **/diag_picks_*.json
+            **/diag_picks_*.csv
+          if-no-files-found: warn
+
   wf2-seq:
     name: wf2-seq (BadExit + Walkforward#2 sequential)
     needs: [wf1-parallel, raw-data, build-features, make-matrix]
@@ -1056,6 +1065,15 @@ jobs:
           name: walkforward2_all
           path: data/signals/walkforward2
           if-no-files-found: error
+
+      - name: Upload artifact (diagnostics all)
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics_all
+          path: |
+            **/diag_picks_*.json
+            **/diag_picks_*.csv
+          if-no-files-found: warn
 
   aggregate:
     name: aggregate-walkforward2
